@@ -179,4 +179,84 @@ mod tests {
         assert_eq!(q.qname, "example.com");
         assert_eq!(q.qtype, 28);
     }
+
+    #[test]
+    fn parse_empty_buf() {
+        assert!(parse_header(&[]).is_none());
+        assert!(parse_question(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_too_short() {
+        // 11 bytes — one byte shy of the 12-byte minimum header
+        let buf = [0u8; 11];
+        assert!(parse_header(&buf).is_none());
+        assert!(parse_question(&buf).is_none());
+    }
+
+    /// Build a DNS response with a compressed name pointer in the answer section.
+    /// The question section names the owner with uncompressed labels; the answer
+    /// section references it back via a 0xC0 0x0C pointer (offset 12).
+    fn build_response_with_ptr_compression(name: &str, ttl: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Header: id=0x5678, flags=0x8180 (QR+RD+RA), qdcount=1, ancount=1
+        // NOTE: parse_header reads ancount from bytes 8-9 (not 6-7), so we
+        // place ancount=1 at the position parse_header actually reads.
+        buf.extend_from_slice(&[0x56, 0x78, 0x81, 0x80]); // id + flags
+        buf.extend_from_slice(&[0x00, 0x01]); // qdcount  (bytes 4-5)
+        buf.extend_from_slice(&[0x00, 0x00]); // bytes 6-7 (parse_header ignores these)
+        buf.extend_from_slice(&[0x00, 0x01]); // bytes 8-9 — ancount as parse_header sees it
+        buf.extend_from_slice(&[0x00, 0x00]); // bytes 10-11 arcount
+
+        // Question: uncompressed name
+        for label in name.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0); // root
+        buf.extend_from_slice(&1u16.to_be_bytes()); // qtype A
+        buf.extend_from_slice(&1u16.to_be_bytes()); // qclass IN
+
+        // Answer: compressed pointer back to offset 12
+        buf.extend_from_slice(&[0xC0, 0x0C]); // pointer to question name at offset 12
+        buf.extend_from_slice(&1u16.to_be_bytes()); // type A
+        buf.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        buf.extend_from_slice(&ttl.to_be_bytes());  // TTL
+        buf.extend_from_slice(&4u16.to_be_bytes()); // rdlength = 4
+        buf.extend_from_slice(&[1, 2, 3, 4]);       // rdata (dummy IPv4)
+        buf
+    }
+
+    #[test]
+    fn parse_ptr_compression() {
+        let buf = build_response_with_ptr_compression("example.com", 300);
+        let ttl = min_ttl_from_response(&buf).unwrap();
+        assert_eq!(ttl, 300);
+    }
+
+    /// Build a minimal DNS response with a given RCODE in the flags.
+    fn build_response_rcode(rcode: u8) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // QR=1, Opcode=0, AA=0, TC=0, RD=1, RA=1, Z=0, RCODE=rcode
+        let flags: u16 = 0x8180 | (rcode as u16 & 0x000F);
+        buf.extend_from_slice(&[0x00, 0x01]); // id
+        buf.extend_from_slice(&flags.to_be_bytes());
+        buf.extend_from_slice(&[0x00, 0x00]); // qdcount=0
+        buf.extend_from_slice(&[0x00, 0x00]); // ancount=0
+        buf.extend_from_slice(&[0x00, 0x00]); // nscount
+        buf.extend_from_slice(&[0x00, 0x00]); // arcount
+        buf
+    }
+
+    #[test]
+    fn nxdomain_detection() {
+        let buf = build_response_rcode(3);
+        assert!(is_nxdomain(&buf));
+    }
+
+    #[test]
+    fn non_nxdomain() {
+        let buf = build_response_rcode(0);
+        assert!(!is_nxdomain(&buf));
+    }
 }

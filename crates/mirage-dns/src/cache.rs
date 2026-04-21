@@ -102,4 +102,38 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(cache.get(&q, 0).is_none());
     }
+
+    #[test]
+    fn cache_eviction() {
+        let mut cache = DnsCache::new(2);
+        let q1 = question("first.com");
+        let q2 = question("second.com");
+        let q3 = question("third.com");
+
+        // Insert two entries — fills the cache
+        cache.put(q1.clone(), vec![0x00, 0x01, 0x80, 0x00], Duration::from_secs(300));
+        cache.put(q2.clone(), vec![0x00, 0x02, 0x80, 0x00], Duration::from_secs(300));
+        assert_eq!(cache.stats().size, 2);
+
+        // Third insert must evict the oldest (q1, since q2 was accessed last via LRU)
+        cache.put(q3.clone(), vec![0x00, 0x03, 0x80, 0x00], Duration::from_secs(300));
+        assert_eq!(cache.stats().size, 2);
+
+        // q1 should be gone; q2 and q3 should be present
+        assert!(cache.get(&q1, 0).is_none(), "q1 should have been evicted");
+        assert!(cache.get(&q2, 0).is_some(), "q2 should still be cached");
+        assert!(cache.get(&q3, 0).is_some(), "q3 should be cached");
+    }
+
+    #[test]
+    fn cache_stats() {
+        let mut cache = DnsCache::new(5);
+        assert_eq!(cache.stats().size, 0);
+        assert_eq!(cache.stats().capacity, 5);
+
+        cache.put(question("a.com"), vec![0; 4], Duration::from_secs(60));
+        cache.put(question("b.com"), vec![0; 4], Duration::from_secs(60));
+        assert_eq!(cache.stats().size, 2);
+        assert_eq!(cache.stats().capacity, 5);
+    }
 }
