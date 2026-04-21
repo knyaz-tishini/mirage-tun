@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::info;
 
 use crate::error::TunError;
@@ -40,9 +40,12 @@ struct ErrorBody {
     error: String,
 }
 
-type AppState = Arc<Mutex<ServiceState>>;
+pub struct AppState {
+    pub service: Arc<Mutex<ServiceState>>,
+    pub stop_tx: watch::Sender<()>,
+}
 
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(get_health))
         .route("/status", get(get_status))
@@ -50,6 +53,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/tun/stop", post(post_tun_stop))
         .route("/proxy/set", post(post_proxy_set))
         .route("/proxy/clear", post(post_proxy_clear))
+        .route("/admin/restart", post(post_admin_restart))
         .with_state(state)
 }
 
@@ -58,9 +62,9 @@ async fn get_health() -> StatusCode {
 }
 
 async fn get_status(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> Json<StatusResponse> {
-    let s = state.lock().await;
+    let s = state.service.lock().await;
     Json(StatusResponse {
         adapter_alive: s.wintun.is_some(),
         tun_phase: s.tun_phase.clone(),
@@ -70,10 +74,10 @@ async fn get_status(
 }
 
 async fn post_tun_start(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Json(params): Json<TunStartParams>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let mut s = state.lock().await;
+    let mut s = state.service.lock().await;
 
     if s.wintun.is_none() {
         return Err(map_err(TunError::AdapterNotReady));
@@ -89,6 +93,21 @@ async fn post_tun_start(
     s.tun_phase = TunPhase::Transitioning;
 
     let tun_name = s.tun_name.clone();
+
+    // Recreate Wintun session FIRST (old adapter destroyed, new one created with IP)
+    drop(s.wintun.take());
+    let wintun = crate::wintun::WintunHandle::create(&tun_name, "10.0.85.1/24", 1500)
+        .await
+        .map_err(map_err)?;
+    let (reader, writer) = wintun.split();
+    s.wintun = Some(wintun);
+
+    // Set DNS on fresh adapter
+    let _ = std::process::Command::new("netsh")
+        .args(["interface", "ip", "set", "dns", &tun_name, "static", "10.0.85.1"])
+        .output();
+
+    // Routes AFTER adapter exists — otherwise they vanish with destroyed interface
     let mut routing = Routing::new(&tun_name);
     routing.set_default_route().map_err(map_err)?;
 
@@ -98,13 +117,6 @@ async fn post_tun_start(
         }
     }
 
-    // Set DNS on TUN adapter
-    let _ = std::process::Command::new("netsh")
-        .args(["interface", "ip", "set", "dns", &tun_name, "static", "10.0.85.1"])
-        .output();
-
-    let wintun = s.wintun.as_ref().unwrap();
-    let (reader, writer) = wintun.split();
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let _runner = IpStackRunner::start(reader, writer, socks5_addr, cancel.clone())
@@ -126,9 +138,9 @@ async fn post_tun_start(
 }
 
 async fn post_tun_stop(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let mut s = state.lock().await;
+    let mut s = state.service.lock().await;
 
     if s.tun_phase != TunPhase::TunActive {
         return Err(map_err(TunError::NotActive));
@@ -171,21 +183,29 @@ async fn post_tun_stop(
 }
 
 async fn post_proxy_set(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Json(params): Json<ProxySetParams>,
 ) -> StatusCode {
     crate::proxy::set_system_proxy(&params.proxy_server);
-    let mut s = state.lock().await;
+    let mut s = state.service.lock().await;
     s.proxy_active = Some(params.proxy_server);
     StatusCode::OK
 }
 
 async fn post_proxy_clear(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> StatusCode {
     crate::proxy::clear_system_proxy();
-    let mut s = state.lock().await;
+    let mut s = state.service.lock().await;
     s.proxy_active = None;
+    StatusCode::OK
+}
+
+async fn post_admin_restart(
+    State(state): State<Arc<AppState>>,
+) -> StatusCode {
+    info!("Restart requested via /admin/restart");
+    let _ = state.stop_tx.send(());
     StatusCode::OK
 }
 

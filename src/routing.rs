@@ -29,22 +29,32 @@ impl Routing {
         debug!(gateway = ?self.original_gateway, "Routing: saved original gateway");
 
         let tun_name = &self.tun_name;
+
+        // Set interface metric to 1 so total metric (route + iface) beats amnezia
+        if let Err(e) = run_netsh_route(&[
+            "interface", "ipv4", "set", "interface",
+            tun_name,
+            "metric=1",
+        ]) {
+            warn!("failed to set interface metric (non-fatal): {e}");
+        }
+
         run_netsh_route(&[
             "interface", "ipv4", "add", "route",
             "0.0.0.0/1",
             &format!("interface={tun_name}"),
-            "metric=10",
+            "metric=1",
             "store=active",
         ])?;
         run_netsh_route(&[
             "interface", "ipv4", "add", "route",
             "128.0.0.0/1",
             &format!("interface={tun_name}"),
-            "metric=10",
+            "metric=1",
             "store=active",
         ])?;
         self.tun_default_set = true;
-        info!(tun_name, "Routing: default route set via TUN");
+        info!(tun_name, "Routing: default route set via TUN (metric=1+1=2)");
         Ok(())
     }
 

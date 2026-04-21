@@ -1,7 +1,20 @@
-[package]
-name = "mirage2tun"
+[workspace]
+resolver = "2"
+members = [
+    "crates/mirage-ipstack",
+    "crates/mirage-wfp",
+    "crates/mirage-tun-core",
+    ".",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+[package]
+name = "mirage2tun"
+version.workspace = true
+edition.workspace = true
 
 [[bin]]
 name = "mirage2tun"
@@ -14,7 +27,9 @@ axum = "0.8"
 windows-service = "0.7"
 libloading = "0.8"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
-mirage-ipstack = { path = "../mirage2web/crates/mirage-ipstack" }
+mirage-ipstack = { path = "crates/mirage-ipstack" }
+mirage-wfp = { path = "crates/mirage-wfp" }
+mirage-tun-core = { path = "crates/mirage-tun-core" }
 rand = { version = "0.8", features = ["std", "std_rng"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

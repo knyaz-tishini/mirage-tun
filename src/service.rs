@@ -2,7 +2,9 @@ use std::ffi::OsString;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{watch, Mutex};
 use tracing::info;
+use windows_service::service_control_handler::ServiceStatusHandle;
 
+use crate::api::AppState;
 use crate::state::ServiceState;
 use crate::wintun::WintunHandle;
 use crate::routing::cleanup_stale_routes;
@@ -61,12 +63,29 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
 
-    rt.block_on(run_service_logic(status_handle, stop_rx))?;
+    // Init tracing to file before entering async context
+    std::fs::create_dir_all("C:\\ProgramData\\mirage2tun\\logs").ok();
+    let file_appender = tracing_appender::rolling::daily(
+        "C:\\ProgramData\\mirage2tun\\logs",
+        "mirage2tun.log",
+    );
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter("info")
+        .init();
+
+    // Retrieve stop_tx from OnceLock to pass into logic
+    // SAFETY: we just set it above; get() will always succeed here.
+    let stop_tx = STOP_TX.get().expect("STOP_TX set above in same function").clone();
+
+    rt.block_on(run_service_logic(Some(status_handle), stop_tx, stop_rx))?;
     Ok(())
 }
 
 pub async fn run_service_logic(
-    _status_handle: impl std::any::Any,
+    status_handle: Option<ServiceStatusHandle>,
+    stop_tx: watch::Sender<()>,
     mut stop_rx: watch::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Stale state cleanup
@@ -84,13 +103,33 @@ pub async fn run_service_logic(
         }
     };
 
-    let mut state = ServiceState::new(TUN_NAME.to_owned());
-    state.wintun = wintun;
-    let state = Arc::new(Mutex::new(state));
+    let mut svc_state = ServiceState::new(TUN_NAME.to_owned());
+    svc_state.wintun = wintun;
+    let svc_state = Arc::new(Mutex::new(svc_state));
 
-    let router = crate::api::build_router(Arc::clone(&state));
+    let app_state = Arc::new(AppState {
+        service: Arc::clone(&svc_state),
+        stop_tx,
+    });
+
+    let router = crate::api::build_router(Arc::clone(&app_state));
     let listener = tokio::net::TcpListener::bind(API_BIND).await?;
     info!("Management API listening on {API_BIND}");
+
+    // Report Running to SCM after successful bind
+    if let Some(ref handle) = status_handle {
+        use windows_service::service::*;
+        handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: std::time::Duration::default(),
+            process_id: None,
+        })?;
+        info!("Reported Running to SCM");
+    }
 
     tokio::select! {
         result = axum::serve(listener, router) => {
@@ -105,7 +144,7 @@ pub async fn run_service_logic(
 
     // Graceful shutdown
     {
-        let mut s = state.lock().await;
+        let mut s = svc_state.lock().await;
         if let Some(cancel) = s.ipstack_cancel.take() {
             cancel.cancel();
         }
@@ -125,5 +164,20 @@ pub async fn run_service_logic(
     }
 
     info!("Service stopped");
+
+    // Report Stopped to SCM
+    if let Some(ref handle) = status_handle {
+        use windows_service::service::*;
+        let _ = handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: std::time::Duration::default(),
+            process_id: None,
+        });
+    }
+
     Ok(())
 }

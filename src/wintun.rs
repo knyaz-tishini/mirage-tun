@@ -119,38 +119,53 @@ unsafe impl Send for WintunReader {}
 unsafe impl Send for WintunWriter {}
 
 impl WintunReader {
-    /// Read one IP packet from Wintun. Blocks (via `spawn_blocking`) until a
-    /// packet arrives or the 5-second event timeout elapses.
+    /// Spawn a dedicated OS thread that reads packets from Wintun in a blocking
+    /// loop and sends them over an mpsc channel.  Returns the receiving half.
     ///
-    /// Returns `Ok(Vec::new())` on a spurious wake / timeout (no packet available).
-    pub async fn recv(&self) -> Result<Vec<u8>> {
+    /// The thread exits when the WintunShared is dropped (session closed → recv
+    /// returns NULL) or when the channel receiver is dropped.
+    pub fn start_reader_thread(&self) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
         let shared = Arc::clone(&self.shared);
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            let event = unsafe { (shared.fn_get_event)(shared.session.0) };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
 
-            // Wait up to 5 s before re-checking (allows clean shutdown).
-            let wait_result = unsafe { WaitForSingleObject(event, 5000) };
-            // WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258
-            if wait_result != 0 && wait_result != 258 {
-                return Err(TunError::Wintun(format!(
-                    "WaitForSingleObject returned {wait_result}"
-                )));
-            }
+        std::thread::Builder::new()
+            .name("wintun-reader".into())
+            .spawn(move || {
+                let event = unsafe { (shared.fn_get_event)(shared.session.0) };
+                info!(
+                    "wintun-reader thread: session=0x{:x} event=0x{:x}",
+                    shared.session.0 as usize, event as usize
+                );
 
-            let mut pkt_size: u32 = 0;
-            let pkt_ptr = unsafe { (shared.fn_receive)(shared.session.0, &mut pkt_size) };
+                loop {
+                    let wait_result = unsafe { WaitForSingleObject(event, 5000) };
+                    // WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258
+                    if wait_result != 0 && wait_result != 258 {
+                        warn!("wintun-reader: WaitForSingleObject returned {wait_result}, exiting");
+                        break;
+                    }
 
-            if pkt_ptr.is_null() {
-                return Ok(Vec::new());
-            }
+                    let mut pkt_size: u32 = 0;
+                    let pkt_ptr = unsafe { (shared.fn_receive)(shared.session.0, &mut pkt_size) };
 
-            let len = pkt_size as usize;
-            let data = unsafe { std::slice::from_raw_parts(pkt_ptr, len).to_vec() };
-            unsafe { (shared.fn_release)(shared.session.0, pkt_ptr) };
-            Ok(data)
-        })
-        .await
-        .map_err(|e| TunError::Wintun(format!("spawn_blocking panicked: {e}")))?
+                    if pkt_ptr.is_null() {
+                        continue; // timeout or spurious wake
+                    }
+
+                    let len = pkt_size as usize;
+                    let data = unsafe { std::slice::from_raw_parts(pkt_ptr, len).to_vec() };
+                    unsafe { (shared.fn_release)(shared.session.0, pkt_ptr) };
+
+                    if tx.blocking_send(data).is_err() {
+                        info!("wintun-reader: channel closed, exiting");
+                        break;
+                    }
+                }
+                info!("wintun-reader thread exiting");
+            })
+            .expect("wintun-reader thread spawn failed: OS thread limit reached or name contains NUL");
+
+        rx
     }
 }
 

@@ -1,0 +1,10 @@
+[package]
+name = "mirage-tun-core"
+version.workspace = true
+edition.workspace = true
+description = "TUN device abstractions: traits, NAT table, packet parser"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "net", "time"] }

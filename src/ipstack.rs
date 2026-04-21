@@ -97,9 +97,7 @@ impl AsyncWrite for PacketDevice {
 // ── IpStackRunner ─────────────────────────────────────────────────────────────
 
 /// Owns the background tasks that bridge Wintun ↔ IpStack ↔ SOCKS5.
-pub struct IpStackRunner {
-    cancel: CancellationToken,
-}
+pub struct IpStackRunner;
 
 impl IpStackRunner {
     pub async fn start(
@@ -118,40 +116,44 @@ impl IpStackRunner {
         // ── Wintun → stack reader task ────────────────────────────────────────
         let reader_cancel = cancel.clone();
         let reader_tx = wintun_to_stack_tx;
+        let mut wintun_rx = reader.start_reader_thread();
         tokio::spawn(async move {
+            info!("IpStackRunner: reader task started");
             let mut pkt_count: u64 = 0;
-            let mut timeout_count: u64 = 0;
-            let start = std::time::Instant::now();
+            let mut drop_count: u64 = 0;
             loop {
                 tokio::select! {
                     _ = reader_cancel.cancelled() => break,
-                    result = reader.recv() => {
-                        match result {
-                            Ok(packet) if packet.is_empty() => {
-                                timeout_count += 1;
-                                if timeout_count <= 3 || timeout_count % 50 == 0 {
-                                    info!("IpStackRunner: Wintun read timeout #{timeout_count}");
-                                }
-                                continue;
+                    packet = wintun_rx.recv() => {
+                        match packet {
+                            None => {
+                                warn!("IpStackRunner: wintun reader channel closed");
+                                break;
                             }
-                            Ok(packet) => {
+                            Some(packet) => {
+                                let ip_ver = packet.first().map(|b| b >> 4).unwrap_or(0);
+                                if ip_ver != 4 || packet.len() < 20 {
+                                    drop_count += 1;
+                                    if drop_count <= 5 {
+                                        info!("IpStackRunner: drop non-IPv4 pkt, ver={ip_ver} len={}", packet.len());
+                                    }
+                                    continue;
+                                }
                                 pkt_count += 1;
-                                let elapsed = start.elapsed().as_secs();
-                                if pkt_count <= 20 || pkt_count % 100 == 0 || (elapsed % 10 == 0 && pkt_count % 10 == 1) {
-                                    let ip_ver = packet.first().map(|b| b >> 4).unwrap_or(0);
-                                    let proto = if ip_ver == 4 && packet.len() >= 10 { packet[9] } else { 0 };
+                                if pkt_count <= 10 || pkt_count % 500 == 0 {
+                                    let proto = packet[9];
+                                    let dst = if packet.len() >= 20 {
+                                        format!("{}.{}.{}.{}", packet[16], packet[17], packet[18], packet[19])
+                                    } else { "?".into() };
                                     info!(
-                                        "IpStackRunner: pkt #{pkt_count} {} bytes IPv{ip_ver} proto={proto} (timeouts={timeout_count})",
+                                        "IpStackRunner: pkt #{pkt_count} {} bytes proto={proto} dst={dst} (drops={drop_count})",
                                         packet.len()
                                     );
                                 }
                                 if reader_tx.send(packet).await.is_err() {
+                                    warn!("IpStackRunner: stack channel closed, reader exiting");
                                     break;
                                 }
-                            }
-                            Err(e) => {
-                                warn!("IpStackRunner: Wintun read error: {e}");
-                                break;
                             }
                         }
                     }
@@ -162,6 +164,7 @@ impl IpStackRunner {
         // ── Stack → Wintun writer task ────────────────────────────────────────
         let writer_cancel = cancel.clone();
         tokio::spawn(async move {
+            info!("IpStackRunner: writer task started");
             let mut first_write = true;
             loop {
                 tokio::select! {
@@ -213,13 +216,7 @@ impl IpStackRunner {
             }
         });
 
-        Ok(Self { cancel })
-    }
-}
-
-impl Drop for IpStackRunner {
-    fn drop(&mut self) {
-        self.cancel.cancel();
+        Ok(Self)
     }
 }
 
@@ -228,7 +225,7 @@ impl Drop for IpStackRunner {
 fn handle_stream(stream: IpStackStream, socks5_addr: SocketAddr, cancel: CancellationToken) {
     match stream {
         IpStackStream::Tcp(mut tcp) => {
-            let dst = tcp.local_addr();
+            let dst = tcp.peer_addr();
             info!("IpStackRunner: TCP → {dst}");
             tokio::spawn(async move {
                 tokio::select! {
@@ -242,13 +239,13 @@ fn handle_stream(stream: IpStackStream, socks5_addr: SocketAddr, cancel: Cancell
             });
         }
         IpStackStream::Udp(mut udp) => {
-            let dst = udp.local_addr();
+            let dst = udp.peer_addr();
             if dst.port() == 53 {
                 info!("IpStackRunner: UDP DNS → {dst}");
                 tokio::spawn(async move {
                     tokio::select! {
                         _ = cancel.cancelled() => {}
-                        result = handle_dns_udp(&mut udp) => {
+                        result = handle_dns_udp(&mut udp, socks5_addr) => {
                             if let Err(e) = result {
                                 info!("IpStackRunner: DNS UDP error: {e}");
                             }
@@ -283,18 +280,14 @@ async fn handle_tcp(
     Ok(())
 }
 
-// ── DNS UDP forwarding ────────────────────────────────────────────────────────
+// ── DNS UDP → TCP via SOCKS5 ──────────────────────────────────────────────────
 
 async fn handle_dns_udp(
     udp: &mut mirage_ipstack::IpStackUdpStream,
+    socks5_addr: SocketAddr,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::net::UdpSocket;
-
-    let upstream: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53));
-    let bind: SocketAddr = "0.0.0.0:0".parse()?;
-
-    let sock = UdpSocket::bind(bind).await?;
-    sock.connect(upstream).await?;
+    let dns_upstream: SocketAddr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53));
 
     let mut buf = vec![0u8; 4096];
     let n = udp.read(&mut buf).await?;
@@ -302,12 +295,32 @@ async fn handle_dns_udp(
         return Ok(());
     }
 
-    sock.send(&buf[..n]).await?;
+    info!(
+        "IpStackRunner: DNS query {} bytes → SOCKS5({socks5_addr}) → {dns_upstream}",
+        n
+    );
 
-    let mut resp = vec![0u8; 4096];
-    let m = sock.recv(&mut resp).await?;
-    info!("IpStackRunner: DNS query {} bytes → 8.8.8.8, response {} bytes", n, m);
-    udp.write_all(&resp[..m]).await?;
+    let mut proxy = socks5_connect(socks5_addr, dns_upstream).await?;
+
+    // DNS-over-TCP: 2-byte big-endian length prefix + query payload
+    let len_prefix = (n as u16).to_be_bytes();
+    proxy.write_all(&len_prefix).await?;
+    proxy.write_all(&buf[..n]).await?;
+
+    // Read 2-byte length prefix of the response
+    let mut resp_len_bytes = [0u8; 2];
+    proxy.read_exact(&mut resp_len_bytes).await?;
+    let resp_len = u16::from_be_bytes(resp_len_bytes) as usize;
+
+    let mut resp = vec![0u8; resp_len];
+    proxy.read_exact(&mut resp).await?;
+
+    info!(
+        "IpStackRunner: DNS response {} bytes via SOCKS5({socks5_addr})",
+        resp_len
+    );
+
+    udp.write_all(&resp).await?;
 
     Ok(())
 }
