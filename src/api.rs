@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
+use mirage_dns::{DnsConfig, DnsResolver};
 use mirage_tun_core::config::TunConfig;
 use mirage_tun_core::traits::PlatformFirewall;
 
@@ -131,8 +132,20 @@ async fn post_tun_start(
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let if_index = routing.original_interface_idx().unwrap_or(0);
+
+    let dns_config = DnsConfig {
+        doh_url: "https://1.1.1.1/dns-query".into(),
+        http_proxy: Some("http://127.0.0.1:19481".into()),
+        cache_size: 4096,
+        timeout: std::time::Duration::from_secs(5),
+        fallback_dns: "8.8.8.8:53".parse().unwrap(),
+    };
+    let dns_resolver = DnsResolver::new(dns_config).map_err(|e| {
+        map_err(TunError::Routing(format!("DNS resolver init failed: {e}")))
+    })?;
+
     let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
-    let _runner = IpStackRunner::start(device, socks5_addr, cancel.clone(), relay_ips, if_index)
+    let _runner = IpStackRunner::start(device, socks5_addr, cancel.clone(), relay_ips, if_index, dns_resolver)
         .await
         .map_err(map_err)?;
 

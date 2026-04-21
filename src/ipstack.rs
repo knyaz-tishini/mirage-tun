@@ -1,8 +1,10 @@
 use std::{
     collections::HashSet,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
+
+use mirage_dns::DnsResolver;
 
 use mirage_ipstack::{IpStack, IpStackConfig, IpStackStream};
 use tokio::{
@@ -25,6 +27,7 @@ impl IpStackRunner {
         cancel: CancellationToken,
         relay_addrs: Vec<IpAddr>,
         if_index: u32,
+        dns_resolver: DnsResolver,
     ) -> Result<Self> {
         info!("IpStackRunner: started, socks5={socks5_addr}, relay_bypass={relay_addrs:?}, if_index={if_index}");
 
@@ -85,14 +88,12 @@ impl IpStackRunner {
 
                                 if dst.port() == 53 {
                                     debug!("IpStackRunner: UDP DNS → {dst}");
-                                    let sem = socks5_semaphore.clone();
+                                    let resolver = dns_resolver.clone();
                                     tokio::spawn(async move {
-                                        if let Err(e) = handle_dns_udp_stream(udp_stream, socks5_addr, dst, &sem, if_index).await {
+                                        if let Err(e) = handle_dns_udp_stream(udp_stream, resolver).await {
                                             debug!("IpStackRunner: DNS {dst} error: {e}");
                                         }
                                     });
-                                } else {
-                                    // Non-DNS UDP — drop silently for now
                                 }
                             }
                             Ok(IpStackStream::UnknownTransport(_)) | Ok(IpStackStream::UnknownNetwork(_)) => {
@@ -137,52 +138,26 @@ async fn handle_tcp(
 
 async fn handle_dns_udp_stream(
     mut udp: mirage_ipstack::IpStackUdpStream,
-    socks5_addr: SocketAddr,
-    dns_dst: SocketAddr,
-    socks5_semaphore: &Semaphore,
-    if_index: u32,
+    resolver: DnsResolver,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Read the DNS query from the UDP stream
-    let mut query = vec![0u8; 4096];
-    let n = udp.read(&mut query).await?;
-    if n == 0 {
-        return Ok(());
+    let mut query_buf = vec![0u8; 4096];
+    // Handle multiple queries on the same UDP stream
+    loop {
+        let n = udp.read(&mut query_buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        match resolver.resolve(&query_buf[..n]).await {
+            Ok(response) => {
+                udp.write_all(&response).await?;
+            }
+            Err(e) => {
+                debug!("DNS resolve error: {e}");
+                break;
+            }
+        }
     }
-    let query = &query[..n];
-
-    let dns_upstream: SocketAddr = if dns_dst.port() == 53 && !dns_dst.ip().is_loopback() {
-        dns_dst
-    } else {
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53))
-    };
-
-    debug!("IpStackRunner: DNS query {} bytes → SOCKS5({socks5_addr}) → {dns_upstream}", query.len());
-
-    let _permit = socks5_semaphore
-        .acquire()
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
-
-    let mut proxy = socks5_connect(socks5_addr, dns_upstream, if_index).await?;
-
-    // DNS-over-TCP: 2-byte big-endian length prefix + query payload
-    let len_prefix = (query.len() as u16).to_be_bytes();
-    proxy.write_all(&len_prefix).await?;
-    proxy.write_all(query).await?;
-
-    // Read 2-byte length prefix of the response
-    let mut resp_len_bytes = [0u8; 2];
-    proxy.read_exact(&mut resp_len_bytes).await?;
-    let resp_len = u16::from_be_bytes(resp_len_bytes) as usize;
-
-    let mut resp = vec![0u8; resp_len];
-    proxy.read_exact(&mut resp).await?;
-
-    debug!("IpStackRunner: DNS response {resp_len} bytes");
-
-    // Write response back to the UDP stream
-    udp.write_all(&resp).await?;
-
     Ok(())
 }
 
