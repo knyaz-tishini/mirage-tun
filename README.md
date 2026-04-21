@@ -1,56 +1,102 @@
 # mirage2tun
 
-Windows Service — управление Wintun адаптером, маршрутизацией, DNS, системным прокси. Работает независимо от VPN клиента.
+Windows Service — Wintun адаптер, маршрутизация, DNS (DoH), WFP kill-switch, системный прокси. Работает в связке с mirage2web client.
+
+**Статус (2026-04-21): TUN mode ALL PASS** — `evaluate` выходит через `45.59.119.139`, DNS OK, start/stop чистые.
+
+## Workspace crates
+
+```
+mirage2tun/
+├── crates/
+│   ├── mirage-ipstack/    # Userspace TCP/IP стек (fork of narrowlink/ipstack)
+│   ├── mirage-wfp/        # Windows Filtering Platform (dynamic WFP engine)
+│   ├── mirage-tun-core/   # Platform traits (PlatformFirewall, PlatformRouting, PlatformTun)
+│   └── mirage-dns/        # DoH resolver + TTL-aware LRU cache
+└── src/                   # Main binary (Windows Service)
+```
 
 ## Порт
 
 `127.0.0.1:19485` — management API
 
+## Требования
+
+- `wintun.dll` рядом с exe
+- mirage2web client (SOCKS5 `:19480`, HTTP proxy `:19481`)
+- Admin права (Wintun, WFP, routes)
+
 ## Установка
 
-Требует admin (UAC):
-
-```
+```bash
 mirage2tun.exe install
 ```
 
-Что происходит:
-1. Копирует себя в `mirage2tun-running.exe` (оригинал остаётся свободным)
-2. Регистрирует Windows Service с exe = `mirage2tun-running.exe`
-3. Устанавливает SCM recovery policy (авторестарт через 1s/5s/30s)
+1. Копирует себя в `mirage2tun-running.exe`
+2. Регистрирует Windows Service (exe = `-running.exe`)
+3. Ставит SCM recovery policy (авторестарт 1s/5s/30s)
 4. Запускает сервис
+
+```bash
+mirage2tun.exe uninstall   # stop + remove
+```
+
+## CLI команды
+
+| Команда | Что делает |
+|---------|-----------|
+| `install` | Регистрировать + запустить Windows Service |
+| `uninstall` | Остановить + удалить сервис |
+| `debug-run` | Запустить логику сервиса в foreground (stdout) |
+| `evaluate` | E2E тест: start TUN → exit IP → DNS → stop → PASS/FAIL |
+| `update` | Скопировать exe в `-running.exe` (hot-swap) |
+| `test-read` | Raw Wintun packet read тест |
+
+## E2E тест
+
+```bash
+# Требует: mirage2web client запущен, нет другого экземпляра mirage2tun
+mirage2tun.exe evaluate
+# [1/5] API... PASS  [2/5] TUN start... PASS  [3/5] Exit IP... PASS (45.59.119.139)  [4/5] DNS... PASS  [5/5] Stop... PASS  === ALL PASS ===
+```
+
+**Важно**: SCM авторестартует сервис после kill. Перед `evaluate` — `sc stop mirage2tun` + подождать.
+
+## Быстрый старт
+
+```bash
+# 1. Запустить mirage2web client (SOCKS5 + HTTP proxy)
+# 2. Запустить TUN сервис
+sc start mirage2tun
+
+# 3. Активировать TUN
+curl -X POST http://127.0.0.1:19485/tun/start \
+  -H "Content-Type: application/json" \
+  -d '{"socks5_addr":"127.0.0.1:19480","relay_addrs":["91.218.245.247","45.59.119.139"]}'
+
+# 4. Весь трафик идёт через relay chain → exit 45.59.119.139
+
+# 5. Остановить TUN
+curl -X POST http://127.0.0.1:19485/tun/stop
+```
 
 ## Обновление (hot-swap)
 
-Оригинал `mirage2tun.exe` не заблокирован — сервис работает из копии `-running.exe`.
+Сервис работает из `-running.exe`, оригинал не заблокирован.
 
 ```bash
-# 1. Пересобрать
 cargo build --release
-
-# 2. Скопировать новый бинарь поверх -running
-mirage2tun.exe update
-
-# 3. Перезапустить сервис (любым способом)
-curl -X POST http://127.0.0.1:19485/admin/restart
-# или: sc stop mirage2tun && sc start mirage2tun
-```
-
-`update` копирует текущий exe в `mirage2tun-running.exe`. При рестарте SCM подхватит новый бинарь.
-
-**Важно**: если сервис запущен, `update` не сможет перезаписать `-running.exe` (file lock). Сначала `sc stop mirage2tun`, потом `update`, потом `sc start mirage2tun`.
-
-## Удаление
-
-```
-mirage2tun.exe uninstall
+sc stop mirage2tun            # остановить перед update (file lock)
+mirage2tun.exe update         # скопировать новый exe → -running.exe
+sc start mirage2tun           # SCM подхватит новый бинарь
+# или: curl -X POST http://127.0.0.1:19485/admin/restart
 ```
 
 ## API
 
 ### GET /health
 
-200 OK
+`200 OK`
 
 ### GET /status
 
@@ -67,8 +113,6 @@ mirage2tun.exe uninstall
 
 ### POST /tun/start
 
-Активировать TUN маршрутизацию. Весь трафик пойдёт через Wintun → IpStack → SOCKS5.
-
 ```json
 {
   "socks5_addr": "127.0.0.1:19480",
@@ -76,15 +120,15 @@ mirage2tun.exe uninstall
 }
 ```
 
-- `socks5_addr` — SOCKS5 прокси куда IpStack форвардит TCP (обычно mirage-client)
-- `relay_addrs` — **обязательно**: IP relay/exit серверов. Для них добавляются bypass routes через физический шлюз. Без этого трафик к relay уйдёт в TUN → бесконечный loop → потеря связи
-- Маршруты: `0.0.0.0/1` + `128.0.0.0/1` через `mirage0` metric 2 (interface metric 1 + route metric 1)
-- DNS на TUN адаптере: `10.0.85.1`
-- Порядок: recreate Wintun adapter → assign IP → set routes → start IpStack
+- `socks5_addr` — куда IpStack форвардит TCP (mirage2web client)
+- `relay_addrs` — IP relay/exit серверов; для них добавляются bypass routes через физический шлюз (иначе loop)
+- Маршруты: `0.0.0.0/1` + `128.0.0.0/1` через `mirage0`, metric 2 (iface=1 + route=1)
+- DNS на адаптере: `10.0.85.1` (DoH через 1.1.1.1 via HTTP proxy)
+- Session reuse: не пересоздаёт WintunHandle, использует тот что создан при старте сервиса
 
 ### POST /tun/stop
 
-Деактивировать TUN. Убирает маршруты, bypass routes, DNS.
+Деактивировать TUN. Убирает маршруты, bypass routes, WFP фильтры, DNS.
 
 ### POST /proxy/set
 
@@ -92,138 +136,108 @@ mirage2tun.exe uninstall
 {"proxy_server": "127.0.0.1:19481"}
 ```
 
-Устанавливает системный прокси (WinINET + WinHTTP + InternetSetOption notify).
+Системный прокси (WinINET + WinHTTP + InternetSetOption notify).
 
 ### POST /proxy/clear
 
-Снимает системный прокси.
+Снять системный прокси.
 
 ### POST /admin/restart
 
-Graceful shutdown. Сервис завершается, SCM автоматически перезапускает (recovery policy).
+Graceful shutdown → SCM перезапускает (recovery policy).
 
 ## Архитектура
 
 ```
 mirage2tun (Windows Service, SYSTEM)
 ├── Wintun adapter "mirage0" (10.0.85.1/24, MTU 1500)
-├── Dedicated reader thread (std::thread, sync WaitForSingleObject loop)
-├── Routing (0.0.0.0/1 + 128.0.0.0/1 on-link, metric 2)
-├── IpStack (mirage-ipstack crate — userspace TCP/IP stack)
-│   ├── TCP → SOCKS5 proxy (mirage-client)
-│   ├── UDP DNS (port 53) → 8.8.8.8 direct
-│   └── UDP non-DNS → dropped
+├── Dedicated reader thread (std::thread, sync WaitForSingleObject loop → mpsc channel)
+├── mirage-ipstack (userspace TCP/IP стек)
+│   ├── TCP → SOCKS5 connect 127.0.0.1:19480 (IP_UNICAST_IF → физический NIC, bypass TUN loop)
+│   └── UDP:53 → mirage-dns (DoH via 1.1.1.1 через HTTP proxy 127.0.0.1:19481, TTL-aware LRU cache)
+├── mirage-wfp (WFP kill-switch: блокирует всё кроме relay IPs + loopback)
+├── Routing (netsh + route.exe fallback, if_index=19 физический NIC)
 ├── System proxy (WinINET/WinHTTP)
 └── Axum API (127.0.0.1:19485)
 ```
 
-### Traffic flow (TUN mode)
+### Traffic flow
 
 ```
-App on machine
-    │ TCP to 216.58.198.34:443
-    ▼
-Windows routing table
-    │ 0.0.0.0/1 → mirage0 (metric 2, beats amnezia tun2 metric 6)
-    ▼
-Wintun adapter "mirage0"
-    │ raw IP packets
-    ▼
-wintun-reader thread (std::thread)
-    │ WaitForSingleObject + WintunReceivePacket
-    │ sends via tokio::sync::mpsc channel
-    ▼
-IpStack reader task (tokio)
-    │ filters IPv4 only, drops IPv6/ARP
-    ▼
-PacketDevice (AsyncRead/AsyncWrite over channels)
-    │
-    ▼
-mirage-ipstack (IpStack::accept)
-    │ reassembles TCP streams from raw packets
-    ▼
-handle_stream()
-    ├── TCP → socks5_connect(127.0.0.1:19480, peer_addr)
-    │       │ SOCKS5 CONNECT to real destination
-    │       ▼
-    │   mirage-client → relay chain → exit node → internet
-    │
-    ├── UDP :53 → forward to 8.8.8.8 direct
-    └── UDP other → drop
+App → Windows routing (0.0.0.0/1 → mirage0, metric 2)
+  → Wintun adapter "mirage0" (10.0.85.1/24)
+  → wintun-reader thread (WaitForSingleObject loop)
+  → mpsc channel (256 buffer)
+  → mirage-ipstack (IpStack::accept)
+  → TCP: SOCKS5 connect 127.0.0.1:19480 (IP_UNICAST_IF на физическом NIC)
+      → mirage2web client → relay chain → exit node 45.59.119.139 → internet
+  → UDP:53: DoH resolver (1.1.1.1 via HTTP proxy 127.0.0.1:19481)
+      → mirage-dns TTL-aware LRU cache → DoH POST → fallback TCP DNS
+  → WFP kill-switch: блокирует non-relay, non-loopback outbound
 ```
 
 ### Bypass routes
 
-relay_addrs из `/tun/start` получают маршрут `/32` через оригинальный gateway (`192.168.1.1`), минуя TUN. Без этого пакеты к relay серверам попадут в mirage0 → IpStack → SOCKS5 → relay → mirage0 → бесконечный цикл.
+`relay_addrs` из `/tun/start` получают `/32` маршрут через оригинальный gateway, минуя TUN.
+Без этого: пакеты к relay → mirage0 → IpStack → SOCKS5 → relay → mirage0 → бесконечный цикл.
 
-## Файлы
+### Route metric
+
+| Адаптер | Interface metric | Route metric | Итого |
+|---------|-----------------|--------------|-------|
+| mirage0 | 1 | 1 | **2** |
+| AmneziaVPN tun2 | 5 | 1 | 6 |
+
+mirage0 побеждает для `0.0.0.0/1` и `128.0.0.0/1`.
+
+## Исходники
 
 | Файл | Назначение |
 |------|-----------|
-| `main.rs` | CLI: install/uninstall/run/debug-run/update/test-read |
-| `service.rs` | SCM integration, service lifecycle |
-| `api.rs` | Axum management API |
-| `wintun.rs` | Wintun FFI (dynamic load wintun.dll), dedicated reader thread |
-| `routing.rs` | Route management via netsh/route |
-| `ipstack.rs` | IpStack bridge (Wintun ↔ channels ↔ IpStack ↔ SOCKS5) |
+| `main.rs` | CLI: install/uninstall/run/debug-run/evaluate/update/test-read |
+| `service.rs` | SCM integration, service lifecycle, run_service_logic |
+| `api.rs` | Axum management API (6 endpoints) |
+| `wintun.rs` | Wintun FFI + WintunDevice (AsyncRead+AsyncWrite) |
+| `routing.rs` | Route management (default route, bypass, gateway detection) |
+| `ipstack.rs` | IpStack bridge: TCP→SOCKS5, UDP DNS→DoH resolver |
+| `firewall.rs` | WFP kill-switch (block all except relay+loopback) |
 | `proxy.rs` | System proxy (WinINET + WinHTTP) |
 | `state.rs` | ServiceState, TunPhase |
 | `error.rs` | TunError enum |
 
 ## Ключевые решения
 
-### Dedicated reader thread вместо spawn_blocking
+### Dedicated reader thread
 
-`tokio::spawn_blocking` для `WintunReceivePacket` зависает после первого успешного вызова. Причина: Wintun event handle (`WintunGetReadWaitEvent`) + `WaitForSingleObject` не совместимы с пулом потоков tokio. Решение: один persistent `std::thread` с синхронным циклом, отправляет пакеты через `tokio::sync::mpsc::channel(256)`.
+`tokio::spawn_blocking` для `WintunReceivePacket` зависает после первого успешного вызова — несовместимость Wintun event handle (`WintunGetReadWaitEvent`) + `WaitForSingleObject` с пулом потоков tokio. Решение: один persistent `std::thread` с синхронным циклом → `tokio::sync::mpsc::channel(256)`.
 
-### Route metric
+### Session reuse
 
-Общий metric = route metric + interface metric. Amnezia tun2: metric 6 (route=1, iface=5). mirage0: metric 2 (route=1, iface=1). mirage0 побеждает для `0.0.0.0/1` и `128.0.0.0/1`.
+`/tun/start` переиспользует `WintunHandle`, созданный при старте сервиса — не drop+recreate. Drop+recreate вызывал `WintunStartSession` failures: драйвер не успевал освободить сессию.
 
-### Порядок операций в /tun/start
+### Gateway detection
 
-1. Drop старый WintunHandle (уничтожает адаптер + маршруты)
-2. Create новый WintunHandle (новый адаптер, IP, session)
-3. Set DNS
-4. Add routes (после создания адаптера, иначе потеряются)
-5. Start IpStack + reader thread
+`netsh interface ipv4 show route` без filter-аргумента, пропуск не-IP шлюзов (например, "AmneziaVPN"). Fallback: `route.exe PRINT`.
 
-### IpStack — не свой, из mirage2web
+### WFP dynamic session
 
-`mirage-ipstack` = `mirage2web/crates/mirage-ipstack` (path dependency). Полноценный userspace TCP/IP стек. В `ipstack.rs` только bridge-код: `PacketDevice` (channels → AsyncRead/AsyncWrite), `IpStackRunner` (3 задачи), TCP→SOCKS5 форвардер, DNS форвардер.
+Фильтры привязаны к процессу — исчезают при крэше, нет stale sublayers.
 
-## Проверено (2026-04-21, без xray)
+### DoH via HTTP proxy
 
-- L1 `91.218.245.247` — ping OK (30мс), TCP:4700 OK. Доступен без xray и с xray.
-- L2 `45.59.119.139` — ping OK (72мс), TCP:4700 OK. Доступен без xray и с xray.
-- SOCKS5 клиент (`mirage-client.exe --config sandbox/client-config.json`) — работает без xray и с xray. `curl -x socks5h://127.0.0.1:19480 http://ifconfig.me` → `45.59.119.139`.
-- **Проблема в IpStack**: relay серверы и SOCKS5 клиент исправны. Баг в связке Wintun → IpStack → SOCKS5 (error 10053, TCP reset).
+DNS запросы идут через relay chain (HTTP proxy `:19481`), не напрямую — нет DNS leak.
 
-## Зависимости
+### IP_UNICAST_IF
 
-- `wintun.dll` — должен лежать рядом с exe
-- `mirage-client` — SOCKS5 endpoint для IpStack (`:19480`)
-- `mirage-ipstack` — path dep из `mirage2web/crates/mirage-ipstack`
-- Логи: `C:\ProgramData\mirage2tun\logs\`
+SOCKS5 соединения привязаны к физическому NIC (if_index=19) — пакеты не попадают в TUN loop.
 
-## Запуск для тестов
+## Известные ограничения
 
-```bash
-# 1. Запустить mirage-client (SOCKS5 на :19480)
-cd mirage2web
-RUST_LOG=info ./target/release/mirage-client.exe --config sandbox/client-config.json &
+- **Pool exhaustion под нагрузкой** (browser, много соединений) — ограничение mirage2web client, не mirage2tun
+- **SCM авторестарт**: после `sc stop` ждать до полной остановки перед `evaluate`
+- **Stale bypass routes от AmneziaVPN**: "object already exists" предупреждения — безвредны, fallback на route.exe
 
-# 2. Проверить SOCKS5
-curl -x socks5h://127.0.0.1:19480 http://ifconfig.me
-# → 45.59.119.139 (exit node)
+## Логи
 
-# 3. Запустить TUN
-curl -X POST http://127.0.0.1:19485/tun/start \
-  -H "Content-Type: application/json" \
-  -d '{"socks5_addr":"127.0.0.1:19480","relay_addrs":["91.218.245.247","45.59.119.139"]}'
-
-# 4. Весь трафик теперь идёт через mirage relay chain
-
-# 5. Остановить TUN (вернуть нормальный роутинг)
-curl -X POST http://127.0.0.1:19485/tun/stop
-```
+- Сервис: `C:\ProgramData\mirage2tun\logs\mirage2tun.log` (daily rolling)
+- Foreground: `mirage2tun.exe debug-run` или `mirage2tun.exe evaluate` → stdout
