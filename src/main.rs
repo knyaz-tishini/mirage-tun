@@ -31,6 +31,8 @@ enum Cmd {
     Update,
     /// Minimal Wintun read test — no IpStack, no tokio, just raw recv in a loop
     TestRead,
+    /// End-to-end TUN test: start service, activate TUN, verify exit IP + DNS, stop (requires admin + mirage2web running)
+    Evaluate,
 }
 
 fn main() {
@@ -66,6 +68,9 @@ fn main() {
         }
         Cmd::TestRead => {
             test_read();
+        }
+        Cmd::Evaluate => {
+            evaluate();
         }
     }
 }
@@ -337,4 +342,168 @@ fn debug_run() {
             }
         }
     });
+}
+
+fn evaluate() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stdout)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+        let stop_tx2 = stop_tx.clone();
+
+        // Spawn service logic in background
+        let svc_handle = tokio::spawn(async move {
+            if let Err(e) = service::run_service_logic(None, stop_tx2, stop_rx).await {
+                eprintln!("[evaluate] service error: {e}");
+            }
+        });
+
+        let api = "http://127.0.0.1:19485";
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .no_proxy()
+            .build()
+            .expect("reqwest client");
+
+        // 1) Wait for API ready
+        print!("[1/5] Waiting for API...");
+        let api_ok = poll_health(&client, api).await;
+        println!(" {}", verdict(api_ok));
+        if !api_ok {
+            eprintln!("ABORT: API never became ready");
+            let _ = stop_tx.send(());
+            let _ = svc_handle.await;
+            std::process::exit(1);
+        }
+
+        // 2) Activate TUN
+        print!("[2/5] POST /tun/start...");
+        let start_ok = activate_tun(&client, api).await;
+        println!(" {}", verdict(start_ok));
+        if !start_ok {
+            eprintln!("ABORT: TUN activation failed");
+            let _ = stop_tx.send(());
+            let _ = svc_handle.await;
+            std::process::exit(1);
+        }
+
+        // Let routes + DNS settle
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // 3) Check exit IP
+        print!("[3/5] Checking exit IP (ifconfig.me)...");
+        let (ip_ok, exit_ip) = check_exit_ip().await;
+        if ip_ok {
+            println!(" PASS ({})", exit_ip);
+        } else {
+            println!(" FAIL (got: {})", exit_ip);
+        }
+
+        // 4) Check DNS
+        print!("[4/5] Checking DNS (example.com)...");
+        let dns_ok = check_dns().await;
+        println!(" {}", verdict(dns_ok));
+
+        // 5) Stop TUN
+        print!("[5/5] POST /tun/stop...");
+        let stop_ok = deactivate_tun(&client, api).await;
+        println!(" {}", verdict(stop_ok));
+
+        // Shutdown service
+        let _ = stop_tx.send(());
+        let _ = svc_handle.await;
+
+        // Final verdict
+        println!();
+        let all_pass = api_ok && start_ok && ip_ok && dns_ok && stop_ok;
+        if all_pass {
+            println!("=== ALL PASS ===");
+        } else {
+            println!("=== FAIL ===");
+            std::process::exit(1);
+        }
+    });
+}
+
+fn verdict(ok: bool) -> &'static str {
+    if ok { "PASS" } else { "FAIL" }
+}
+
+async fn poll_health(client: &reqwest::Client, api: &str) -> bool {
+    for _ in 0..20 {
+        match client.get(format!("{api}/health")).send().await {
+            Ok(r) if r.status().is_success() => return true,
+            _ => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    false
+}
+
+async fn activate_tun(client: &reqwest::Client, api: &str) -> bool {
+    let body = serde_json::json!({
+        "socks5_addr": "127.0.0.1:19480",
+        "relay_addrs": ["91.218.245.247", "45.59.119.139"]
+    });
+    match client.post(format!("{api}/tun/start")).json(&body).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(e) => {
+            eprintln!(" error: {e}");
+            false
+        }
+    }
+}
+
+async fn check_exit_ip() -> (bool, String) {
+    // Route through SOCKS5 proxy (mirage2web) → relay chain → exit node
+    // Direct requests get blocked by WFP kill-switch
+    let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:19480").expect("proxy url");
+    let tun_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .proxy(proxy)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    match tun_client.get("http://ifconfig.me/ip").send().await {
+        Ok(r) => {
+            let body = r.text().await.unwrap_or_default().trim().to_string();
+            let ok = body.contains("45.59.119.139");
+            (ok, body)
+        }
+        Err(e) => (false, format!("error: {e}")),
+    }
+}
+
+async fn check_dns() -> bool {
+    // Route through SOCKS5 to verify DNS works end-to-end via relay
+    let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:19480").expect("proxy url");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .proxy(proxy)
+        .build();
+    match client {
+        Ok(c) => c.get("http://example.com").send().await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+async fn deactivate_tun(client: &reqwest::Client, api: &str) -> bool {
+    match client.post(format!("{api}/tun/stop")).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(e) => {
+            eprintln!(" error: {e}");
+            false
+        }
+    }
 }

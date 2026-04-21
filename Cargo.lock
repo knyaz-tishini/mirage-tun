@@ -849,6 +849,7 @@ dependencies = [
  "mirage-tun-core",
  "mirage-wfp",
  "rand 0.8.6",
+ "reqwest",
  "serde",
  "serde_json",
  "socket2 0.5.10",

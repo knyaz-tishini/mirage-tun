@@ -203,13 +203,14 @@ fn run_netsh_route(args: &[&str]) -> Result<()> {
 }
 
 /// Returns (gateway_ip, interface_index).
-/// Tries `netsh interface ipv4 show route 0.0.0.0/0` first for exact interface index,
+/// Tries `netsh interface ipv4 show route` first for exact interface index,
 /// falls back to `route print 0.0.0.0` with index=0 when netsh parsing fails.
 fn read_default_gateway() -> Option<(String, u32)> {
-    // netsh output columns: Publish Type Met Prefix Idx Gateway/InterfaceName
-    // Example line: No  Manual  25  0.0.0.0/0  12  192.168.1.1
+    // `netsh interface ipv4 show route` — no filter arg (Windows rejects it).
+    // Output columns: Publish Type Met Prefix Idx Gateway/InterfaceName
+    // Example: No  Manual  0  0.0.0.0/0  19  192.168.1.1
     let netsh_out = Command::new("netsh")
-        .args(["interface", "ipv4", "show", "route", "0.0.0.0/0"])
+        .args(["interface", "ipv4", "show", "route"])
         .output()
         .ok();
     if let Some(out) = netsh_out {
@@ -218,8 +219,11 @@ fn read_default_gateway() -> Option<(String, u32)> {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             if let Some(pos) = tokens.iter().position(|t| *t == "0.0.0.0/0") {
                 if let (Some(idx_str), Some(gw)) = (tokens.get(pos + 1), tokens.get(pos + 2)) {
-                    if let Ok(idx) = idx_str.parse::<u32>() {
-                        return Some((gw.to_string(), idx));
+                    // Only accept entries where gateway is a valid IP (skip "AmneziaVPN" etc.)
+                    if gw.parse::<std::net::IpAddr>().is_ok() {
+                        if let Ok(idx) = idx_str.parse::<u32>() {
+                            return Some((gw.to_string(), idx));
+                        }
                     }
                 }
             }
@@ -257,20 +261,23 @@ mod tests {
 
     #[test]
     fn parse_gateway_line_netsh() {
-        // Simulates `netsh interface ipv4 show route 0.0.0.0/0` output
-        let fake_output = "No       Manual    25   0.0.0.0/0                  12  192.168.1.1\n";
+        // Simulates `netsh interface ipv4 show route` output (no filter arg)
+        let fake_output = "No       Manual    0   0.0.0.0/0                  19  192.168.1.1\nNo       Manual    0   0.0.0.0/0                  44  AmneziaVPN\n";
         let mut found: Option<(String, u32)> = None;
         for line in fake_output.lines() {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             if let Some(pos) = tokens.iter().position(|t| *t == "0.0.0.0/0") {
                 if let (Some(idx_str), Some(gw)) = (tokens.get(pos + 1), tokens.get(pos + 2)) {
-                    if let Ok(idx) = idx_str.parse::<u32>() {
-                        found = Some((gw.to_string(), idx));
+                    if gw.parse::<std::net::IpAddr>().is_ok() {
+                        if let Ok(idx) = idx_str.parse::<u32>() {
+                            found = Some((gw.to_string(), idx));
+                            break;
+                        }
                     }
                 }
             }
         }
         assert_eq!(found.as_ref().map(|(gw, _)| gw.as_str()), Some("192.168.1.1"));
-        assert_eq!(found.as_ref().map(|(_, idx)| *idx), Some(12u32));
+        assert_eq!(found.as_ref().map(|(_, idx)| *idx), Some(19u32));
     }
 }

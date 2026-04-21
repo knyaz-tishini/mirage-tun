@@ -11,7 +11,6 @@ use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
 use mirage_dns::{DnsConfig, DnsResolver};
-use mirage_tun_core::config::TunConfig;
 use mirage_tun_core::traits::PlatformFirewall;
 
 use crate::error::TunError;
@@ -98,15 +97,7 @@ async fn post_tun_start(
 
     let tun_name = s.tun_name.clone();
 
-    // Recreate Wintun session FIRST (old adapter destroyed, new one created with IP)
-    drop(s.wintun.take());
-    let tun_cfg = TunConfig::default();
-    let wintun = crate::wintun::WintunHandle::create(&tun_name, &tun_cfg.tun_addr, tun_cfg.mtu)
-        .await
-        .map_err(map_err)?;
-    s.wintun = Some(wintun);
-
-    // Set DNS on fresh adapter
+    // Set DNS on adapter
     let _ = std::process::Command::new("netsh")
         .args(["interface", "ip", "set", "dns", &tun_name, "static", "10.0.85.1"])
         .output();
