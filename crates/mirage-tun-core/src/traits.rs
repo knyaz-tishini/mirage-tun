@@ -1,27 +1,26 @@
-use std::net::{IpAddr, SocketAddr};
-use crate::error::TunError;
+use std::net::IpAddr;
 
-#[async_trait::async_trait]
 pub trait PlatformTun: Send + Sync {
-    async fn create(&mut self) -> Result<(), TunError>;
-    async fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, TunError>;
-    async fn write_packet(&mut self, packet: &[u8]) -> Result<(), TunError>;
+    type Error: std::fmt::Display;
     fn name(&self) -> &str;
-    fn destroy(&mut self);
 }
 
 pub trait PlatformFirewall: Send + Sync {
+    type Error: std::fmt::Display;
     fn activate(
         &mut self,
-        relay_addrs: &[SocketAddr],
+        relay_addrs: &[IpAddr],
         tun_name: &str,
         exempt_ports: &[u16],
-    ) -> Result<(), TunError>;
-    fn deactivate(&mut self) -> Result<(), TunError>;
+    ) -> std::result::Result<(), Self::Error>;
+    fn deactivate(&mut self) -> std::result::Result<(), Self::Error>;
 }
 
 pub trait PlatformRouting: Send + Sync {
-    fn set_default_route(&mut self, tun_name: &str) -> Result<(), TunError>;
-    fn restore_routes(&mut self) -> Result<(), TunError>;
-    fn add_bypass(&mut self, addr: IpAddr) -> Result<(), TunError>;
+    type Error: std::fmt::Display;
+    fn set_default_route(&mut self) -> std::result::Result<(), Self::Error>;
+    fn restore_routes(&mut self) -> std::result::Result<(), Self::Error>;
+    fn add_bypass(&mut self, addr: IpAddr) -> std::result::Result<(), Self::Error>;
+    fn original_gateway(&self) -> Option<&str>;
+    fn original_interface_idx(&self) -> Option<u32>;
 }

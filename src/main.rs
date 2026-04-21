@@ -1,5 +1,6 @@
 mod api;
 mod error;
+mod firewall;
 mod ipstack;
 mod proxy;
 mod routing;

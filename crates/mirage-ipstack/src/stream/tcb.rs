@@ -107,13 +107,15 @@ impl Tcb {
         self.duplicate_ack_count >= self.max_count_for_dup_ack
     }
 
-    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
+    /// Returns `true` if the packet was a retransmit (seq < ack) and a duplicate ACK must be sent.
+    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) -> bool {
         if seq < self.ack {
             #[rustfmt::skip]
-            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
-            return;
+            log::debug!("{:?}: retransmit seq {seq} < ack {}, len = {} — needs dup ACK", self.state, self.ack, buf.len());
+            return true;
         }
         self.unordered_packets.insert(seq, buf);
+        false
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
         self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
@@ -350,9 +352,9 @@ mod tests {
             MAX_RETRANSMIT_COUNT,
         );
 
-        tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]);
-        tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]);
-        tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
+        assert!(!tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]));
+        assert!(!tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]));
+        assert!(!tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]));
 
         let data = tcb.consume_unordered_packets(700).unwrap();
         assert_eq!(data.len(), 700);

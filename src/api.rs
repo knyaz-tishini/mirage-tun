@@ -8,7 +8,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
-use tracing::info;
+use tracing::{info, warn};
+
+use mirage_tun_core::config::TunConfig;
+use mirage_tun_core::traits::PlatformFirewall;
 
 use crate::error::TunError;
 use crate::ipstack::IpStackRunner;
@@ -96,10 +99,10 @@ async fn post_tun_start(
 
     // Recreate Wintun session FIRST (old adapter destroyed, new one created with IP)
     drop(s.wintun.take());
-    let wintun = crate::wintun::WintunHandle::create(&tun_name, "10.0.85.1/24", 1500)
+    let tun_cfg = TunConfig::default();
+    let wintun = crate::wintun::WintunHandle::create(&tun_name, &tun_cfg.tun_addr, tun_cfg.mtu)
         .await
         .map_err(map_err)?;
-    let (reader, writer) = wintun.split();
     s.wintun = Some(wintun);
 
     // Set DNS on fresh adapter
@@ -111,20 +114,31 @@ async fn post_tun_start(
     let mut routing = Routing::new(&tun_name);
     routing.set_default_route().map_err(map_err)?;
 
+    let mut relay_ips: Vec<IpAddr> = Vec::new();
     for relay in &params.relay_addrs {
         if let Ok(ip) = relay.parse::<IpAddr>() {
             routing.add_bypass(ip).map_err(map_err)?;
+            relay_ips.push(ip);
         }
+    }
+
+    // Activate WFP kill-switch
+    let mut killswitch = crate::firewall::WfpKillSwitch::new();
+    if let Err(e) = killswitch.activate(&relay_ips, &tun_name, &[]) {
+        warn!("WFP kill-switch failed to activate (non-fatal): {e}");
     }
 
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let _runner = IpStackRunner::start(reader, writer, socks5_addr, cancel.clone())
+    let if_index = routing.original_interface_idx().unwrap_or(0);
+    let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
+    let _runner = IpStackRunner::start(device, socks5_addr, cancel.clone(), relay_ips, if_index)
         .await
         .map_err(map_err)?;
 
     s.ipstack_cancel = Some(cancel);
     s.socks5_addr = Some(socks5_addr);
+    s.killswitch = Some(killswitch);
     s.tun_phase = TunPhase::TunActive;
 
     // Store routing state
@@ -150,6 +164,10 @@ async fn post_tun_stop(
 
     if let Some(cancel) = s.ipstack_cancel.take() {
         cancel.cancel();
+    }
+
+    if let Some(mut ks) = s.killswitch.take() {
+        let _ = ks.deactivate();
     }
 
     // Restore routes manually

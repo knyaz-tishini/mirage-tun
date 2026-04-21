@@ -642,8 +642,11 @@ async fn tcp_main_logic_loop(
             TcpState::SynReceived => {
                 if flags & ACK == ACK {
                     if len > 0 {
-                        tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        if tcb.add_unordered_packet(incoming_seq, payload) {
+                            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                        } else {
+                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        }
                     }
                     tcb.change_state(TcpState::Established);
                 }
@@ -668,10 +671,13 @@ async fn tcp_main_logic_loop(
                             }
                         }
                         PacketType::NewPacket => {
-                            tcb.add_unordered_packet(incoming_seq, payload);
-                            let nt = network_tuple;
-                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
-                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            if tcb.add_unordered_packet(incoming_seq, payload) {
+                                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                            } else {
+                                let nt = network_tuple;
+                                extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
+                                write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            }
                         }
                         PacketType::Ack => {
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
@@ -721,9 +727,12 @@ async fn tcp_main_logic_loop(
                         ));
                     }
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
-                    if !payload.is_empty() && tcb.get_ack() == incoming_seq {
-                        tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                    if !payload.is_empty() {
+                        if tcb.add_unordered_packet(incoming_seq, payload) {
+                            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                        } else {
+                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        }
                     }
                 } else {
                     log::trace!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, unnormal case, we do nothing here");
@@ -774,9 +783,12 @@ async fn tcp_main_logic_loop(
                 } else if flags & ACK == ACK {
                     tcb.change_state(TcpState::FinWait2);
                     if len > 0 {
-                        tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
-                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                        if tcb.add_unordered_packet(incoming_seq, payload) {
+                            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                        } else {
+                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                        }
                     }
                     let new_state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {new_state:?}");
@@ -800,8 +812,9 @@ async fn tcp_main_logic_loop(
                 } else if flags & ACK == ACK && len > 0 {
                     if pkt_type == PacketType::KeepAlive {
                         write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                    } else if tcb.add_unordered_packet(incoming_seq, payload) {
+                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     } else {
-                        tcb.add_unordered_packet(incoming_seq, payload);
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }

@@ -1,0 +1,156 @@
+{
+  "client_id": "stend-client",
+  "private_key": "40667380fe85ce090fc9390b5dcdc62a617d0a690e1a0301001ee32e2443c850",
+  "chains": [
+    {
+      "chain_id": "classic-direct",
+      "l1": {
+        "addr": "91.218.245.247:4700",
+        "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+        "sni": null
+      },
+      "l2": {
+        "addr": "45.59.119.139:4700",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "l1_transparent": true,
+      "hops": [],
+      "handshake": "ephemeral",
+      "reply": "raw",
+      "protocol": "Mirage",
+      "priority": 10,
+      "shaping": "none",
+      "camouflage": "raw"
+    },
+    {
+      "chain_id": "byte-cipher-classic",
+      "l1": {
+        "addr": "91.218.245.247:4702",
+        "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+        "sni": null
+      },
+      "l2": {
+        "addr": "45.59.119.139:4700",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "l1_transparent": false,
+      "hops": [],
+      "handshake": "ephemeral",
+      "reply": "raw",
+      "protocol": "MirageTls",
+      "priority": 10,
+      "shaping": "none",
+      "camouflage": "raw"
+    },
+    {
+      "chain_id": "crypto-relay-classic",
+      "l1": {
+        "addr": "91.218.245.247:4703",
+        "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+        "sni": null
+      },
+      "l2": {
+        "addr": "45.59.119.139:4700",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "l1_transparent": false,
+      "hops": [],
+      "handshake": "ephemeral",
+      "reply": "raw",
+      "protocol": "Mirage",
+      "priority": 10,
+      "shaping": "none",
+      "camouflage": "raw"
+    },
+    {
+      "chain_id": "three-hop-onion",
+      "l1": null,
+      "l2": {
+        "addr": "45.59.119.139:4701",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "hops": [
+        {
+          "addr": "91.218.245.247:4701",
+          "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+          "sni": null,
+          "role": "entry"
+        },
+        {
+          "addr": "91.218.245.247:4710",
+          "public_key": "4996667ce03371bcbb4f974b466b01da4dee9fb21f13e20de5656dbb60625e6f",
+          "sni": null,
+          "role": "middle"
+        },
+        {
+          "addr": "45.59.119.139:4701",
+          "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+          "sni": null,
+          "role": "exit"
+        }
+      ],
+      "handshake": "ephemeral",
+      "reply": "onion",
+      "protocol": "Mirage",
+      "priority": 0,
+      "shaping": "none",
+      "camouflage": "raw"
+    },
+    {
+      "chain_id": "three-hop-telescopic",
+      "l1": null,
+      "l2": {
+        "addr": "45.59.119.139:4701",
+        "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+        "sni": null
+      },
+      "hops": [
+        {
+          "addr": "91.218.245.247:4701",
+          "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
+          "sni": null,
+          "role": "entry"
+        },
+        {
+          "addr": "91.218.245.247:4710",
+          "public_key": "4996667ce03371bcbb4f974b466b01da4dee9fb21f13e20de5656dbb60625e6f",
+          "sni": null,
+          "role": "middle"
+        },
+        {
+          "addr": "45.59.119.139:4701",
+          "public_key": "2a16c2311bb89080e0b3808711d9a486778dbd2fd203021bb632941188cebd3b",
+          "sni": null,
+          "role": "exit"
+        }
+      ],
+      "handshake": "telescopic",
+      "reply": "onion",
+      "protocol": "Mirage",
+      "priority": 0,
+      "shaping": "none",
+      "camouflage": "raw"
+    }
+  ],
+  "routing": {
+    "default_chain": "byte-cipher-classic",
+    "rules": [],
+    "direct_cidrs": [],
+    "blocked_domains": [],
+    "direct_domains": []
+  },
+  "pool": {
+    "pool_size": 50
+  },
+  "http_proxy": {
+    "enabled": true,
+    "bind_addr": "127.0.0.1:19481"
+  },
+  "psk": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
+  "management_key": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
+  "management_addr": "0.0.0.0:4498"
+}

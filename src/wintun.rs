@@ -1,10 +1,14 @@
 use std::{
+    collections::VecDeque,
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
+    pin::Pin,
     process::Command,
     ptr,
     sync::Arc,
+    task::{Context, Poll},
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use libloading::{Library, Symbol};
 use tracing::{debug, info, warn};
 use windows_sys::Win32::{
@@ -102,21 +106,15 @@ impl Drop for WintunShared {
     }
 }
 
-// ── WintunReader / WintunWriter ──────────────────────────────────────────────
+// ── WintunReader ──────────────────────────────────────────────────────────────
 
-/// Read-only half of a split Wintun device.
+/// Read-only half of a Wintun device (used internally by WintunDevice).
 pub struct WintunReader {
-    pub(crate) shared: Arc<WintunShared>,
-}
-
-/// Write-only half of a split Wintun device.
-pub struct WintunWriter {
     pub(crate) shared: Arc<WintunShared>,
 }
 
 // Safety: the underlying Wintun API is thread-safe for concurrent read/write.
 unsafe impl Send for WintunReader {}
-unsafe impl Send for WintunWriter {}
 
 impl WintunReader {
     /// Spawn a dedicated OS thread that reads packets from Wintun in a blocking
@@ -169,28 +167,6 @@ impl WintunReader {
     }
 }
 
-impl WintunWriter {
-    /// Write one IP packet to Wintun.
-    pub async fn send(&self, packet: Vec<u8>) -> Result<()> {
-        let shared = Arc::clone(&self.shared);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let len = packet.len() as u32;
-            let send_buf = unsafe { (shared.fn_alloc_send)(shared.session.0, len) };
-            if send_buf.is_null() {
-                return Err(TunError::Wintun(
-                    "WintunAllocateSendPacket returned NULL (ring buffer full?)".to_owned(),
-                ));
-            }
-            unsafe {
-                ptr::copy_nonoverlapping(packet.as_ptr(), send_buf, packet.len());
-                (shared.fn_send)(shared.session.0, send_buf);
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| TunError::Wintun(format!("spawn_blocking panicked: {e}")))?
-    }
-}
 
 // ── WintunHandle ──────────────────────────────────────────────────────────
 
@@ -210,11 +186,103 @@ impl WintunHandle {
         Ok(Self { shared: Arc::new(shared) })
     }
 
-    pub fn split(&self) -> (WintunReader, WintunWriter) {
-        (
-            WintunReader { shared: Arc::clone(&self.shared) },
-            WintunWriter { shared: Arc::clone(&self.shared) },
-        )
+    fn reader(&self) -> WintunReader {
+        WintunReader { shared: Arc::clone(&self.shared) }
+    }
+}
+
+// ── WintunDevice (AsyncRead + AsyncWrite for mirage-ipstack) ────────────────
+
+/// Combined read/write device wrapping Wintun for use with `mirage-ipstack`.
+///
+/// `mirage-ipstack` requires a single `AsyncRead + AsyncWrite` device.
+/// This adapter bridges the channel-based `WintunReader` and the
+/// blocking Wintun send API into that interface.
+pub struct WintunDevice {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    writer: Arc<WintunShared>,
+    read_buf: VecDeque<u8>,
+}
+
+impl WintunDevice {
+    /// Create from a WintunHandle. Starts the blocking reader thread internally.
+    pub fn new(handle: &WintunHandle) -> Self {
+        let reader = handle.reader();
+        let rx = reader.start_reader_thread();
+        Self {
+            rx,
+            writer: Arc::clone(&handle.shared),
+            read_buf: VecDeque::with_capacity(2048),
+        }
+    }
+}
+
+impl AsyncRead for WintunDevice {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Drain carry-over bytes first.
+        if !self.read_buf.is_empty() {
+            let n = std::cmp::min(self.read_buf.len(), buf.remaining());
+            let drained: Vec<u8> = self.read_buf.drain(..n).collect();
+            buf.put_slice(&drained);
+            return Poll::Ready(Ok(()));
+        }
+
+        // Poll channel for next packet.
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(packet)) => {
+                let n = std::cmp::min(packet.len(), buf.remaining());
+                buf.put_slice(&packet[..n]);
+                if n < packet.len() {
+                    self.read_buf.extend(&packet[n..]);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => {
+                // Channel closed = Wintun session ended.
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for WintunDevice {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        // mirage-ipstack calls write_all with exactly one serialized IP packet.
+        // Send it to Wintun immediately via spawn_blocking.
+        let packet = buf.to_vec();
+        let len = packet.len();
+        let shared = Arc::clone(&self.writer);
+        tokio::spawn(async move {
+            let shared2 = shared;
+            let _ = tokio::task::spawn_blocking(move || {
+                let pkt_len = packet.len() as u32;
+                let send_buf = unsafe { (shared2.fn_alloc_send)(shared2.session.0, pkt_len) };
+                if !send_buf.is_null() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(packet.as_ptr(), send_buf, packet.len());
+                        (shared2.fn_send)(shared2.session.0, send_buf);
+                    }
+                }
+            }).await;
+        });
+        Poll::Ready(Ok(len))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 

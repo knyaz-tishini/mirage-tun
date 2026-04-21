@@ -15,6 +15,8 @@ pub enum TunError {
     AlreadyActive,
     #[error("tun not active")]
     NotActive,
+    #[error("wfp: {0}")]
+    Wfp(String),
 }
 
 pub type Result<T> = std::result::Result<T, TunError>;

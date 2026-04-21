@@ -26,8 +26,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 axum = "0.8"
 windows-service = "0.7"
 libloading = "0.8"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
-mirage-ipstack = { path = "crates/mirage-ipstack" }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Networking_WinSock"] }
+socket2 = { version = "0.5", features = ["all"] }
 mirage-wfp = { path = "crates/mirage-wfp" }
 mirage-tun-core = { path = "crates/mirage-tun-core" }
 rand = { version = "0.8", features = ["std", "std_rng"] }
@@ -38,6 +38,8 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+mirage-ipstack = { path = "crates/mirage-ipstack" }
+log = "0.4"
 
 [profile.release]
 opt-level = 3

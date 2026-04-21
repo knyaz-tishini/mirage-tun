@@ -4,6 +4,7 @@ use crate::error::{Result, TunError};
 
 pub struct Routing {
     original_gateway: Option<String>,
+    original_interface_idx: Option<u32>,
     bypass_routes: Vec<String>,
     tun_default_set: bool,
     tun_name: String,
@@ -13,6 +14,7 @@ impl Routing {
     pub fn new(tun_name: impl Into<String>) -> Self {
         Self {
             original_gateway: None,
+            original_interface_idx: None,
             bypass_routes: Vec::new(),
             tun_default_set: false,
             tun_name: tun_name.into(),
@@ -23,10 +25,24 @@ impl Routing {
         self.original_gateway.as_deref()
     }
 
+    pub fn original_interface_idx(&self) -> Option<u32> {
+        self.original_interface_idx
+    }
+
     pub fn set_default_route(&mut self) -> Result<()> {
         cleanup_stale_routes(&self.tun_name);
-        self.original_gateway = read_default_gateway();
-        debug!(gateway = ?self.original_gateway, "Routing: saved original gateway");
+        if let Some((gw, idx)) = read_default_gateway() {
+            self.original_interface_idx = Some(idx);
+            self.original_gateway = Some(gw);
+        }
+        info!(
+            gateway = ?self.original_gateway,
+            if_idx = ?self.original_interface_idx,
+            "Routing: saved original default gateway (will be used for bypass routes)"
+        );
+        if self.original_gateway.is_none() {
+            warn!("Routing: could not detect original gateway — bypass routes will NOT work");
+        }
 
         let tun_name = &self.tun_name;
 
@@ -90,11 +106,46 @@ impl Routing {
 
     pub fn add_bypass(&mut self, addr: IpAddr) -> Result<()> {
         let addr_str = addr.to_string();
+        let prefix = format!("{addr_str}/32");
+        let if_idx = self.original_interface_idx.unwrap_or(0);
+
+        info!(
+            %addr,
+            gateway = ?self.original_gateway,
+            if_idx,
+            "Routing: adding bypass route for relay addr"
+        );
+
         if let Some(ref gw) = self.original_gateway.clone() {
-            run_route(&["add", &addr_str, "mask", "255.255.255.255", gw])?;
-            debug!(%addr, gateway = %gw, "Routing: bypass route added");
+            if if_idx > 0 {
+                // Prefer netsh with explicit interface index — more reliable on modern Windows
+                // than route.exe which can pick a different interface when TUN is active.
+                let if_idx_str = if_idx.to_string();
+                let result = run_netsh_route(&[
+                    "interface", "ipv4", "add", "route",
+                    &prefix,
+                    &format!("interface={if_idx_str}"),
+                    &format!("nexthop={gw}"),
+                    "metric=1",
+                    "store=active",
+                ]);
+                match &result {
+                    Ok(()) => info!(%addr, gateway = %gw, if_idx, "Routing: bypass route added via netsh"),
+                    Err(e) => {
+                        warn!(%addr, gateway = %gw, if_idx, "Routing: netsh bypass failed ({e}), falling back to route.exe");
+                        let idx_str = if_idx.to_string();
+                        run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1", "IF", &idx_str])?;
+                        info!(%addr, gateway = %gw, if_idx, "Routing: bypass route added via route.exe fallback");
+                    }
+                }
+            } else {
+                // No interface index — fall back to route.exe with just gateway
+                warn!(%addr, gateway = %gw, "Routing: no interface index, using route.exe without IF");
+                run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1"])?;
+                info!(%addr, gateway = %gw, "Routing: bypass route added via route.exe (no IF)");
+            }
         } else {
-            warn!(%addr, "Routing: no original gateway saved; bypass may be incomplete");
+            warn!(%addr, "Routing: no original gateway saved; bypass route NOT added — relay traffic will go through TUN");
         }
         self.bypass_routes.push(addr_str);
         Ok(())
@@ -151,13 +202,37 @@ fn run_netsh_route(args: &[&str]) -> Result<()> {
     Err(TunError::Routing(format!("netsh command failed ({label}): {stdout}{stderr}")))
 }
 
-fn read_default_gateway() -> Option<String> {
+/// Returns (gateway_ip, interface_index).
+/// Tries `netsh interface ipv4 show route 0.0.0.0/0` first for exact interface index,
+/// falls back to `route print 0.0.0.0` with index=0 when netsh parsing fails.
+fn read_default_gateway() -> Option<(String, u32)> {
+    // netsh output columns: Publish Type Met Prefix Idx Gateway/InterfaceName
+    // Example line: No  Manual  25  0.0.0.0/0  12  192.168.1.1
+    let netsh_out = Command::new("netsh")
+        .args(["interface", "ipv4", "show", "route", "0.0.0.0/0"])
+        .output()
+        .ok();
+    if let Some(out) = netsh_out {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if let Some(pos) = tokens.iter().position(|t| *t == "0.0.0.0/0") {
+                if let (Some(idx_str), Some(gw)) = (tokens.get(pos + 1), tokens.get(pos + 2)) {
+                    if let Ok(idx) = idx_str.parse::<u32>() {
+                        return Some((gw.to_string(), idx));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: route print — columns: Network Netmask Gateway Interface Metric
     let out = Command::new("route").args(["print", "0.0.0.0"]).output().ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         if tokens.len() >= 3 && tokens[0] == "0.0.0.0" && tokens[1] == "0.0.0.0" {
-            return Some(tokens[2].to_owned());
+            return Some((tokens[2].to_owned(), 0));
         }
     }
     None
@@ -166,15 +241,36 @@ fn read_default_gateway() -> Option<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn parse_gateway_line() {
+    fn parse_gateway_line_fallback() {
+        // Simulates `route print 0.0.0.0` fallback path
         let fake_output = "          0.0.0.0          0.0.0.0      192.168.1.1    192.168.1.50     25\n";
-        let mut found: Option<String> = None;
+        let mut found: Option<(String, u32)> = None;
         for line in fake_output.lines() {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             if tokens.len() >= 3 && tokens[0] == "0.0.0.0" && tokens[1] == "0.0.0.0" {
-                found = Some(tokens[2].to_owned());
+                found = Some((tokens[2].to_owned(), 0));
             }
         }
-        assert_eq!(found.as_deref(), Some("192.168.1.1"));
+        assert_eq!(found.as_ref().map(|(gw, _)| gw.as_str()), Some("192.168.1.1"));
+        assert_eq!(found.as_ref().map(|(_, idx)| *idx), Some(0u32));
+    }
+
+    #[test]
+    fn parse_gateway_line_netsh() {
+        // Simulates `netsh interface ipv4 show route 0.0.0.0/0` output
+        let fake_output = "No       Manual    25   0.0.0.0/0                  12  192.168.1.1\n";
+        let mut found: Option<(String, u32)> = None;
+        for line in fake_output.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if let Some(pos) = tokens.iter().position(|t| *t == "0.0.0.0/0") {
+                if let (Some(idx_str), Some(gw)) = (tokens.get(pos + 1), tokens.get(pos + 2)) {
+                    if let Ok(idx) = idx_str.parse::<u32>() {
+                        found = Some((gw.to_string(), idx));
+                    }
+                }
+            }
+        }
+        assert_eq!(found.as_ref().map(|(gw, _)| gw.as_str()), Some("192.168.1.1"));
+        assert_eq!(found.as_ref().map(|(_, idx)| *idx), Some(12u32));
     }
 }
