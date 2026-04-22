@@ -1,20 +1,22 @@
 # mirage2tun
 
-Windows Service — Wintun адаптер, маршрутизация, DNS (over TCP via SOCKS5), WFP kill-switch, системный прокси. Работает в связке с mirage2web client.
+Windows Service — Wintun адаптер, split tunnel, multi-chain routing, app-based bypass, policy engine, DNS (over TCP via SOCKS5), WFP kill-switch, системный прокси. Работает в связке с mirage2web client.
 
-**Статус (2026-04-22): TUN mode 0.3s latency** — on par with direct SOCKS5 (0.2s). DNS via SOCKS5 exit node, zero DNS leak.
+**Статус (2026-04-23): TUN mode 0.3s latency, split tunnel + multi-chain** — on par with direct SOCKS5 (0.2s). DNS via SOCKS5 exit node, zero DNS leak. Policy engine с hot-reload, app-based bypass, multi-SOCKS5 chains.
 
 ## Workspace crates
 
 ```
 mirage2tun/
 ├── crates/
-│   ├── mirage-ipstack/    # Legacy (unused)
-│   ├── mirage-wfp/        # Windows Filtering Platform (dynamic WFP engine)
-│   └── mirage-tun-core/   # Platform traits (PlatformFirewall, PlatformRouting, PlatformTun)
-├── vendor/
-│   └── netstack-smoltcp-0.2.2/  # Vendored + modified userspace TCP/IP stack (smoltcp)
-└── src/                   # Main binary (Windows Service)
+│   ├── mirage-tun-core/       # Platform traits (PlatformFirewall, PlatformRouting, PlatformTun)
+│   └── mirage-tun-windows/    # Windows implementation (main binary)
+│       ├── crates/
+│       │   ├── mirage-wfp/    # Windows Filtering Platform
+│       │   ├── mirage-ipstack/ # Legacy (unused)
+│       │   └── mirage-dns/    # DNS utilities
+│       └── vendor/
+│           └── netstack-smoltcp-0.2.2/  # Vendored userspace TCP/IP stack
 ```
 
 ## Порт
@@ -106,7 +108,9 @@ sc start mirage2tun           # SCM подхватит новый бинарь
   "adapter_alive": true,
   "tun_phase": "adapter_ready",
   "proxy_active": null,
-  "socks5_addr": null
+  "socks5_addr": null,
+  "policy_rules": 0,
+  "dns_map_size": 0
 }
 ```
 
@@ -117,11 +121,22 @@ sc start mirage2tun           # SCM подхватит новый бинарь
 ```json
 {
   "socks5_addr": "127.0.0.1:19480",
-  "relay_addrs": ["91.218.245.247", "45.59.119.139"]
+  "relay_addrs": ["91.218.245.247", "45.59.119.139"],
+  "chains": [
+    {"name": "default", "socks5_addr": "127.0.0.1:19480"},
+    {"name": "direct-ru", "socks5_addr": "127.0.0.1:19481"}
+  ],
+  "policy": {
+    "default_action": "mirage",
+    "rules": [
+      {"type": "dest_domain", "domain": ".ru", "action": "bypass"},
+      {"type": "dest_app_dir", "dir": "E:\\MU\\", "action": "bypass"}
+    ]
+  }
 }
 ```
 
-- `socks5_addr` — куда netstack форвардит TCP (mirage2web client)
+- `socks5_addr` — legacy compat; `chains` имеет приоритет
 - `relay_addrs` — IP relay/exit серверов; для них добавляются bypass routes через физический шлюз (иначе loop)
 - Маршруты: `0.0.0.0/1` + `128.0.0.0/1` через `mirage0`, metric 2 (iface=1 + route=1)
 - DNS: DNS-over-TCP via SOCKS5 → 8.8.8.8:53 на exit node (in-memory cache, 60s TTL, 1024 entries)
@@ -147,6 +162,96 @@ sc start mirage2tun           # SCM подхватит новый бинарь
 
 Graceful shutdown → SCM перезапускает (recovery policy).
 
+### GET /policy/get
+
+```json
+{
+  "default_action": "mirage",
+  "rules": [
+    {"type": "dest_domain", "domain": ".ru", "action": "bypass"},
+    {"type": "dest_app_dir", "dir": "E:\\MU\\", "action": "bypass"}
+  ]
+}
+```
+
+### POST /policy/set
+
+Тело — как у GET /policy/get. Сохраняется в tun.json. Hot-reload без перезапуска TUN.
+
+### GET /chains/list
+
+```json
+{
+  "chains": [
+    {"name": "default", "socks5_addr": "127.0.0.1:19480"}
+  ]
+}
+```
+
+### POST /chains/update
+
+Тело — как у GET /chains/list. Hot-reload chain endpoints.
+
+## Split Tunnel
+
+Трафик маршрутизируется по правилам policy engine:
+
+### Policy Rules
+
+| Тип | JSON | Пример |
+|-----|------|--------|
+| CIDR | `{"type": "dest_cidr", "cidr": "10.0.0.0/8", "action": "bypass"}` | Внутренние сети |
+| Domain | `{"type": "dest_domain", "domain": ".ru", "action": "bypass"}` | Суффикс-матч: `.ru` ловит `*.ru` |
+| Port | `{"type": "dest_port", "port": 443, "action": "chain:uk1"}` | Конкретный порт |
+| App path | `{"type": "dest_app_path", "path": "E:\\MU\\main.exe", "action": "bypass"}` | Конкретный exe |
+| App dir | `{"type": "dest_app_dir", "dir": "E:\\MU\\", "action": "bypass"}` | Все exe в папке + дочерние процессы |
+
+Приоритет: app_path → app_dir → domain → port → cidr → default_action.
+
+### Policy Actions
+
+| Action | Что делает |
+|--------|-----------|
+| `"bypass"` | Прямой коннект через native NIC, минуя прокси |
+| `"mirage"` | Через дефолтную цепочку (alias для `"chain:default"`) |
+| `"chain:NAME"` | Через именованную цепочку (e.g. `"chain:direct-ru"`) |
+
+### Multi-Chain Routing
+
+Каждая цепочка = отдельный SOCKS5 endpoint от mirage2web:
+
+```json
+{
+  "chains": [
+    {"name": "default", "socks5_addr": "127.0.0.1:19480"},
+    {"name": "direct-ru", "socks5_addr": "127.0.0.1:19481"},
+    {"name": "uk1", "socks5_addr": "127.0.0.1:19482"}
+  ]
+}
+```
+
+Policy привязывает правила к цепочкам: `.ru` → direct-ru, streaming → uk1, default → mirage.
+
+### App-Based Bypass
+
+Процесс определяется через Win32 `GetExtendedTcpTable` (src_port → PID) + `QueryFullProcessImageNameW`.
+
+Для игр с лаунчерами (MU Online, etc.): `dest_app_dir` правило + ancestor walk (`CreateToolhelp32Snapshot`) — если любой родитель в цепочке запущен из указанной папки, дочерний процесс наследует решение.
+
+Пример: `{"type": "dest_app_dir", "dir": "E:\\MU\\", "action": "bypass"}` — launcher, guard, anti-cheat, main.exe — всё bypass.
+
+### DNS Isolation
+
+- Bypass домены → native DNS через UDP (IP_UNICAST_IF → физический NIC)
+- Mirage домены → DNS-over-TCP via SOCKS5 → 8.8.8.8 на exit node
+- DnsMap: ip→domain reverse mapping для TCP policy lookup (8192 entries, 5min TTL)
+
+### UDP Bypass
+
+Non-DNS UDP (QUIC, game traffic, VoIP):
+- Bypass policy → форвард через native NIC (IP_UNICAST_IF)
+- Mirage policy → drop (SOCKS5 UDP ASSOCIATE не реализован)
+
 ## Архитектура
 
 ```
@@ -157,12 +262,18 @@ mirage2tun (Windows Service, SYSTEM)
 ├── netstack-smoltcp (vendored userspace TCP/IP, Nagle off, ACK delay off)
 │   ├── pump_wintun_to_stack: batch feed (SinkExt::feed) + single flush per burst
 │   ├── pump_stack_to_wintun: direct channel send, no AsyncWrite indirection
-│   ├── TCP → SOCKS5 connect 127.0.0.1:19480 (IP_UNICAST_IF → физический NIC, bypass TUN loop)
-│   └── UDP:53 → DNS-over-TCP via SOCKS5 → 8.8.8.8:53 (in-memory cache, 60s TTL, max 8 concurrent)
-├── mirage-wfp (WFP kill-switch: блокирует всё кроме relay IPs + loopback)
+│   ├── Policy engine: app_path → app_dir → domain → port → cidr → default_action
+│   ├── TCP → SOCKS5 (chain selection per policy, IP_UNICAST_IF → физический NIC)
+│   │   ├── bypass → native NIC direct connect
+│   │   └── chain:NAME → SOCKS5 endpoint из chain registry
+│   └── UDP:53 → DnsMap lookup → bypass: native UDP / mirage: DNS-over-TCP via SOCKS5
+│       └── Non-DNS UDP: bypass → native NIC, mirage → drop (no UDP ASSOCIATE)
+├── Chain registry (multi-SOCKS5 endpoints, hot-reload)
+├── DnsMap (ip→domain reverse, 8192 entries, 5min TTL)
+├── mirage-wfp (WFP kill-switch: блокирует всё кроме relay IPs + loopback, покрывает ConnectV6)
 ├── Routing (netsh + route.exe fallback, if_index=19 физический NIC)
 ├── System proxy (WinINET/WinHTTP)
-└── Axum API (127.0.0.1:19485)
+└── Axum API (127.0.0.1:19485, 11 endpoints)
 ```
 
 ### Traffic flow
@@ -174,11 +285,16 @@ App → Windows routing (0.0.0.0/1 → mirage0, metric 2)
   → mpsc channel (256 buffer)
   → pump_wintun_to_stack (batch feed + single flush)
   → netstack-smoltcp (userspace TCP/IP, Nagle off, ACK delay off)
-  → TCP: SOCKS5 connect 127.0.0.1:19480 (IP_UNICAST_IF на физическом NIC)
-      → mirage2web client → relay chain → exit node → internet
-  → UDP:53: DNS-over-TCP via SOCKS5 → 8.8.8.8:53 (cached, 60s TTL)
+  → Policy engine (src_port → PID → process path → ancestor walk)
+      ├── action=bypass → native NIC direct connect (IP_UNICAST_IF)
+      └── action=chain:NAME → SOCKS5 endpoint из chain registry
+              → mirage2web client → relay chain → exit node → internet
+  → UDP:53 → DnsMap lookup → policy check
+      ├── bypass domain → native UDP (IP_UNICAST_IF → физический NIC)
+      └── mirage domain → DNS-over-TCP via SOCKS5 → 8.8.8.8:53 (cached, 60s TTL)
+  → Non-DNS UDP: bypass → native NIC, mirage → drop
   → Response: netstack-smoltcp → pump_stack_to_wintun → wintun-writer thread → Wintun → app
-  → WFP kill-switch: блокирует non-relay, non-loopback outbound
+  → WFP kill-switch: блокирует non-relay, non-loopback outbound (IPv4 + IPv6)
 ```
 
 ### Bypass routes
@@ -201,12 +317,16 @@ mirage0 побеждает для `0.0.0.0/1` и `128.0.0.0/1`.
 |------|-----------|
 | `main.rs` | CLI: install/uninstall/run/debug-run/evaluate/update/test-read |
 | `service.rs` | SCM integration, service lifecycle, run_service_logic |
-| `api.rs` | Axum management API (6 endpoints) |
+| `api.rs` | Axum management API (11 endpoints) |
 | `wintun.rs` | Wintun FFI + dedicated reader/writer threads + `WintunDevice` (AsyncRead+AsyncWrite, optional raw channel extraction) |
 | `routing.rs` | Route management (default route, bypass, gateway detection) |
 | `ipstack.rs` | netstack-smoltcp bridge: TCP→SOCKS5, UDP DNS→DNS-over-TCP via SOCKS5, direct channel pumps |
 | `firewall.rs` | WFP kill-switch (block all except relay+loopback) |
 | `proxy.rs` | System proxy (WinINET + WinHTTP) |
+| `chains.rs` | Chain registry (multi-SOCKS5 endpoints) |
+| `policy.rs` | Policy engine (split tunnel rules, hot-reload) |
+| `process_info.rs` | Process resolver (PID lookup, ancestor walk) |
+| `dns_map.rs` | DNS reverse map (ip→domain, TTL 5min) |
 | `state.rs` | ServiceState, TunPhase |
 | `error.rs` | TunError enum |
 
@@ -262,6 +382,8 @@ SOCKS5 соединения привязаны к физическому NIC (if
 - **Pool exhaustion под нагрузкой** (browser, много соединений) — ограничение mirage2web client, не mirage2tun
 - **SCM авторестарт**: после `sc stop` ждать до полной остановки перед `evaluate`
 - **Stale bypass routes от AmneziaVPN**: "object already exists" предупреждения — безвредны, fallback на route.exe
+- **SOCKS5 UDP ASSOCIATE не реализован** — non-DNS UDP через mirage chain дропается (bypass работает)
+- **IPv6 CIDR** — поддержан в policy, WFP kill-switch покрывает ConnectV6
 
 ## Логи
 
