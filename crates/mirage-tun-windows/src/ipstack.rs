@@ -17,6 +17,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::chains::ChainMap;
 use crate::dns_map::DnsMap;
 use crate::error::{Result, TunError};
 use crate::policy::{PolicyDecision, PolicyEngine};
@@ -28,7 +29,7 @@ pub struct IpStackRunner;
 impl IpStackRunner {
     pub async fn start(
         device: WintunDevice,
-        socks5_addr: SocketAddr,
+        chain_map: Arc<ChainMap>,
         cancel: CancellationToken,
         relay_addrs: Vec<IpAddr>,
         if_index: u32,
@@ -37,9 +38,14 @@ impl IpStackRunner {
         native_dns: Option<SocketAddr>,
         process_resolver: Arc<ProcessResolver>,
     ) -> Result<Self> {
+        // Resolve default socks5 for DNS path and logging.
+        let default_socks5 = chain_map.get("default").copied()
+            .or_else(|| chain_map.values().next().copied());
+
         info!(
-            "IpStackRunner: started, socks5={socks5_addr}, \
-             relay_bypass={relay_addrs:?}, if_index={if_index}"
+            "IpStackRunner: started, default_socks5={default_socks5:?}, chains={}, \
+             relay_bypass={relay_addrs:?}, if_index={if_index}",
+            chain_map.len(),
         );
 
         let relay_set: Arc<HashSet<IpAddr>> =
@@ -83,7 +89,7 @@ impl IpStackRunner {
         ));
         tokio::spawn(tcp_accept_loop(
             tcp_listener,
-            socks5_addr,
+            chain_map.clone(),
             socks5_semaphore,
             if_index,
             cancel.clone(),
@@ -94,7 +100,7 @@ impl IpStackRunner {
         ));
         tokio::spawn(udp_dns_loop(
             udp_socket,
-            socks5_addr,
+            chain_map,
             if_index,
             cancel.clone(),
             policy,
@@ -214,7 +220,7 @@ async fn pump_stack_to_wintun(
 
 async fn tcp_accept_loop(
     mut tcp_listener: TcpListener,
-    socks5_addr: SocketAddr,
+    chain_map: Arc<ChainMap>,
     socks5_semaphore: Arc<Semaphore>,
     if_index: u32,
     cancel: CancellationToken,
@@ -262,39 +268,49 @@ async fn tcp_accept_loop(
                     let cancel2 = cancel.clone();
                     let stats2 = stats.clone();
 
-                    if decision == PolicyDecision::Bypass {
-                        info!("TCP {dst}: BYPASS app={} domain={domain_hint:?}",
-                            exe_short.as_deref().unwrap_or("?"));
-                        tokio::spawn(async move {
-                            tokio::select! {
-                                _ = cancel2.cancelled() => {}
-                                r = handle_bypass_tcp(stream, dst, if_index) => {
-                                    match r {
-                                        Ok(_) => { stats2.bypass_ok.fetch_add(1, Ordering::Relaxed); }
-                                        Err(e) => {
-                                            stats2.bypass_fail.fetch_add(1, Ordering::Relaxed);
-                                            warn!("IpStackRunner: TCP {dst} bypass error: {e}");
+                    match decision {
+                        PolicyDecision::Bypass => {
+                            info!("TCP {dst}: BYPASS app={} domain={domain_hint:?}",
+                                exe_short.as_deref().unwrap_or("?"));
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    _ = cancel2.cancelled() => {}
+                                    r = handle_bypass_tcp(stream, dst, if_index) => {
+                                        match r {
+                                            Ok(_) => { stats2.bypass_ok.fetch_add(1, Ordering::Relaxed); }
+                                            Err(e) => {
+                                                stats2.bypass_fail.fetch_add(1, Ordering::Relaxed);
+                                                warn!("IpStackRunner: TCP {dst} bypass error: {e}");
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        });
-                    } else {
-                        let sem = socks5_semaphore.clone();
-                        tokio::spawn(async move {
-                            tokio::select! {
-                                _ = cancel2.cancelled() => {}
-                                r = handle_tcp(stream, socks5_addr, dst, sem, if_index) => {
-                                    match &r {
-                                        Ok(_) => { stats2.socks5_ok.fetch_add(1, Ordering::Relaxed); }
-                                        Err(e) => {
-                                            stats2.socks5_fail.fetch_add(1, Ordering::Relaxed);
-                                            warn!("IpStackRunner: TCP {dst} error: {e}");
+                            });
+                        }
+                        PolicyDecision::Chain(chain_name) => {
+                            let socks5_addr = match chain_map.get(&chain_name).copied() {
+                                Some(addr) => addr,
+                                None => {
+                                    warn!("TCP {dst}: chain '{chain_name}' not found in chain_map — dropping");
+                                    continue;
+                                }
+                            };
+                            let sem = socks5_semaphore.clone();
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    _ = cancel2.cancelled() => {}
+                                    r = handle_tcp(stream, socks5_addr, dst, sem, if_index) => {
+                                        match &r {
+                                            Ok(_) => { stats2.socks5_ok.fetch_add(1, Ordering::Relaxed); }
+                                            Err(e) => {
+                                                stats2.socks5_fail.fetch_add(1, Ordering::Relaxed);
+                                                warn!("IpStackRunner: TCP {dst} chain '{chain_name}' error: {e}");
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        });
+                            });
+                        }
                     }
                 }
             }
@@ -489,13 +505,17 @@ fn create_udp_bypass_socket(_if_index: u32) -> std::io::Result<tokio::net::UdpSo
 
 async fn udp_dns_loop(
     udp_socket: UdpSocket,
-    socks5_addr: SocketAddr,
+    chain_map: Arc<ChainMap>,
     if_index: u32,
     cancel: CancellationToken,
     policy: Arc<PolicyEngine>,
     dns_map: Arc<DnsMap>,
     native_dns: Option<SocketAddr>,
 ) {
+    // Resolve default socks5 for DNS path.
+    let default_socks5 = chain_map.get("default").copied()
+        .or_else(|| chain_map.values().next().copied());
+
     let (mut read_half, write_half) = udp_socket.split();
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<UdpMsg>();
 
@@ -538,7 +558,7 @@ async fn udp_dns_loop(
                             )
                             .await;
                         } else {
-                            warn!("UDP non-DNS {dst_addr}: Mirage policy — dropped (SOCKS5 UDP not supported)");
+                            warn!("UDP non-DNS {dst_addr}: Chain policy — dropped (SOCKS5 UDP not supported)");
                         }
                         continue;
                     }
@@ -556,7 +576,7 @@ async fn udp_dns_loop(
                     let decision = if let Some(ref dom) = domain {
                         policy.domain_decision(dom).await
                     } else {
-                        PolicyDecision::Mirage
+                        PolicyDecision::default_chain()
                     };
 
                     let tx = resp_tx.clone();
@@ -595,7 +615,15 @@ async fn udp_dns_loop(
                         // native_dns not configured — fall through to SOCKS5
                     }
 
-                    // SOCKS5 path (Mirage or Bypass without native_dns)
+                    // SOCKS5 path — use default chain
+                    let socks5_addr = match default_socks5 {
+                        Some(addr) => addr,
+                        None => {
+                            warn!("DNS query: no default chain configured — dropping");
+                            continue;
+                        }
+                    };
+
                     tokio::spawn(async move {
                         let _permit = match sem.acquire().await {
                             Ok(p) => p,

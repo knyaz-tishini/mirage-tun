@@ -24,6 +24,7 @@ pub struct ServiceState {
     pub if_index: u32,
     pub policy: Option<Arc<crate::policy::PolicyEngine>>,
     pub dns_map: Arc<crate::dns_map::DnsMap>,
+    pub chains: Arc<crate::chains::ChainRegistry>,
 }
 
 impl ServiceState {
@@ -42,6 +43,7 @@ impl ServiceState {
             if_index: 0,
             policy: None,
             dns_map: Arc::new(crate::dns_map::DnsMap::new()),
+            chains: Arc::new(crate::chains::ChainRegistry::empty()),
         }
     }
 }

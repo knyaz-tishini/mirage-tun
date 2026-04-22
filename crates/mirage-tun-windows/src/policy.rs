@@ -4,11 +4,51 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Runtime routing decision — which chain to use, or bypass entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecision {
-    Mirage,
+    /// Route through the named SOCKS5 chain. "default" = legacy mirage path.
+    Chain(String),
+    /// Connect directly via the native interface (bypass the proxy).
     Bypass,
+}
+
+impl PolicyDecision {
+    pub fn default_chain() -> Self {
+        PolicyDecision::Chain("default".to_owned())
+    }
+}
+
+impl Serialize for PolicyDecision {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PolicyDecision::Bypass => s.serialize_str("bypass"),
+            PolicyDecision::Chain(name) if name == "default" => s.serialize_str("mirage"),
+            PolicyDecision::Chain(name) => s.serialize_str(&format!("chain:{name}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyDecision {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "bypass" => PolicyDecision::Bypass,
+            "mirage" => PolicyDecision::Chain("default".to_owned()),
+            other => {
+                if let Some(name) = other.strip_prefix("chain:") {
+                    PolicyDecision::Chain(name.to_owned())
+                } else {
+                    // Treat any unknown string as a named chain for forward compat.
+                    PolicyDecision::Chain(other.to_owned())
+                }
+            }
+        })
+    }
+}
+
+fn default_mirage() -> PolicyDecision {
+    PolicyDecision::Chain("default".to_owned())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,8 +70,6 @@ pub struct PolicyConfigRequest {
     #[serde(default = "default_mirage")]
     pub default_action: PolicyDecision,
 }
-
-fn default_mirage() -> PolicyDecision { PolicyDecision::Mirage }
 
 /// Parsed CIDR — either IPv4 (network_u32, mask_u32) or IPv6 (network_u128, mask_u128).
 enum ParsedCidr {
@@ -82,29 +120,29 @@ impl CompiledPolicy {
                 PolicyRule::DestCidr { cidr, action } => {
                     match parse_cidr(cidr) {
                         Some(ParsedCidr::V4(addr, mask)) => {
-                            cidr_table_v4.push((addr, mask, *action));
+                            cidr_table_v4.push((addr, mask, action.clone()));
                         }
                         Some(ParsedCidr::V6(addr, mask)) => {
-                            cidr_table_v6.push((addr, mask, *action));
+                            cidr_table_v6.push((addr, mask, action.clone()));
                         }
                         None => {}
                     }
                 }
                 PolicyRule::DestDomain { domain, action } => {
-                    domain_table.push((domain.to_lowercase(), *action));
+                    domain_table.push((domain.to_lowercase(), action.clone()));
                 }
                 PolicyRule::DestPort { port, action } => {
-                    port_table.insert(*port, *action);
+                    port_table.insert(*port, action.clone());
                 }
                 PolicyRule::DestAppPath { path, action } => {
-                    app_path_table.push((normalize_app_path(path), *action));
+                    app_path_table.push((normalize_app_path(path), action.clone()));
                 }
                 PolicyRule::DestAppDir { dir, action } => {
                     let mut normalized = normalize_app_path(dir);
                     if !normalized.ends_with('/') {
                         normalized.push('/');
                     }
-                    app_dir_table.push((normalized, *action));
+                    app_dir_table.push((normalized, action.clone()));
                 }
             }
         }
@@ -122,7 +160,7 @@ impl CompiledPolicy {
     }
 
     pub fn mirage_only() -> Self {
-        Self::compile(vec![], PolicyDecision::Mirage)
+        Self::compile(vec![], PolicyDecision::default_chain())
     }
 
     pub fn decide(
@@ -142,7 +180,7 @@ impl CompiledPolicy {
             for (rule_path, decision) in &self.app_path_table {
                 for &p in &paths {
                     if p == rule_path.as_str() {
-                        return *decision;
+                        return decision.clone();
                     }
                 }
             }
@@ -151,7 +189,7 @@ impl CompiledPolicy {
             for (rule_dir, decision) in &self.app_dir_table {
                 for &p in &paths {
                     if p.starts_with(rule_dir.as_str()) {
-                        return *decision;
+                        return decision.clone();
                     }
                 }
             }
@@ -163,25 +201,25 @@ impl CompiledPolicy {
             for (suffix, decision) in &self.domain_table {
                 if suffix.starts_with('.') {
                     if domain_lower.ends_with(suffix.as_str()) || domain_lower == &suffix[1..] {
-                        return *decision;
+                        return decision.clone();
                     }
                 } else if domain_lower == *suffix || domain_lower.ends_with(&format!(".{suffix}")) {
-                    return *decision;
+                    return decision.clone();
                 }
             }
         }
 
         // Check port
         if let Some(decision) = self.port_table.get(&dst_port) {
-            return *decision;
+            return decision.clone();
         }
 
         // Check CIDR — IPv4
         if let IpAddr::V4(v4) = dst_ip {
             let ip_u32 = u32::from(v4);
-            for &(network, mask, decision) in &self.cidr_table_v4 {
+            for (network, mask, decision) in &self.cidr_table_v4 {
                 if ip_u32 & mask == network & mask {
-                    return decision;
+                    return decision.clone();
                 }
             }
         }
@@ -189,14 +227,14 @@ impl CompiledPolicy {
         // Check CIDR — IPv6
         if let IpAddr::V6(v6) = dst_ip {
             let ip_u128 = u128::from(v6);
-            for &(network, mask, decision) in &self.cidr_table_v6 {
+            for (network, mask, decision) in &self.cidr_table_v6 {
                 if ip_u128 & mask == network & mask {
-                    return decision;
+                    return decision.clone();
                 }
             }
         }
 
-        self.default_action
+        self.default_action.clone()
     }
 
     pub fn domain_decision(&self, domain: &str) -> PolicyDecision {
@@ -204,13 +242,13 @@ impl CompiledPolicy {
         for (suffix, decision) in &self.domain_table {
             if suffix.starts_with('.') {
                 if domain_lower.ends_with(suffix.as_str()) || domain_lower == &suffix[1..] {
-                    return *decision;
+                    return decision.clone();
                 }
             } else if domain_lower == *suffix || domain_lower.ends_with(&format!(".{suffix}")) {
-                return *decision;
+                return decision.clone();
             }
         }
-        self.default_action
+        self.default_action.clone()
     }
 
     pub fn bypass_cidrs(&self) -> Vec<(u32, u32)> {

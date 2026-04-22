@@ -1,4 +1,5 @@
 pub mod api;
+pub mod chains;
 pub mod dns_map;
 pub mod error;
 pub mod firewall;

@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use mirage_tun_core::traits::PlatformFirewall;
 
+use crate::chains::{ChainConfig, ChainMap, ChainRegistry};
 use crate::error::TunError;
 use crate::ipstack::IpStackRunner;
 use crate::routing::Routing;
@@ -19,16 +20,27 @@ use crate::state::{ServiceState, TunPhase};
 
 #[derive(Serialize, Deserialize)]
 pub struct TunStartParams {
+    /// Legacy single-proxy address. Used when `chains` is empty.
+    #[serde(default)]
     pub socks5_addr: String,
     #[serde(default)]
     pub relay_addrs: Vec<String>,
     #[serde(default)]
     pub policy: Option<crate::policy::PolicyConfigRequest>,
+    /// Named SOCKS5 chains. If empty and `socks5_addr` is set, synthesizes
+    /// a single "default" chain from `socks5_addr` for backward compat.
+    #[serde(default)]
+    pub chains: Vec<ChainConfig>,
 }
 
 #[derive(Deserialize)]
 pub struct ProxySetParams {
     pub proxy_server: String,
+}
+
+#[derive(Deserialize)]
+pub struct ChainsUpdateParams {
+    pub chains: Vec<ChainConfig>,
 }
 
 #[derive(Serialize)]
@@ -51,6 +63,7 @@ pub struct AppState {
     pub stop_tx: watch::Sender<()>,
     pub policy: Arc<crate::policy::PolicyEngine>,
     pub dns_map: Arc<crate::dns_map::DnsMap>,
+    pub chains: Arc<ChainRegistry>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -64,6 +77,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/admin/restart", post(post_admin_restart))
         .route("/policy/get", get(get_policy))
         .route("/policy/set", post(set_policy))
+        .route("/chains/list", get(get_chains_list))
+        .route("/chains/update", post(post_chains_update))
         .with_state(state)
 }
 
@@ -121,9 +136,32 @@ pub async fn activate_tun_inner(
         return Err(TunError::AlreadyActive);
     }
 
-    let socks5_addr: SocketAddr = params.socks5_addr.parse().map_err(|e| {
-        TunError::Other(format!("invalid socks5_addr: {e}"))
-    })?;
+    // Build chain configs — backward compat: if `chains` is empty but `socks5_addr`
+    // is present, synthesize a single "default" chain.
+    let chain_configs: Vec<ChainConfig> = if params.chains.is_empty() && !params.socks5_addr.is_empty() {
+        vec![ChainConfig { name: "default".to_owned(), socks5_addr: params.socks5_addr.clone() }]
+    } else {
+        params.chains.clone()
+    };
+
+    if chain_configs.is_empty() {
+        return Err(TunError::Other("no chains configured and no socks5_addr provided".to_owned()));
+    }
+
+    // Resolve the "default" chain address (used for DNS warmup / legacy path).
+    let default_socks5: SocketAddr = chain_configs
+        .iter()
+        .find(|c| c.name == "default")
+        .or_else(|| chain_configs.first())
+        .ok_or_else(|| TunError::Other("no chain available".to_owned()))
+        .and_then(|c| {
+            c.socks5_addr.parse::<SocketAddr>()
+                .map_err(|e| TunError::Other(format!("invalid socks5_addr '{}': {e}", c.socks5_addr)))
+        })?;
+
+    // Build ChainMap for IpStackRunner.
+    let chain_registry = ChainRegistry::new(chain_configs.clone());
+    let chain_map = chain_registry.snapshot().await;
 
     s.tun_phase = TunPhase::Transitioning;
 
@@ -186,7 +224,7 @@ pub async fn activate_tun_inner(
     let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
     let _runner = IpStackRunner::start(
         device,
-        socks5_addr,
+        chain_map,
         cancel.clone(),
         relay_ips,
         if_index,
@@ -198,7 +236,7 @@ pub async fn activate_tun_inner(
     .await?;
 
     s.ipstack_cancel = Some(cancel);
-    s.socks5_addr = Some(socks5_addr);
+    s.socks5_addr = Some(default_socks5);
     s.killswitch = Some(killswitch);
     s.tun_phase = TunPhase::TunActive;
     s.if_index = if_index;
@@ -215,7 +253,14 @@ pub async fn activate_tun_inner(
         info!("Policy loaded from TUN start params");
     }
 
-    info!("TUN started, socks5={socks5_addr}");
+    // Update chain registry on AppState.
+    let new_map: ChainMap = chain_configs.iter().filter_map(|c| {
+        c.socks5_addr.parse::<SocketAddr>().ok().map(|addr| (c.name.clone(), addr))
+    }).collect();
+    state.chains.update(new_map).await;
+    s.chains = Arc::clone(&state.chains);
+
+    info!("TUN started, default_socks5={default_socks5}, chains={}", chain_configs.len());
     Ok(())
 }
 
@@ -322,7 +367,7 @@ async fn set_policy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<crate::policy::PolicyConfigRequest>,
 ) -> StatusCode {
-    let compiled = crate::policy::CompiledPolicy::compile(req.rules.clone(), req.default_action);
+    let compiled = crate::policy::CompiledPolicy::compile(req.rules.clone(), req.default_action.clone());
     let new_bypass_cidrs = compiled.bypass_cidrs();
     state.policy.update(compiled).await;
     info!("Policy updated via API");
@@ -345,6 +390,30 @@ async fn set_policy(
 
     // Best-effort persist — failure is logged inside, never fails the response.
     crate::service::save_policy_to_config(&req);
+    StatusCode::OK
+}
+
+async fn get_chains_list(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let configs = state.chains.to_configs().await;
+    Json(serde_json::json!({ "chains": configs }))
+}
+
+async fn post_chains_update(
+    State(state): State<Arc<AppState>>,
+    Json(params): Json<ChainsUpdateParams>,
+) -> StatusCode {
+    let new_map: ChainMap = params.chains.iter().filter_map(|c| {
+        c.socks5_addr.parse::<SocketAddr>()
+            .map_err(|e| warn!("chains/update: invalid addr '{}' for '{}': {e}", c.socks5_addr, c.name))
+            .ok()
+            .map(|addr| (c.name.clone(), addr))
+    }).collect();
+
+    let count = new_map.len();
+    state.chains.update(new_map).await;
+    info!("Chains updated via API: {count} chains");
     StatusCode::OK
 }
 
