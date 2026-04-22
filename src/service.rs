@@ -122,7 +122,7 @@ pub async fn run_service_logic(
     mut stop_rx: watch::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Stale state cleanup
-    cleanup_stale_routes(TUN_NAME);
+    cleanup_stale_routes(TUN_NAME).await;
     crate::proxy::clear_system_proxy();
 
     let wintun = match WintunHandle::create(TUN_NAME, TUN_ADDR, TUN_MTU).await {
@@ -159,7 +159,6 @@ pub async fn run_service_logic(
                     Ok(contents) => {
                         match serde_json::from_str::<crate::api::TunStartParams>(&contents) {
                             Ok(params) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 match autostart_activate(autostart_state, params).await {
                                     Ok(()) => info!("Autostart: TUN activated successfully"),
                                     Err(e) => tracing::warn!("Autostart: TUN activation failed: {e}"),

@@ -97,18 +97,19 @@ pub async fn activate_tun_inner(
     let tun_name = s.tun_name.clone();
 
     // Set DNS on adapter
-    let _ = std::process::Command::new("netsh")
+    let _ = tokio::process::Command::new("netsh")
         .args(["interface", "ip", "set", "dns", &tun_name, "static", "198.18.0.1"])
-        .output();
+        .output()
+        .await;
 
     // Routes AFTER adapter exists — otherwise they vanish with destroyed interface
     let mut routing = Routing::new(&tun_name);
-    routing.set_default_route()?;
+    routing.set_default_route().await?;
 
     let mut relay_ips: Vec<IpAddr> = Vec::new();
     for relay in &params.relay_addrs {
         if let Ok(ip) = relay.parse::<IpAddr>() {
-            routing.add_bypass(ip)?;
+            routing.add_bypass(ip).await?;
             relay_ips.push(ip);
         }
     }
@@ -173,26 +174,32 @@ async fn post_tun_stop(
     // Restore routes manually
     let tun_name = s.tun_name.clone();
     if s.tun_default_set {
-        let _ = std::process::Command::new("netsh")
-            .args(["interface", "ipv4", "delete", "route", "0.0.0.0/1", &format!("interface={tun_name}"), "store=active"])
-            .output();
-        let _ = std::process::Command::new("netsh")
-            .args(["interface", "ipv4", "delete", "route", "128.0.0.0/1", &format!("interface={tun_name}"), "store=active"])
-            .output();
+        let iface = format!("interface={tun_name}");
+        let (_, _) = tokio::join!(
+            tokio::process::Command::new("netsh")
+                .args(["interface", "ipv4", "delete", "route", "0.0.0.0/1", &iface, "store=active"])
+                .output(),
+            tokio::process::Command::new("netsh")
+                .args(["interface", "ipv4", "delete", "route", "128.0.0.0/1", &iface, "store=active"])
+                .output()
+        );
         s.tun_default_set = false;
     }
 
     // Remove bypass routes
-    for addr in s.bypass_routes.drain(..) {
-        let _ = std::process::Command::new("route")
+    let bypass: Vec<String> = s.bypass_routes.drain(..).collect();
+    for addr in bypass {
+        let _ = tokio::process::Command::new("route")
             .args(["delete", &addr, "mask", "255.255.255.255"])
-            .output();
+            .output()
+            .await;
     }
 
     // Clear DNS
-    let _ = std::process::Command::new("netsh")
+    let _ = tokio::process::Command::new("netsh")
         .args(["interface", "ip", "set", "dns", &tun_name, "dhcp"])
-        .output();
+        .output()
+        .await;
 
     s.socks5_addr = None;
     s.tun_phase = TunPhase::AdapterReady;

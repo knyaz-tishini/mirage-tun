@@ -1,4 +1,4 @@
-use std::{net::IpAddr, process::Command};
+use std::net::IpAddr;
 use tracing::{debug, info, warn};
 use crate::error::{Result, TunError};
 
@@ -29,9 +29,8 @@ impl Routing {
         self.original_interface_idx
     }
 
-    pub fn set_default_route(&mut self) -> Result<()> {
-        cleanup_stale_routes(&self.tun_name);
-        if let Some((gw, idx)) = read_default_gateway() {
+    pub async fn set_default_route(&mut self) -> Result<()> {
+        if let Some((gw, idx)) = read_default_gateway().await {
             self.original_interface_idx = Some(idx);
             self.original_gateway = Some(gw);
         }
@@ -44,67 +43,52 @@ impl Routing {
             warn!("Routing: could not detect original gateway — bypass routes will NOT work");
         }
 
-        let tun_name = &self.tun_name;
+        let tun_name = self.tun_name.clone();
 
         // Set interface metric to 1 so total metric (route + iface) beats amnezia
         if let Err(e) = run_netsh_route(&[
             "interface", "ipv4", "set", "interface",
-            tun_name,
+            &tun_name,
             "metric=1",
-        ]) {
+        ]).await {
             warn!("failed to set interface metric (non-fatal): {e}");
         }
 
-        run_netsh_route(&[
-            "interface", "ipv4", "add", "route",
-            "0.0.0.0/1",
-            &format!("interface={tun_name}"),
-            "metric=1",
-            "store=active",
-        ])?;
-        run_netsh_route(&[
-            "interface", "ipv4", "add", "route",
-            "128.0.0.0/1",
-            &format!("interface={tun_name}"),
-            "metric=1",
-            "store=active",
-        ])?;
+        let iface = format!("interface={tun_name}");
+        // Run both half-route additions in parallel
+        let args0 = ["interface", "ipv4", "add", "route", "0.0.0.0/1", iface.as_str(), "metric=1", "store=active"];
+        let args1 = ["interface", "ipv4", "add", "route", "128.0.0.0/1", iface.as_str(), "metric=1", "store=active"];
+        tokio::try_join!(
+            run_netsh_route(&args0),
+            run_netsh_route(&args1)
+        )?;
         self.tun_default_set = true;
         info!(tun_name, "Routing: default route set via TUN (metric=1+1=2)");
         Ok(())
     }
 
-    pub fn restore_routes(&mut self) -> Result<()> {
+    pub fn restore_routes_sync(&mut self) {
         for addr in self.bypass_routes.drain(..) {
-            if let Err(e) = run_route(&["delete", &addr, "mask", "255.255.255.255"]) {
-                warn!("Routing: failed to remove bypass route {addr}: {e}");
-            }
+            let _ = std::process::Command::new("route")
+                .args(["delete", &addr, "mask", "255.255.255.255"])
+                .output();
         }
         if self.tun_default_set {
             let name = &self.tun_name;
-            if let Err(e) = run_netsh_route(&[
-                "interface", "ipv4", "delete", "route",
-                "0.0.0.0/1",
-                &format!("interface={name}"),
-                "store=active",
-            ]) {
-                warn!("Routing: failed to remove TUN route 0.0.0.0/1: {e}");
-            }
-            if let Err(e) = run_netsh_route(&[
-                "interface", "ipv4", "delete", "route",
-                "128.0.0.0/1",
-                &format!("interface={name}"),
-                "store=active",
-            ]) {
-                warn!("Routing: failed to remove TUN route 128.0.0.0/1: {e}");
-            }
+            let _ = std::process::Command::new("netsh")
+                .args(["interface", "ipv4", "delete", "route", "0.0.0.0/1",
+                       &format!("interface={name}"), "store=active"])
+                .output();
+            let _ = std::process::Command::new("netsh")
+                .args(["interface", "ipv4", "delete", "route", "128.0.0.0/1",
+                       &format!("interface={name}"), "store=active"])
+                .output();
             self.tun_default_set = false;
         }
-        info!("Routing: routes restored");
-        Ok(())
+        info!("Routing: routes restored (sync)");
     }
 
-    pub fn add_bypass(&mut self, addr: IpAddr) -> Result<()> {
+    pub async fn add_bypass(&mut self, addr: IpAddr) -> Result<()> {
         let addr_str = addr.to_string();
         let prefix = format!("{addr_str}/32");
         let if_idx = self.original_interface_idx.unwrap_or(0);
@@ -128,20 +112,20 @@ impl Routing {
                     &format!("nexthop={gw}"),
                     "metric=1",
                     "store=active",
-                ]);
+                ]).await;
                 match &result {
                     Ok(()) => info!(%addr, gateway = %gw, if_idx, "Routing: bypass route added via netsh"),
                     Err(e) => {
                         warn!(%addr, gateway = %gw, if_idx, "Routing: netsh bypass failed ({e}), falling back to route.exe");
                         let idx_str = if_idx.to_string();
-                        run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1", "IF", &idx_str])?;
+                        run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1", "IF", &idx_str]).await?;
                         info!(%addr, gateway = %gw, if_idx, "Routing: bypass route added via route.exe fallback");
                     }
                 }
             } else {
                 // No interface index — fall back to route.exe with just gateway
                 warn!(%addr, gateway = %gw, "Routing: no interface index, using route.exe without IF");
-                run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1"])?;
+                run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1"]).await?;
                 info!(%addr, gateway = %gw, "Routing: bypass route added via route.exe (no IF)");
             }
         } else {
@@ -155,33 +139,30 @@ impl Routing {
 impl Drop for Routing {
     fn drop(&mut self) {
         if self.tun_default_set || !self.bypass_routes.is_empty() {
-            if let Err(e) = self.restore_routes() {
-                warn!("Routing::drop: failed to restore routes: {e}");
-            }
+            self.restore_routes_sync();
         }
     }
 }
 
-pub fn cleanup_stale_routes(tun_name: &str) {
-    let _ = run_netsh_route(&[
-        "interface", "ipv4", "delete", "route",
-        "0.0.0.0/1",
-        &format!("interface={tun_name}"),
-        "store=active",
-    ]);
-    let _ = run_netsh_route(&[
-        "interface", "ipv4", "delete", "route",
-        "128.0.0.0/1",
-        &format!("interface={tun_name}"),
-        "store=active",
-    ]);
+pub async fn cleanup_stale_routes(tun_name: &str) {
+    let iface = format!("interface={tun_name}");
+    let args0 = ["interface", "ipv4", "delete", "route", "0.0.0.0/1", iface.as_str(), "store=active"];
+    let args1 = ["interface", "ipv4", "delete", "route", "128.0.0.0/1", iface.as_str(), "store=active"];
+    let (_, _) = tokio::join!(
+        run_netsh_route(&args0),
+        run_netsh_route(&args1)
+    );
     debug!("Routing: stale route cleanup done");
 }
 
-fn run_route(args: &[&str]) -> Result<()> {
+async fn run_route(args: &[&str]) -> Result<()> {
     let label = format!("route {}", args.join(" "));
     debug!(cmd = %label, "Routing: running");
-    let out = Command::new("route").args(args).output().map_err(|e| TunError::Io { source: e })?;
+    let out = tokio::process::Command::new("route")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| TunError::Io { source: e })?;
     if out.status.success() {
         return Ok(());
     }
@@ -190,10 +171,14 @@ fn run_route(args: &[&str]) -> Result<()> {
     Err(TunError::Routing(format!("route command failed ({label}): {stdout}{stderr}")))
 }
 
-fn run_netsh_route(args: &[&str]) -> Result<()> {
+async fn run_netsh_route(args: &[&str]) -> Result<()> {
     let label = format!("netsh {}", args.join(" "));
     debug!(cmd = %label, "Routing: running");
-    let out = Command::new("netsh").args(args).output().map_err(|e| TunError::Io { source: e })?;
+    let out = tokio::process::Command::new("netsh")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| TunError::Io { source: e })?;
     if out.status.success() {
         return Ok(());
     }
@@ -205,13 +190,14 @@ fn run_netsh_route(args: &[&str]) -> Result<()> {
 /// Returns (gateway_ip, interface_index).
 /// Tries `netsh interface ipv4 show route` first for exact interface index,
 /// falls back to `route print 0.0.0.0` with index=0 when netsh parsing fails.
-fn read_default_gateway() -> Option<(String, u32)> {
+async fn read_default_gateway() -> Option<(String, u32)> {
     // `netsh interface ipv4 show route` — no filter arg (Windows rejects it).
     // Output columns: Publish Type Met Prefix Idx Gateway/InterfaceName
     // Example: No  Manual  0  0.0.0.0/0  19  192.168.1.1
-    let netsh_out = Command::new("netsh")
+    let netsh_out = tokio::process::Command::new("netsh")
         .args(["interface", "ipv4", "show", "route"])
         .output()
+        .await
         .ok();
     if let Some(out) = netsh_out {
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -231,7 +217,11 @@ fn read_default_gateway() -> Option<(String, u32)> {
     }
 
     // Fallback: route print — columns: Network Netmask Gateway Interface Metric
-    let out = Command::new("route").args(["print", "0.0.0.0"]).output().ok()?;
+    let out = tokio::process::Command::new("route")
+        .args(["print", "0.0.0.0"])
+        .output()
+        .await
+        .ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();

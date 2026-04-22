@@ -456,24 +456,24 @@ fn assign_ip_address(tun_name: &str, tun_addr: &str, mtu: u16) -> Result<()> {
 
     let netmask = prefix_to_netmask(prefix_len);
 
+    // Run set address and set MTU in parallel — they're independent.
+    // MTU thread spawned first; address (the slow one) runs on current thread.
+    let mtu_str = format!("mtu={mtu}");
+    let tun_for_mtu = tun_name.to_owned();
+    let mtu_handle = std::thread::spawn(move || {
+        run_netsh(&[
+            "interface", "ipv4", "set", "subinterface",
+            &tun_for_mtu, &mtu_str, "store=persistent",
+        ])
+    });
+
     run_netsh(&[
         "interface", "ip", "set", "address",
         tun_name, "static", addr_str, &netmask,
     ])?;
 
-    let mtu_str = format!("mtu={mtu}");
-    if let Err(e) = run_netsh(&[
-        "interface", "ipv4", "set", "subinterface",
-        tun_name, &mtu_str, "store=persistent",
-    ]) {
+    if let Err(e) = mtu_handle.join().unwrap_or_else(|_| Err(TunError::Wintun("MTU thread panicked".to_owned()))) {
         warn!("failed to set MTU (non-fatal): {e}");
-    }
-
-    if let Err(e) = run_netsh(&[
-        "interface", "ip", "set", "dns",
-        tun_name, "static", addr_str,
-    ]) {
-        warn!("failed to set DNS on TUN (non-fatal): {e}");
     }
 
     info!(name = tun_name, addr = addr_str, mask = %netmask, mtu, "IP address assigned");
@@ -481,9 +481,9 @@ fn assign_ip_address(tun_name: &str, tun_addr: &str, mtu: u16) -> Result<()> {
 }
 
 fn wait_interface_ready(tun_name: &str) {
-    for attempt in 0..10u32 {
+    for attempt in 0..3u32 {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if let Ok(out) = Command::new("netsh")
             .args(["interface", "ipv4", "show", "interfaces"])
@@ -498,7 +498,7 @@ fn wait_interface_ready(tun_name: &str) {
             }
         }
     }
-    warn!("Wintun interface '{tun_name}' not confirmed ready after 3 s, proceeding anyway");
+    warn!("Wintun interface '{tun_name}' not confirmed ready after 300ms, proceeding anyway");
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
