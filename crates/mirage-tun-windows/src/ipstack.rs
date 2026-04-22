@@ -17,7 +17,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::dns_map::DnsMap;
 use crate::error::{Result, TunError};
+use crate::policy::{PolicyDecision, PolicyEngine};
 use crate::wintun::WintunDevice;
 
 pub struct IpStackRunner;
@@ -29,6 +31,9 @@ impl IpStackRunner {
         cancel: CancellationToken,
         relay_addrs: Vec<IpAddr>,
         if_index: u32,
+        policy: Arc<PolicyEngine>,
+        dns_map: Arc<DnsMap>,
+        native_dns: Option<SocketAddr>,
     ) -> Result<Self> {
         info!(
             "IpStackRunner: started, socks5={socks5_addr}, \
@@ -81,8 +86,18 @@ impl IpStackRunner {
             if_index,
             cancel.clone(),
             stats.clone(),
+            policy.clone(),
+            dns_map.clone(),
         ));
-        tokio::spawn(udp_dns_loop(udp_socket, socks5_addr, if_index, cancel.clone()));
+        tokio::spawn(udp_dns_loop(
+            udp_socket,
+            socks5_addr,
+            if_index,
+            cancel.clone(),
+            policy,
+            dns_map,
+            native_dns,
+        ));
 
         // Stats printer
         let stats2 = stats.clone();
@@ -94,12 +109,14 @@ impl IpStackRunner {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {
                         let s = &stats2;
                         info!(
-                            "TUN stats: wintun→stack={} stack→wintun={} tcp_accept={} socks5_ok={} socks5_fail={} sink_err={}",
+                            "TUN stats: wintun→stack={} stack→wintun={} tcp_accept={} socks5_ok={} socks5_fail={} bypass_ok={} bypass_fail={} sink_err={}",
                             s.wintun_to_stack.load(Ordering::Relaxed),
                             s.stack_to_wintun.load(Ordering::Relaxed),
                             s.tcp_accepted.load(Ordering::Relaxed),
                             s.socks5_ok.load(Ordering::Relaxed),
                             s.socks5_fail.load(Ordering::Relaxed),
+                            s.bypass_ok.load(Ordering::Relaxed),
+                            s.bypass_fail.load(Ordering::Relaxed),
                             s.sink_errors.load(Ordering::Relaxed),
                         );
                     }
@@ -121,6 +138,8 @@ struct PumpStats {
     socks5_ok: AtomicU64,
     socks5_fail: AtomicU64,
     sink_errors: AtomicU64,
+    bypass_ok: AtomicU64,
+    bypass_fail: AtomicU64,
 }
 
 // ── Wintun ↔ Stack pumps ──────────────────────────────────────────────────────
@@ -197,6 +216,8 @@ async fn tcp_accept_loop(
     if_index: u32,
     cancel: CancellationToken,
     stats: Arc<PumpStats>,
+    policy: Arc<PolicyEngine>,
+    dns_map: Arc<DnsMap>,
 ) {
     loop {
         tokio::select! {
@@ -210,23 +231,47 @@ async fn tcp_accept_loop(
                 Some((stream, _local_addr, remote_addr)) => {
                     let dst = remote_addr;
                     stats.tcp_accepted.fetch_add(1, Ordering::Relaxed);
-                    let sem = socks5_semaphore.clone();
+
+                    // Policy decision
+                    let domain_hint = dns_map.get(&dst.ip());
+                    let decision = policy.decide(dst.ip(), dst.port(), domain_hint.as_deref()).await;
+
                     let cancel2 = cancel.clone();
                     let stats2 = stats.clone();
-                    tokio::spawn(async move {
-                        tokio::select! {
-                            _ = cancel2.cancelled() => {}
-                            r = handle_tcp(stream, socks5_addr, dst, sem, if_index) => {
-                                match &r {
-                                    Ok(_) => { stats2.socks5_ok.fetch_add(1, Ordering::Relaxed); }
-                                    Err(e) => {
-                                        stats2.socks5_fail.fetch_add(1, Ordering::Relaxed);
-                                        warn!("IpStackRunner: TCP {dst} error: {e}");
+
+                    if decision == PolicyDecision::Bypass {
+                        tracing::debug!("TCP {dst}: BYPASS (domain={domain_hint:?})");
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = cancel2.cancelled() => {}
+                                r = handle_bypass_tcp(stream, dst, if_index) => {
+                                    match r {
+                                        Ok(_) => { stats2.bypass_ok.fetch_add(1, Ordering::Relaxed); }
+                                        Err(e) => {
+                                            stats2.bypass_fail.fetch_add(1, Ordering::Relaxed);
+                                            warn!("IpStackRunner: TCP {dst} bypass error: {e}");
+                                        }
                                     }
                                 }
                             }
-                        }
-                    });
+                        });
+                    } else {
+                        let sem = socks5_semaphore.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = cancel2.cancelled() => {}
+                                r = handle_tcp(stream, socks5_addr, dst, sem, if_index) => {
+                                    match &r {
+                                        Ok(_) => { stats2.socks5_ok.fetch_add(1, Ordering::Relaxed); }
+                                        Err(e) => {
+                                            stats2.socks5_fail.fetch_add(1, Ordering::Relaxed);
+                                            warn!("IpStackRunner: TCP {dst} error: {e}");
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -294,6 +339,9 @@ async fn udp_dns_loop(
     socks5_addr: SocketAddr,
     if_index: u32,
     cancel: CancellationToken,
+    policy: Arc<PolicyEngine>,
+    dns_map: Arc<DnsMap>,
+    native_dns: Option<SocketAddr>,
 ) {
     let (mut read_half, write_half) = udp_socket.split();
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<UdpMsg>();
@@ -321,7 +369,7 @@ async fn udp_dns_loop(
                     if dst_addr.port() != 53 {
                         continue;
                     }
-                    // Check cache first (no SOCKS5 needed)
+                    // Check cache first (no upstream query needed)
                     {
                         let mut c = cache.lock().await;
                         if let Some(cached) = c.get(&payload) {
@@ -329,9 +377,52 @@ async fn udp_dns_loop(
                             continue;
                         }
                     }
+
+                    // Extract domain and check policy BEFORE spawning (no locks held)
+                    let domain = extract_dns_domain(&payload);
+                    let decision = if let Some(ref dom) = domain {
+                        policy.domain_decision(dom).await
+                    } else {
+                        PolicyDecision::Mirage
+                    };
+
                     let tx = resp_tx.clone();
                     let sem = dns_sem.clone();
                     let cache2 = cache.clone();
+                    let dns_map2 = dns_map.clone();
+
+                    if decision == PolicyDecision::Bypass {
+                        if let Some(ndns) = native_dns {
+                            tokio::spawn(async move {
+                                let _permit = match sem.acquire().await {
+                                    Ok(p) => p,
+                                    Err(_) => return,
+                                };
+                                match dns_via_native(&payload, ndns, if_index).await {
+                                    Ok(response) => {
+                                        if let Some(ref dom) = domain {
+                                            let ips = extract_dns_ips(&response);
+                                            if !ips.is_empty() {
+                                                dns_map2.insert_many(&ips, dom);
+                                            }
+                                        }
+                                        {
+                                            let mut c = cache2.lock().await;
+                                            c.put(&payload, &response);
+                                        }
+                                        let _ = tx.send((response, dst_addr, src_addr));
+                                    }
+                                    Err(e) => {
+                                        warn!("IpStackRunner: DNS via native failed: {e}");
+                                    }
+                                }
+                            });
+                            continue;
+                        }
+                        // native_dns not configured — fall through to SOCKS5
+                    }
+
+                    // SOCKS5 path (Mirage or Bypass without native_dns)
                     tokio::spawn(async move {
                         let _permit = match sem.acquire().await {
                             Ok(p) => p,
@@ -339,6 +430,12 @@ async fn udp_dns_loop(
                         };
                         match dns_via_socks5_inner(&payload, socks5_addr, if_index).await {
                             Ok(response) => {
+                                if let Some(ref dom) = domain {
+                                    let ips = extract_dns_ips(&response);
+                                    if !ips.is_empty() {
+                                        dns_map2.insert_many(&ips, dom);
+                                    }
+                                }
                                 {
                                     let mut c = cache2.lock().await;
                                     c.put(&payload, &response);
@@ -354,6 +451,176 @@ async fn udp_dns_loop(
             }
         }
     }
+}
+
+// ── DNS parsing helpers ───────────────────────────────────────────────────────
+
+fn extract_dns_domain(query: &[u8]) -> Option<String> {
+    if query.len() < 13 {
+        return None;
+    }
+    let mut pos = 12;
+    let mut parts = Vec::new();
+    loop {
+        if pos >= query.len() {
+            return None;
+        }
+        let len = query[pos] as usize;
+        if len == 0 {
+            break;
+        }
+        pos += 1;
+        if pos + len > query.len() {
+            return None;
+        }
+        parts.push(std::str::from_utf8(&query[pos..pos + len]).ok()?.to_string());
+        pos += len;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("."))
+}
+
+fn skip_dns_name(data: &[u8], mut pos: usize) -> usize {
+    loop {
+        if pos >= data.len() {
+            return data.len();
+        }
+        let b = data[pos];
+        if b == 0 {
+            return pos + 1;
+        }
+        if b & 0xC0 == 0xC0 {
+            return pos + 2;
+        }
+        pos += 1 + b as usize;
+    }
+}
+
+fn extract_dns_ips(response: &[u8]) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    if response.len() < 12 {
+        return ips;
+    }
+
+    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
+    let qdcount = u16::from_be_bytes([response[4], response[5]]) as usize;
+
+    let mut pos = 12;
+
+    // Skip question section
+    for _ in 0..qdcount {
+        pos = skip_dns_name(response, pos);
+        pos += 4; // QTYPE + QCLASS
+        if pos > response.len() {
+            return ips;
+        }
+    }
+
+    // Parse answer section
+    for _ in 0..ancount {
+        if pos >= response.len() {
+            break;
+        }
+        pos = skip_dns_name(response, pos);
+        if pos + 10 > response.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
+        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlength > response.len() {
+            break;
+        }
+
+        match rtype {
+            1 if rdlength == 4 => {
+                let ip = std::net::Ipv4Addr::new(
+                    response[pos],
+                    response[pos + 1],
+                    response[pos + 2],
+                    response[pos + 3],
+                );
+                ips.push(IpAddr::V4(ip));
+            }
+            28 if rdlength == 16 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&response[pos..pos + 16]);
+                ips.push(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+            }
+            _ => {}
+        }
+        pos += rdlength;
+    }
+    ips
+}
+
+// ── Native DNS (bypass path) ──────────────────────────────────────────────────
+
+#[cfg(windows)]
+async fn dns_via_native(
+    query: &[u8],
+    native_dns: SocketAddr,
+    if_index: u32,
+) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::windows::io::AsRawSocket;
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("static addr is valid");
+    sock.bind(&bind_addr.into())?;
+
+    if if_index > 0 {
+        unsafe {
+            let index_be = u32::to_be(if_index);
+            let ret = windows_sys::Win32::Networking::WinSock::setsockopt(
+                sock.as_raw_socket() as usize,
+                windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
+                31, // IP_UNICAST_IF
+                &index_be as *const u32 as *const u8,
+                std::mem::size_of::<u32>() as i32,
+            );
+            if ret == windows_sys::Win32::Networking::WinSock::SOCKET_ERROR {
+                return Err(std::io::Error::from_raw_os_error(
+                    windows_sys::Win32::Networking::WinSock::WSAGetLastError(),
+                )
+                .into());
+            }
+        }
+    }
+
+    sock.set_nonblocking(true)?;
+    let std_udp: std::net::UdpSocket = sock.into();
+    let tokio_udp = tokio::net::UdpSocket::from_std(std_udp)?;
+    tokio_udp.send_to(query, native_dns).await?;
+
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_udp.recv(&mut buf),
+    )
+    .await??;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+#[cfg(not(windows))]
+async fn dns_via_native(
+    query: &[u8],
+    native_dns: SocketAddr,
+    _if_index: u32,
+) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    udp.send_to(query, native_dns).await?;
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        udp.recv(&mut buf),
+    )
+    .await??;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 pub(crate) async fn dns_via_socks5_inner(
@@ -399,6 +666,18 @@ async fn dns_tcp_query(
     let mut response = vec![0u8; resp_len];
     stream.read_exact(&mut response).await?;
     Ok(response)
+}
+
+// ── TCP bypass (direct via native interface) ──────────────────────────────────
+
+async fn handle_bypass_tcp(
+    mut tcp: netstack_smoltcp::TcpStream,
+    dst: SocketAddr,
+    if_index: u32,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut native = connect_via_interface(dst, if_index).await?;
+    tokio::io::copy_bidirectional_with_sizes(&mut tcp, &mut native, 64 * 1024, 64 * 1024).await?;
+    Ok(())
 }
 
 // ── TCP → SOCKS5 ──────────────────────────────────────────────────────────────

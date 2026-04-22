@@ -136,13 +136,20 @@ pub async fn run_service_logic(
         }
     };
 
+    let policy = Arc::new(crate::policy::PolicyEngine::mirage_only());
+    let dns_map = Arc::new(crate::dns_map::DnsMap::new());
+
     let mut svc_state = ServiceState::new(TUN_NAME.to_owned());
     svc_state.wintun = wintun;
+    svc_state.policy = Some(Arc::clone(&policy));
+    svc_state.dns_map = Arc::clone(&dns_map);
     let svc_state = Arc::new(Mutex::new(svc_state));
 
     let app_state = Arc::new(AppState {
         service: Arc::clone(&svc_state),
         stop_tx,
+        policy,
+        dns_map,
     });
 
     let router = crate::api::build_router(Arc::clone(&app_state));

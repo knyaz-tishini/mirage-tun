@@ -14,11 +14,16 @@ const KILLSWITCH_SUBLAYER_GUID: GUID = GUID::from_u128(0x4d697261_6765_4b69_6c6c
 
 pub struct WfpKillSwitch {
     engine: Option<WfpEngine>,
+    native_if_index: Option<u32>,
 }
 
 impl WfpKillSwitch {
     pub fn new() -> Self {
-        Self { engine: None }
+        Self { engine: None, native_if_index: None }
+    }
+
+    pub fn set_native_if_index(&mut self, idx: u32) {
+        self.native_if_index = Some(idx);
     }
 
     fn weight(n: u8) -> FilterWeight {
@@ -128,6 +133,20 @@ impl PlatformFirewall for WfpKillSwitch {
                     .add(&tx)
                     .map_err(|e| TunError::Wfp(format!("TUN interface permit failed: {e}")))?;
                 info!(tun_idx, "WFP: permit TUN interface");
+            }
+
+            // 4b. Permit native interface for bypass traffic (weight 13).
+            if let Some(native_idx) = self.native_if_index {
+                FilterBuilder::new()
+                    .name("Mirage: permit native interface (bypass)")
+                    .action(Action::Permit)
+                    .layer(Layer::ConnectV4)
+                    .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                    .weight(Self::weight(13))
+                    .condition(InterfaceConditionBuilder::equal(native_idx))
+                    .add(&tx)
+                    .map_err(|e| TunError::Wfp(format!("native interface bypass permit failed: {e}")))?;
+                info!(native_idx, "WFP: permit native interface (bypass)");
             }
 
             // 5. Permit exempt local ports — management API etc. (weight 13).

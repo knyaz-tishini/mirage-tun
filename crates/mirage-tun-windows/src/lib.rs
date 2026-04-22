@@ -1,7 +1,9 @@
 pub mod api;
+pub mod dns_map;
 pub mod error;
 pub mod firewall;
 pub mod ipstack;
+pub mod policy;
 pub mod proxy;
 pub mod routing;
 pub mod service;

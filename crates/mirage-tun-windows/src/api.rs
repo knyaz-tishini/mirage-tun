@@ -22,6 +22,8 @@ pub struct TunStartParams {
     pub socks5_addr: String,
     #[serde(default)]
     pub relay_addrs: Vec<String>,
+    #[serde(default)]
+    pub policy: Option<crate::policy::PolicyConfigRequest>,
 }
 
 #[derive(Deserialize)]
@@ -35,6 +37,8 @@ pub struct StatusResponse {
     pub tun_phase: TunPhase,
     pub proxy_active: Option<String>,
     pub socks5_addr: Option<String>,
+    pub policy_rules: usize,
+    pub dns_map_size: usize,
 }
 
 #[derive(Serialize)]
@@ -45,6 +49,8 @@ struct ErrorBody {
 pub struct AppState {
     pub service: Arc<Mutex<ServiceState>>,
     pub stop_tx: watch::Sender<()>,
+    pub policy: Arc<crate::policy::PolicyEngine>,
+    pub dns_map: Arc<crate::dns_map::DnsMap>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -56,6 +62,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/proxy/set", post(post_proxy_set))
         .route("/proxy/clear", post(post_proxy_clear))
         .route("/admin/restart", post(post_admin_restart))
+        .route("/policy/get", get(get_policy))
+        .route("/policy/set", post(set_policy))
         .with_state(state)
 }
 
@@ -67,11 +75,15 @@ async fn get_status(
     State(state): State<Arc<AppState>>,
 ) -> Json<StatusResponse> {
     let s = state.service.lock().await;
+    let policy_rules = state.policy.get_config().await.rules.len();
+    let dns_map_size = state.dns_map.len();
     Json(StatusResponse {
         adapter_alive: s.wintun.is_some(),
         tun_phase: s.tun_phase.clone(),
         proxy_active: s.proxy_active.clone(),
         socks5_addr: s.socks5_addr.map(|a| a.to_string()),
+        policy_rules,
+        dns_map_size,
     })
 }
 
@@ -119,19 +131,32 @@ pub async fn activate_tun_inner(
     }
     info!("activate: bypass routes = {}ms", t0.elapsed().as_millis());
 
-    // Activate WFP kill-switch
+    let if_index = routing.original_interface_idx().unwrap_or(0);
+
+    // Activate WFP kill-switch (needs if_index for native bypass permit)
     let mut killswitch = crate::firewall::WfpKillSwitch::new();
+    killswitch.set_native_if_index(if_index);
     if let Err(e) = killswitch.activate(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate (non-fatal): {e}");
     }
 
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let if_index = routing.original_interface_idx().unwrap_or(0);
+    let native_dns = discover_native_dns(if_index).await;
+    info!("native_dns resolved: {native_dns:?}");
 
     let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
-    let _runner = IpStackRunner::start(device, socks5_addr, cancel.clone(), relay_ips, if_index)
-        .await?;
+    let _runner = IpStackRunner::start(
+        device,
+        socks5_addr,
+        cancel.clone(),
+        relay_ips,
+        if_index,
+        Arc::clone(&state.policy),
+        Arc::clone(&state.dns_map),
+        native_dns,
+    )
+    .await?;
 
     s.ipstack_cancel = Some(cancel);
     s.socks5_addr = Some(socks5_addr);
@@ -144,6 +169,12 @@ pub async fn activate_tun_inner(
     s.tun_default_set = true;
     // Prevent Drop from restoring routes — we'll do it manually on stop
     std::mem::forget(routing);
+
+    if let Some(policy_req) = params.policy {
+        let compiled = crate::policy::CompiledPolicy::compile(policy_req.rules, policy_req.default_action);
+        state.policy.update(compiled).await;
+        info!("Policy loaded from TUN start params");
+    }
 
     info!("TUN started, socks5={socks5_addr}");
     Ok(())
@@ -237,6 +268,41 @@ async fn post_admin_restart(
     info!("Restart requested via /admin/restart");
     let _ = state.stop_tx.send(());
     StatusCode::OK
+}
+
+async fn get_policy(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let config = state.policy.get_config().await;
+    Json(serde_json::json!({
+        "default_action": config.default_action,
+        "rules": config.rules,
+    }))
+}
+
+async fn set_policy(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<crate::policy::PolicyConfigRequest>,
+) -> StatusCode {
+    let compiled = crate::policy::CompiledPolicy::compile(req.rules, req.default_action);
+    state.policy.update(compiled).await;
+    info!("Policy updated via API");
+    StatusCode::OK
+}
+
+async fn discover_native_dns(_if_index: u32) -> Option<SocketAddr> {
+    let out = tokio::process::Command::new("netsh")
+        .args(["interface", "ip", "show", "dns"])
+        .output()
+        .await
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Ok(ip) = trimmed.parse::<std::net::Ipv4Addr>() {
+            return Some(SocketAddr::new(IpAddr::V4(ip), 53));
+        }
+    }
+    // Fallback to Cloudflare DNS
+    Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 53))
 }
 
 fn map_err(e: TunError) -> (StatusCode, Json<ErrorBody>) {

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -21,6 +22,8 @@ pub struct ServiceState {
     pub tun_name: String,
     pub killswitch: Option<crate::firewall::WfpKillSwitch>,
     pub if_index: u32,
+    pub policy: Option<Arc<crate::policy::PolicyEngine>>,
+    pub dns_map: Arc<crate::dns_map::DnsMap>,
 }
 
 impl ServiceState {
@@ -37,6 +40,8 @@ impl ServiceState {
             tun_name,
             killswitch: None,
             if_index: 0,
+            policy: None,
+            dns_map: Arc::new(crate::dns_map::DnsMap::new()),
         }
     }
 }
