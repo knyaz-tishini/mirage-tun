@@ -187,87 +187,61 @@ async fn run_netsh_route(args: &[&str]) -> Result<()> {
     Err(TunError::Routing(format!("netsh command failed ({label}): {stdout}{stderr}")))
 }
 
-/// Returns (gateway_ip, interface_index).
-/// Tries `netsh interface ipv4 show route` first for exact interface index,
-/// falls back to `route print 0.0.0.0` with index=0 when netsh parsing fails.
+/// Returns (gateway_ip, interface_index) via Win32 GetIpForwardTable2.
+/// Finds the lowest-metric IPv4 default route (0.0.0.0/0).
+/// Instant — no subprocess, no netsh.
 async fn read_default_gateway() -> Option<(String, u32)> {
-    // `netsh interface ipv4 show route` — no filter arg (Windows rejects it).
-    // Output columns: Publish Type Met Prefix Idx Gateway/InterfaceName
-    // Example: No  Manual  0  0.0.0.0/0  19  192.168.1.1
-    let netsh_out = tokio::process::Command::new("netsh")
-        .args(["interface", "ipv4", "show", "route"])
-        .output()
-        .await
-        .ok();
-    if let Some(out) = netsh_out {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            if let Some(pos) = tokens.iter().position(|t| *t == "0.0.0.0/0") {
-                if let (Some(idx_str), Some(gw)) = (tokens.get(pos + 1), tokens.get(pos + 2)) {
-                    // Only accept entries where gateway is a valid IP (skip "AmneziaVPN" etc.)
-                    if gw.parse::<std::net::IpAddr>().is_ok() {
-                        if let Ok(idx) = idx_str.parse::<u32>() {
-                            return Some((gw.to_string(), idx));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: route print — columns: Network Netmask Gateway Interface Metric
-    let out = tokio::process::Command::new("route")
-        .args(["print", "0.0.0.0"])
-        .output()
-        .await
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for line in stdout.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() >= 3 && tokens[0] == "0.0.0.0" && tokens[1] == "0.0.0.0" {
-            return Some((tokens[2].to_owned(), 0));
-        }
-    }
-    None
+    read_default_gateway_win32()
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn parse_gateway_line_fallback() {
-        // Simulates `route print 0.0.0.0` fallback path
-        let fake_output = "          0.0.0.0          0.0.0.0      192.168.1.1    192.168.1.50     25\n";
-        let mut found: Option<(String, u32)> = None;
-        for line in fake_output.lines() {
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            if tokens.len() >= 3 && tokens[0] == "0.0.0.0" && tokens[1] == "0.0.0.0" {
-                found = Some((tokens[2].to_owned(), 0));
-            }
-        }
-        assert_eq!(found.as_ref().map(|(gw, _)| gw.as_str()), Some("192.168.1.1"));
-        assert_eq!(found.as_ref().map(|(_, idx)| *idx), Some(0u32));
-    }
+#[cfg(windows)]
+fn read_default_gateway_win32() -> Option<(String, u32)> {
+    use std::net::Ipv4Addr;
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
 
-    #[test]
-    fn parse_gateway_line_netsh() {
-        // Simulates `netsh interface ipv4 show route` output (no filter arg)
-        let fake_output = "No       Manual    0   0.0.0.0/0                  19  192.168.1.1\nNo       Manual    0   0.0.0.0/0                  44  AmneziaVPN\n";
-        let mut found: Option<(String, u32)> = None;
-        for line in fake_output.lines() {
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            if let Some(pos) = tokens.iter().position(|t| *t == "0.0.0.0/0") {
-                if let (Some(idx_str), Some(gw)) = (tokens.get(pos + 1), tokens.get(pos + 2)) {
-                    if gw.parse::<std::net::IpAddr>().is_ok() {
-                        if let Ok(idx) = idx_str.parse::<u32>() {
-                            found = Some((gw.to_string(), idx));
-                            break;
-                        }
-                    }
+    unsafe {
+        let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        let ret = GetIpForwardTable2(AF_INET, &mut table_ptr);
+        if ret != NO_ERROR {
+            warn!("GetIpForwardTable2 failed: {ret}");
+            return None;
+        }
+
+        let table = &*table_ptr;
+        let num = table.NumEntries as usize;
+        let rows_ptr = table.Table.as_ptr();
+
+        let mut best: Option<(String, u32)> = None;
+        let mut best_metric: u32 = u32::MAX;
+
+        for i in 0..num {
+            let row: &MIB_IPFORWARD_ROW2 = &*rows_ptr.add(i);
+
+            let family = row.DestinationPrefix.Prefix.si_family;
+            let prefix_len = row.DestinationPrefix.PrefixLength;
+
+            if family == AF_INET && prefix_len == 0 {
+                let metric = row.Metric;
+                if metric < best_metric {
+                    best_metric = metric;
+                    let sin = row.NextHop.Ipv4;
+                    let addr_u32 = sin.sin_addr.S_un.S_addr;
+                    let ip = Ipv4Addr::from(addr_u32.to_ne_bytes());
+                    best = Some((ip.to_string(), row.InterfaceIndex));
                 }
             }
         }
-        assert_eq!(found.as_ref().map(|(gw, _)| gw.as_str()), Some("192.168.1.1"));
-        assert_eq!(found.as_ref().map(|(_, idx)| *idx), Some(19u32));
+
+        FreeMibTable(table_ptr as *const _);
+        best
     }
+}
+
+#[cfg(not(windows))]
+fn read_default_gateway_win32() -> Option<(String, u32)> {
+    None
 }

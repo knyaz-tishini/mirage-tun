@@ -96,15 +96,19 @@ pub async fn activate_tun_inner(
 
     let tun_name = s.tun_name.clone();
 
-    // Set DNS on adapter
+    let t0 = std::time::Instant::now();
+
+    // Point adapter DNS at 8.8.8.8 so Windows sends DNS queries into TUN
+    // (our udp_dns_loop intercepts them and forwards via SOCKS5)
     let _ = tokio::process::Command::new("netsh")
-        .args(["interface", "ip", "set", "dns", &tun_name, "static", "198.18.0.1"])
+        .args(["interface", "ip", "set", "dns", &tun_name, "static", "8.8.8.8"])
         .output()
         .await;
 
     // Routes AFTER adapter exists — otherwise they vanish with destroyed interface
     let mut routing = Routing::new(&tun_name);
     routing.set_default_route().await?;
+    info!("activate: set_default_route = {}ms", t0.elapsed().as_millis());
 
     let mut relay_ips: Vec<IpAddr> = Vec::new();
     for relay in &params.relay_addrs {
@@ -113,6 +117,7 @@ pub async fn activate_tun_inner(
             relay_ips.push(ip);
         }
     }
+    info!("activate: bypass routes = {}ms", t0.elapsed().as_millis());
 
     // Activate WFP kill-switch
     let mut killswitch = crate::firewall::WfpKillSwitch::new();
