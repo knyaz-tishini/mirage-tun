@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -15,7 +15,7 @@ pub struct ServiceState {
     pub tun_phase: TunPhase,
     pub proxy_active: Option<String>,
     pub ipstack_cancel: Option<CancellationToken>,
-    pub bypass_routes: Vec<String>,
+    pub bypass_addrs: Vec<IpAddr>,
     pub original_gateway: Option<String>,
     pub tun_default_set: bool,
     pub socks5_addr: Option<SocketAddr>,
@@ -33,7 +33,7 @@ impl ServiceState {
             tun_phase: TunPhase::AdapterReady,
             proxy_active: None,
             ipstack_cancel: None,
-            bypass_routes: Vec::new(),
+            bypass_addrs: Vec::new(),
             original_gateway: None,
             tun_default_set: false,
             socks5_addr: None,

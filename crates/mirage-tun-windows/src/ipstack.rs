@@ -358,6 +358,135 @@ impl DnsCache {
     }
 }
 
+// ── UDP bypass session map ───────────────────────────────────────────────────
+
+/// Key: (client_src, original_dst) — one entry per active UDP bypass session.
+type UdpSessionMap = Arc<Mutex<HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Vec<u8>>>>>;
+
+async fn udp_bypass_forward(
+    payload: Vec<u8>,
+    src_addr: SocketAddr,
+    dst_addr: SocketAddr,
+    resp_tx: mpsc::UnboundedSender<UdpMsg>,
+    sessions: UdpSessionMap,
+    if_index: u32,
+) {
+    // Check if session already exists.
+    {
+        let map = sessions.lock().await;
+        if let Some(tx) = map.get(&(src_addr, dst_addr)) {
+            let _ = tx.send(payload);
+            return;
+        }
+    }
+
+    // No session — create one.
+    let (fwd_tx, mut fwd_rx) = mpsc::channel::<Vec<u8>>(64);
+
+    {
+        let mut map = sessions.lock().await;
+        // Insert; send initial payload.
+        map.insert((src_addr, dst_addr), fwd_tx.clone());
+    }
+    let _ = fwd_tx.send(payload).await;
+
+    let sessions2 = sessions.clone();
+    tokio::spawn(async move {
+        const UDP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        // Create a native UDP socket bound via IP_UNICAST_IF.
+        let sock = match create_udp_bypass_socket(if_index) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("UDP bypass: socket create failed for {dst_addr}: {e}");
+                sessions2.lock().await.remove(&(src_addr, dst_addr));
+                return;
+            }
+        };
+
+        let mut recv_buf = vec![0u8; 65535];
+        loop {
+            tokio::select! {
+                // Forward inbound datagrams to dst.
+                msg = tokio::time::timeout(UDP_IDLE_TIMEOUT, fwd_rx.recv()) => {
+                    match msg {
+                        Ok(Some(data)) => {
+                            if let Err(e) = sock.send_to(&data, dst_addr).await {
+                                warn!("UDP bypass: send to {dst_addr} failed: {e}");
+                                break;
+                            }
+                        }
+                        Ok(None) | Err(_) => {
+                            // Channel closed or idle timeout.
+                            break;
+                        }
+                    }
+                }
+                // Receive responses and push back into TUN.
+                result = tokio::time::timeout(UDP_IDLE_TIMEOUT, sock.recv_from(&mut recv_buf)) => {
+                    match result {
+                        Ok(Ok((n, _from))) => {
+                            let response = recv_buf[..n].to_vec();
+                            // src/dst are swapped: TUN sees response as coming from dst.
+                            let _ = resp_tx.send((response, dst_addr, src_addr));
+                        }
+                        Ok(Err(e)) => {
+                            warn!("UDP bypass: recv from {dst_addr} failed: {e}");
+                            break;
+                        }
+                        Err(_) => {
+                            // Idle timeout.
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        sessions2.lock().await.remove(&(src_addr, dst_addr));
+    });
+}
+
+#[cfg(windows)]
+fn create_udp_bypass_socket(if_index: u32) -> std::io::Result<tokio::net::UdpSocket> {
+    use std::os::windows::io::AsRawSocket;
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("static addr is valid");
+    sock.bind(&bind_addr.into())?;
+
+    if if_index > 0 {
+        unsafe {
+            let index_be = u32::to_be(if_index);
+            let ret = windows_sys::Win32::Networking::WinSock::setsockopt(
+                sock.as_raw_socket() as usize,
+                windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
+                31, // IP_UNICAST_IF
+                &index_be as *const u32 as *const u8,
+                std::mem::size_of::<u32>() as i32,
+            );
+            if ret == windows_sys::Win32::Networking::WinSock::SOCKET_ERROR {
+                return Err(std::io::Error::from_raw_os_error(
+                    windows_sys::Win32::Networking::WinSock::WSAGetLastError(),
+                ));
+            }
+        }
+    }
+
+    sock.set_nonblocking(true)?;
+    let std_udp: std::net::UdpSocket = sock.into();
+    tokio::net::UdpSocket::from_std(std_udp)
+}
+
+#[cfg(not(windows))]
+fn create_udp_bypass_socket(_if_index: u32) -> std::io::Result<tokio::net::UdpSocket> {
+    // Blocking bind, but only on non-Windows (test/dev builds).
+    let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    std_sock.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(std_sock)
+}
+
 async fn udp_dns_loop(
     udp_socket: UdpSocket,
     socks5_addr: SocketAddr,
@@ -382,6 +511,7 @@ async fn udp_dns_loop(
 
     let dns_sem = Arc::new(Semaphore::new(DNS_CONCURRENCY));
     let cache = Arc::new(Mutex::new(DnsCache::new()));
+    let udp_sessions: UdpSessionMap = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -391,6 +521,25 @@ async fn udp_dns_loop(
                 None => break,
                 Some((payload, src_addr, dst_addr)) => {
                     if dst_addr.port() != 53 {
+                        let dst_ip = dst_addr.ip();
+                        let domain_hint = dns_map.get(&dst_ip);
+                        let decision = policy
+                            .decide(dst_ip, dst_addr.port(), domain_hint.as_deref(), None)
+                            .await;
+
+                        if decision == PolicyDecision::Bypass {
+                            udp_bypass_forward(
+                                payload,
+                                src_addr,
+                                dst_addr,
+                                resp_tx.clone(),
+                                udp_sessions.clone(),
+                                if_index,
+                            )
+                            .await;
+                        } else {
+                            warn!("UDP non-DNS {dst_addr}: Mirage policy — dropped (SOCKS5 UDP not supported)");
+                        }
                         continue;
                     }
                     // Check cache first (no upstream query needed)

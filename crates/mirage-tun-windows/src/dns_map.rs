@@ -71,6 +71,7 @@ impl DnsMap {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("DnsMap lock poisoned").map.len()
+        let inner = self.inner.lock().expect("DnsMap lock poisoned");
+        inner.map.values().filter(|(_, ts)| ts.elapsed() < TTL).count()
     }
 }

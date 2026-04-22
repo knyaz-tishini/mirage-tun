@@ -1,4 +1,4 @@
-use std::process::Command;
+use tokio::process::Command;
 use tracing::{info, warn};
 
 const REG_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
@@ -8,7 +8,7 @@ const REG_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet 
 /// `proxy_server` format:
 /// - HTTP CONNECT: `"127.0.0.1:19481"`
 /// - SOCKS5:       `"socks=127.0.0.1:19480"`
-pub fn set_system_proxy(proxy_server: &str) {
+pub async fn set_system_proxy(proxy_server: &str) {
     // 1. WinINET — registry (browsers)
     let enable_ok = Command::new("reg")
         .args([
@@ -19,6 +19,7 @@ pub fn set_system_proxy(proxy_server: &str) {
             "/f",
         ])
         .output()
+        .await
         .map(|o| o.status.success())
         .unwrap_or(false);
 
@@ -31,6 +32,7 @@ pub fn set_system_proxy(proxy_server: &str) {
             "/f",
         ])
         .output()
+        .await
         .map(|o| o.status.success())
         .unwrap_or(false);
 
@@ -46,6 +48,7 @@ pub fn set_system_proxy(proxy_server: &str) {
         let ok = Command::new("netsh")
             .args(["winhttp", "set", "proxy", proxy_server])
             .output()
+            .await
             .map(|o| o.status.success())
             .unwrap_or(false);
         if ok {
@@ -56,11 +59,11 @@ pub fn set_system_proxy(proxy_server: &str) {
     }
 
     // 3. Notify running apps of settings change.
-    notify_proxy_change();
+    notify_proxy_change().await;
 }
 
 /// Disable the Windows system proxy.
-pub fn clear_system_proxy() {
+pub async fn clear_system_proxy() {
     // 1. WinINET — disable via registry
     let ok = Command::new("reg")
         .args([
@@ -71,6 +74,7 @@ pub fn clear_system_proxy() {
             "/f",
         ])
         .output()
+        .await
         .map(|o| o.status.success())
         .unwrap_or(false);
 
@@ -84,6 +88,7 @@ pub fn clear_system_proxy() {
     let ok = Command::new("netsh")
         .args(["winhttp", "reset", "proxy"])
         .output()
+        .await
         .map(|o| o.status.success())
         .unwrap_or(false);
 
@@ -94,14 +99,14 @@ pub fn clear_system_proxy() {
     }
 
     // 3. Notify running apps.
-    notify_proxy_change();
+    notify_proxy_change().await;
 }
 
 /// Notify running WinINET applications (browsers, etc.) that proxy settings
 /// changed. Calls `InternetSetOption` with:
 /// - option 39 = `INTERNET_OPTION_SETTINGS_CHANGED`
 /// - option 37 = `INTERNET_OPTION_REFRESH`
-fn notify_proxy_change() {
+async fn notify_proxy_change() {
     let ps_cmd = concat!(
         "Add-Type -TypeDefinition '",
         "using System.Runtime.InteropServices; ",
@@ -117,6 +122,7 @@ fn notify_proxy_change() {
     let ok = Command::new("powershell")
         .args(["-NoProfile", "-Command", ps_cmd])
         .output()
+        .await
         .map(|o| o.status.success())
         .unwrap_or(false);
 

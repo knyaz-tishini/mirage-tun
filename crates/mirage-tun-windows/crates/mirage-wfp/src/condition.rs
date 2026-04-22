@@ -2,14 +2,14 @@
 
 use std::ffi::OsStr;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_BYTE_BLOB_TYPE, FWP_MATCH_EQUAL, FWP_MATCH_GREATER, FWP_MATCH_GREATER_OR_EQUAL,
     FWP_MATCH_LESS, FWP_MATCH_LESS_OR_EQUAL, FWP_MATCH_RANGE, FWP_UINT8, FWP_UINT16, FWP_UINT32,
-    FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWPM_CONDITION_ALE_APP_ID,
-    FWPM_CONDITION_INTERFACE_INDEX, FWPM_CONDITION_IP_LOCAL_ADDRESS,
+    FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK,
+    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_INTERFACE_INDEX, FWPM_CONDITION_IP_LOCAL_ADDRESS,
     FWPM_CONDITION_IP_LOCAL_PORT, FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS,
     FWPM_CONDITION_IP_REMOTE_PORT, FWPM_FILTER_CONDITION0,
 };
@@ -115,6 +115,21 @@ impl InnerBuilder {
         Condition { raw, _storage: Arc::new(storage) }
     }
 
+    fn build_v6_mask(self, addr: Ipv6Addr, prefix_len: u8) -> Condition {
+        let mut am = Box::new(FWP_V6_ADDR_AND_MASK {
+            addr: addr.octets(),
+            prefixLength: prefix_len,
+        });
+        let mut raw: FWPM_FILTER_CONDITION0 = unsafe { std::mem::zeroed() };
+        raw.fieldKey = *self.field.guid();
+        raw.matchType = self.match_type as i32;
+        raw.conditionValue.r#type = FWP_V6_ADDR_MASK;
+        // Points into am; am kept alive via storage.
+        raw.conditionValue.Anonymous.v6AddrMask = &mut *am as *mut _;
+        let storage: Storage = Some(am as Box<dyn std::any::Any + Send>);
+        Condition { raw, _storage: Arc::new(storage) }
+    }
+
     fn build_blob(self, blob: OwnedByteBlob) -> Condition {
         let mut raw: FWPM_FILTER_CONDITION0 = unsafe { std::mem::zeroed() };
         raw.fieldKey = *self.field.guid();
@@ -206,6 +221,18 @@ impl AddrConditionBuilder {
     pub fn subnet_v4(self, addr: u32, mask: u32) -> Condition {
         InnerBuilder { field: self.field, match_type: MatchType::Equal }
             .build_v4_mask(addr, mask)
+    }
+
+    /// Exact IPv6 address match (equivalent to /128 prefix).
+    pub fn equal_v6(self, addr: Ipv6Addr) -> Condition {
+        InnerBuilder { field: self.field, match_type: MatchType::Equal }
+            .build_v6_mask(addr, 128)
+    }
+
+    /// IPv6 prefix match (addr + prefix_len, e.g. ::1/128 for loopback).
+    pub fn prefix_v6(self, addr: Ipv6Addr, prefix_len: u8) -> Condition {
+        InnerBuilder { field: self.field, match_type: MatchType::Equal }
+            .build_v6_mask(addr, prefix_len)
     }
 }
 

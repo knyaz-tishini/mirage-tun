@@ -17,7 +17,7 @@ const TUN_ADDR: &str = "10.0.85.1/24";
 const TUN_MTU: u16 = 1500;
 const API_BIND: &str = "127.0.0.1:19485";
 
-fn find_config() -> Option<PathBuf> {
+pub(crate) fn find_config() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         let beside_exe = exe
             .parent()
@@ -32,6 +32,51 @@ fn find_config() -> Option<PathBuf> {
         return Some(prog_data);
     }
     None
+}
+
+/// Returns the config path to write to (creating dirs if needed).
+/// Prefers the existing file location; falls back to ProgramData.
+pub(crate) fn config_path_for_write() -> PathBuf {
+    if let Some(existing) = find_config() {
+        return existing;
+    }
+    let dir = PathBuf::from(r"C:\ProgramData\mirage2tun");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("tun.json")
+}
+
+/// Persist `policy` into tun.json (read-modify-write).
+/// Best-effort: logs a warning on failure, never returns an error.
+pub(crate) fn save_policy_to_config(policy: &crate::policy::PolicyConfigRequest) {
+    let path = config_path_for_write();
+
+    // Read current JSON object (or start with empty object).
+    let mut obj: serde_json::Map<String, serde_json::Value> = path
+        .exists()
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    // Update only the policy field.
+    match serde_json::to_value(policy) {
+        Ok(v) => { obj.insert("policy".to_owned(), v); }
+        Err(e) => {
+            tracing::warn!("save_policy_to_config: serialize failed: {e}");
+            return;
+        }
+    }
+
+    match serde_json::to_string_pretty(&serde_json::Value::Object(obj)) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("save_policy_to_config: write failed: {e}");
+            } else {
+                tracing::info!("Policy persisted to {}", path.display());
+            }
+        }
+        Err(e) => tracing::warn!("save_policy_to_config: to_string failed: {e}"),
+    }
 }
 
 async fn autostart_activate(
@@ -123,7 +168,7 @@ pub async fn run_service_logic(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Stale state cleanup
     cleanup_stale_routes(TUN_NAME).await;
-    crate::proxy::clear_system_proxy();
+    crate::proxy::clear_system_proxy().await;
 
     let wintun = match WintunHandle::create(TUN_NAME, TUN_ADDR, TUN_MTU).await {
         Ok(w) => {
@@ -224,7 +269,7 @@ pub async fn run_service_logic(
                 .output();
         }
         if s.proxy_active.is_some() {
-            crate::proxy::clear_system_proxy();
+            crate::proxy::clear_system_proxy().await;
         }
         s.wintun = None;
     }

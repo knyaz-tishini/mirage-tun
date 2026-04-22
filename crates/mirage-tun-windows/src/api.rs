@@ -17,7 +17,7 @@ use crate::ipstack::IpStackRunner;
 use crate::routing::Routing;
 use crate::state::{ServiceState, TunPhase};
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TunStartParams {
     pub socks5_addr: String,
     #[serde(default)]
@@ -91,8 +91,29 @@ pub async fn activate_tun_inner(
     state: &Arc<AppState>,
     params: TunStartParams,
 ) -> Result<(), TunError> {
+    // Resolve TUN interface index via spawn_blocking BEFORE taking the mutex so
+    // we don't block the async executor with a sync subprocess call while holding
+    // a lock.
+    let tun_name_pre = {
+        let s = state.service.lock().await;
+        if s.wintun.is_none() {
+            return Err(TunError::AdapterNotReady);
+        }
+        if s.tun_phase == TunPhase::TunActive {
+            return Err(TunError::AlreadyActive);
+        }
+        s.tun_name.clone()
+    };
+    let tun_name_for_resolve = tun_name_pre.clone();
+    let pre_resolved_tun_idx = tokio::task::spawn_blocking(move || {
+        crate::firewall::resolve_interface_index(&tun_name_for_resolve)
+    })
+    .await
+    .unwrap_or(None);
+
     let mut s = state.service.lock().await;
 
+    // Re-check state after the brief unlock above.
     if s.wintun.is_none() {
         return Err(TunError::AdapterNotReady);
     }
@@ -133,9 +154,23 @@ pub async fn activate_tun_inner(
 
     let if_index = routing.original_interface_idx().unwrap_or(0);
 
-    // Activate WFP kill-switch (needs if_index for native bypass permit)
+    // Compile policy from params early so we can extract bypass CIDRs for WFP.
+    let initial_policy = params.policy.map(|policy_req| {
+        crate::policy::CompiledPolicy::compile(policy_req.rules, policy_req.default_action)
+    });
+    let bypass_cidrs_for_wfp: Vec<(u32, u32)> = initial_policy
+        .as_ref()
+        .map(|p| p.bypass_cidrs())
+        .unwrap_or_default();
+
+    // Activate WFP kill-switch (needs if_index for native bypass permit).
+    // TUN interface index was resolved via spawn_blocking before taking the mutex.
     let mut killswitch = crate::firewall::WfpKillSwitch::new();
     killswitch.set_native_if_index(if_index);
+    if let Some(tun_idx) = pre_resolved_tun_idx {
+        killswitch.set_tun_if_index(tun_idx);
+    }
+    killswitch.set_bypass_cidrs(bypass_cidrs_for_wfp);
     if let Err(e) = killswitch.activate(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate (non-fatal): {e}");
     }
@@ -147,6 +182,7 @@ pub async fn activate_tun_inner(
 
     let process_resolver = Arc::new(crate::process_info::ProcessResolver::new());
 
+    let bypass_addrs_store = relay_ips.clone();
     let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
     let _runner = IpStackRunner::start(
         device,
@@ -170,11 +206,11 @@ pub async fn activate_tun_inner(
     // Store routing state
     s.original_gateway = routing.original_gateway().map(|s| s.to_owned());
     s.tun_default_set = true;
+    s.bypass_addrs = bypass_addrs_store;
     // Prevent Drop from restoring routes — we'll do it manually on stop
     std::mem::forget(routing);
 
-    if let Some(policy_req) = params.policy {
-        let compiled = crate::policy::CompiledPolicy::compile(policy_req.rules, policy_req.default_action);
+    if let Some(compiled) = initial_policy {
         state.policy.update(compiled).await;
         info!("Policy loaded from TUN start params");
     }
@@ -226,10 +262,11 @@ async fn post_tun_stop(
     }
 
     // Remove bypass routes
-    let bypass: Vec<String> = s.bypass_routes.drain(..).collect();
+    let bypass: Vec<std::net::IpAddr> = s.bypass_addrs.drain(..).collect();
     for addr in bypass {
+        let addr_str = addr.to_string();
         let _ = tokio::process::Command::new("route")
-            .args(["delete", &addr, "mask", "255.255.255.255"])
+            .args(["delete", &addr_str, "mask", "255.255.255.255"])
             .output()
             .await;
     }
@@ -250,7 +287,7 @@ async fn post_proxy_set(
     State(state): State<Arc<AppState>>,
     Json(params): Json<ProxySetParams>,
 ) -> StatusCode {
-    crate::proxy::set_system_proxy(&params.proxy_server);
+    crate::proxy::set_system_proxy(&params.proxy_server).await;
     let mut s = state.service.lock().await;
     s.proxy_active = Some(params.proxy_server);
     StatusCode::OK
@@ -259,7 +296,7 @@ async fn post_proxy_set(
 async fn post_proxy_clear(
     State(state): State<Arc<AppState>>,
 ) -> StatusCode {
-    crate::proxy::clear_system_proxy();
+    crate::proxy::clear_system_proxy().await;
     let mut s = state.service.lock().await;
     s.proxy_active = None;
     StatusCode::OK
@@ -285,15 +322,40 @@ async fn set_policy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<crate::policy::PolicyConfigRequest>,
 ) -> StatusCode {
-    let compiled = crate::policy::CompiledPolicy::compile(req.rules, req.default_action);
+    let compiled = crate::policy::CompiledPolicy::compile(req.rules.clone(), req.default_action);
+    let new_bypass_cidrs = compiled.bypass_cidrs();
     state.policy.update(compiled).await;
     info!("Policy updated via API");
+
+    // Re-apply WFP bypass CIDR permits when TUN is active.
+    {
+        let mut s = state.service.lock().await;
+        if s.tun_phase == TunPhase::TunActive {
+            let relay_ips: Vec<IpAddr> = s.bypass_addrs.clone();
+            let tun_name = s.tun_name.clone();
+            if let Some(ks) = s.killswitch.as_mut() {
+                if let Err(e) = ks.update_bypass_cidrs(new_bypass_cidrs, &relay_ips, &tun_name, &[]) {
+                    warn!("WFP bypass CIDR update failed (non-fatal): {e}");
+                } else {
+                    info!("WFP bypass CIDRs updated");
+                }
+            }
+        }
+    }
+
+    // Best-effort persist — failure is logged inside, never fails the response.
+    crate::service::save_policy_to_config(&req);
     StatusCode::OK
 }
 
-async fn discover_native_dns(_if_index: u32) -> Option<SocketAddr> {
+async fn discover_native_dns(if_index: u32) -> Option<SocketAddr> {
+    // Query DNS servers for the specific interface by index.
+    // `netsh interface ipv4 show dnsservers interface=<idx>` returns only the
+    // DNS entries for that interface, avoiding picking up 8.8.8.8 that we set
+    // on the TUN adapter itself.
+    let index_str = if_index.to_string();
     let out = tokio::process::Command::new("netsh")
-        .args(["interface", "ip", "show", "dns"])
+        .args(["interface", "ipv4", "show", "dnsservers", &format!("interface={index_str}")])
         .output()
         .await
         .ok()?;

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -33,12 +33,36 @@ pub struct PolicyConfigRequest {
 
 fn default_mirage() -> PolicyDecision { PolicyDecision::Mirage }
 
+/// Parsed CIDR — either IPv4 (network_u32, mask_u32) or IPv6 (network_u128, mask_u128).
+enum ParsedCidr {
+    V4(u32, u32),
+    V6(u128, u128),
+}
+
+fn parse_cidr(cidr: &str) -> Option<ParsedCidr> {
+    let (addr_str, prefix_str) = cidr.split_once('/')?;
+    if let Ok(v4) = addr_str.parse::<Ipv4Addr>() {
+        let prefix_len: u32 = prefix_str.parse().ok()?;
+        if prefix_len > 32 { return None; }
+        let mask = if prefix_len == 0 { 0u32 } else { !0u32 << (32 - prefix_len) };
+        return Some(ParsedCidr::V4(u32::from(v4), mask));
+    }
+    if let Ok(v6) = addr_str.parse::<Ipv6Addr>() {
+        let prefix_len: u32 = prefix_str.parse().ok()?;
+        if prefix_len > 128 { return None; }
+        let mask: u128 = if prefix_len == 0 { 0u128 } else { !0u128 << (128 - prefix_len) };
+        return Some(ParsedCidr::V6(u128::from(v6), mask));
+    }
+    None
+}
+
 /// Compiled policy — fast lookup structures.
 pub struct CompiledPolicy {
     pub rules: Vec<PolicyRule>,
     pub default_action: PolicyDecision,
-    cidr_table: Vec<(u32, u32, PolicyDecision)>,  // (network_addr, mask, decision)
-    domain_table: Vec<(String, PolicyDecision)>,   // (lowercase suffix, decision)
+    cidr_table_v4: Vec<(u32, u32, PolicyDecision)>,    // (network_addr, mask, decision)
+    cidr_table_v6: Vec<(u128, u128, PolicyDecision)>,  // (network_addr, mask, decision)
+    domain_table: Vec<(String, PolicyDecision)>,        // (lowercase suffix, decision)
     port_table: HashMap<u16, PolicyDecision>,
     app_path_table: Vec<(String, PolicyDecision)>, // normalized exact exe paths
     app_dir_table: Vec<(String, PolicyDecision)>,  // normalized dir prefixes (trailing /)
@@ -46,7 +70,8 @@ pub struct CompiledPolicy {
 
 impl CompiledPolicy {
     pub fn compile(rules: Vec<PolicyRule>, default_action: PolicyDecision) -> Self {
-        let mut cidr_table = Vec::new();
+        let mut cidr_table_v4 = Vec::new();
+        let mut cidr_table_v6 = Vec::new();
         let mut domain_table = Vec::new();
         let mut port_table = HashMap::new();
         let mut app_path_table = Vec::new();
@@ -55,8 +80,14 @@ impl CompiledPolicy {
         for rule in &rules {
             match rule {
                 PolicyRule::DestCidr { cidr, action } => {
-                    if let Some((addr, mask)) = parse_cidr(cidr) {
-                        cidr_table.push((addr, mask, *action));
+                    match parse_cidr(cidr) {
+                        Some(ParsedCidr::V4(addr, mask)) => {
+                            cidr_table_v4.push((addr, mask, *action));
+                        }
+                        Some(ParsedCidr::V6(addr, mask)) => {
+                            cidr_table_v6.push((addr, mask, *action));
+                        }
+                        None => {}
                     }
                 }
                 PolicyRule::DestDomain { domain, action } => {
@@ -81,7 +112,8 @@ impl CompiledPolicy {
         Self {
             rules,
             default_action,
-            cidr_table,
+            cidr_table_v4,
+            cidr_table_v6,
             domain_table,
             port_table,
             app_path_table,
@@ -144,11 +176,21 @@ impl CompiledPolicy {
             return *decision;
         }
 
-        // Check CIDR
+        // Check CIDR — IPv4
         if let IpAddr::V4(v4) = dst_ip {
             let ip_u32 = u32::from(v4);
-            for &(network, mask, decision) in &self.cidr_table {
+            for &(network, mask, decision) in &self.cidr_table_v4 {
                 if ip_u32 & mask == network & mask {
+                    return decision;
+                }
+            }
+        }
+
+        // Check CIDR — IPv6
+        if let IpAddr::V6(v6) = dst_ip {
+            let ip_u128 = u128::from(v6);
+            for &(network, mask, decision) in &self.cidr_table_v6 {
+                if ip_u128 & mask == network & mask {
                     return decision;
                 }
             }
@@ -172,7 +214,15 @@ impl CompiledPolicy {
     }
 
     pub fn bypass_cidrs(&self) -> Vec<(u32, u32)> {
-        self.cidr_table.iter()
+        self.cidr_table_v4.iter()
+            .filter(|(_, _, d)| *d == PolicyDecision::Bypass)
+            .map(|(addr, mask, _)| (*addr, *mask))
+            .collect()
+    }
+
+    /// Bypass CIDRs for IPv6.
+    pub fn bypass_cidrs_v6(&self) -> Vec<(u128, u128)> {
+        self.cidr_table_v6.iter()
             .filter(|(_, _, d)| *d == PolicyDecision::Bypass)
             .map(|(addr, mask, _)| (*addr, *mask))
             .collect()
@@ -181,16 +231,6 @@ impl CompiledPolicy {
 
 fn normalize_app_path(p: &str) -> String {
     p.to_lowercase().replace('\\', "/")
-}
-
-fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
-    let parts: Vec<&str> = cidr.split('/').collect();
-    if parts.len() != 2 { return None; }
-    let addr: Ipv4Addr = parts[0].parse().ok()?;
-    let prefix_len: u32 = parts[1].parse().ok()?;
-    if prefix_len > 32 { return None; }
-    let mask = if prefix_len == 0 { 0u32 } else { !0u32 << (32 - prefix_len) };
-    Some((u32::from(addr), mask))
 }
 
 pub struct PolicyEngine {
@@ -234,5 +274,10 @@ impl PolicyEngine {
     pub async fn bypass_cidrs(&self) -> Vec<(u32, u32)> {
         let config = self.config.read().await;
         config.bypass_cidrs()
+    }
+
+    pub async fn bypass_cidrs_v6(&self) -> Vec<(u128, u128)> {
+        let config = self.config.read().await;
+        config.bypass_cidrs_v6()
     }
 }
