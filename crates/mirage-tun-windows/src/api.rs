@@ -145,6 +145,8 @@ pub async fn activate_tun_inner(
     let native_dns = discover_native_dns(if_index).await;
     info!("native_dns resolved: {native_dns:?}");
 
+    let process_resolver = Arc::new(crate::process_info::ProcessResolver::new());
+
     let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
     let _runner = IpStackRunner::start(
         device,
@@ -155,6 +157,7 @@ pub async fn activate_tun_inner(
         Arc::clone(&state.policy),
         Arc::clone(&state.dns_map),
         native_dns,
+        process_resolver,
     )
     .await?;
 

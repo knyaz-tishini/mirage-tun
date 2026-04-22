@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use crate::dns_map::DnsMap;
 use crate::error::{Result, TunError};
 use crate::policy::{PolicyDecision, PolicyEngine};
+use crate::process_info::ProcessResolver;
 use crate::wintun::WintunDevice;
 
 pub struct IpStackRunner;
@@ -34,6 +35,7 @@ impl IpStackRunner {
         policy: Arc<PolicyEngine>,
         dns_map: Arc<DnsMap>,
         native_dns: Option<SocketAddr>,
+        process_resolver: Arc<ProcessResolver>,
     ) -> Result<Self> {
         info!(
             "IpStackRunner: started, socks5={socks5_addr}, \
@@ -88,6 +90,7 @@ impl IpStackRunner {
             stats.clone(),
             policy.clone(),
             dns_map.clone(),
+            process_resolver,
         ));
         tokio::spawn(udp_dns_loop(
             udp_socket,
@@ -218,6 +221,7 @@ async fn tcp_accept_loop(
     stats: Arc<PumpStats>,
     policy: Arc<PolicyEngine>,
     dns_map: Arc<DnsMap>,
+    process_resolver: Arc<ProcessResolver>,
 ) {
     loop {
         tokio::select! {
@@ -228,13 +232,32 @@ async fn tcp_accept_loop(
             }
             item = tcp_listener.next() => match item {
                 None => break,
-                Some((stream, _local_addr, remote_addr)) => {
+                Some((stream, local_addr, remote_addr)) => {
                     let dst = remote_addr;
+                    let src_port = local_addr.port();
                     stats.tcp_accepted.fetch_add(1, Ordering::Relaxed);
+
+                    // App-based process lookup (spawn_blocking — sync Win32 calls)
+                    let resolver = process_resolver.clone();
+                    let app_info = tokio::task::spawn_blocking(move || {
+                        resolver.resolve(src_port, dst)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+
+                    if let Some(ref info) = app_info {
+                        tracing::debug!(
+                            "TCP {dst}: src_port={src_port} exe={}",
+                            info.exe_path
+                        );
+                    }
 
                     // Policy decision
                     let domain_hint = dns_map.get(&dst.ip());
-                    let decision = policy.decide(dst.ip(), dst.port(), domain_hint.as_deref()).await;
+                    let decision = policy
+                        .decide(dst.ip(), dst.port(), domain_hint.as_deref(), app_info.as_ref())
+                        .await;
 
                     let cancel2 = cancel.clone();
                     let stats2 = stats.clone();

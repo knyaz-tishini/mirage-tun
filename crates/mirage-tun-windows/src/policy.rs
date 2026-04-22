@@ -17,6 +17,10 @@ pub enum PolicyRule {
     DestCidr { cidr: String, action: PolicyDecision },
     DestDomain { domain: String, action: PolicyDecision },
     DestPort { port: u16, action: PolicyDecision },
+    /// Exact exe path match (case-insensitive, slash-normalized).
+    DestAppPath { path: String, action: PolicyDecision },
+    /// Directory prefix match — any exe whose normalized path starts with this dir prefix.
+    DestAppDir { dir: String, action: PolicyDecision },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,9 +37,11 @@ fn default_mirage() -> PolicyDecision { PolicyDecision::Mirage }
 pub struct CompiledPolicy {
     pub rules: Vec<PolicyRule>,
     pub default_action: PolicyDecision,
-    cidr_table: Vec<(u32, u32, PolicyDecision)>, // (network_addr, mask, decision)
-    domain_table: Vec<(String, PolicyDecision)>,  // (lowercase suffix, decision)
+    cidr_table: Vec<(u32, u32, PolicyDecision)>,  // (network_addr, mask, decision)
+    domain_table: Vec<(String, PolicyDecision)>,   // (lowercase suffix, decision)
     port_table: HashMap<u16, PolicyDecision>,
+    app_path_table: Vec<(String, PolicyDecision)>, // normalized exact exe paths
+    app_dir_table: Vec<(String, PolicyDecision)>,  // normalized dir prefixes (trailing /)
 }
 
 impl CompiledPolicy {
@@ -43,6 +49,8 @@ impl CompiledPolicy {
         let mut cidr_table = Vec::new();
         let mut domain_table = Vec::new();
         let mut port_table = HashMap::new();
+        let mut app_path_table = Vec::new();
+        let mut app_dir_table = Vec::new();
 
         for rule in &rules {
             match rule {
@@ -57,18 +65,67 @@ impl CompiledPolicy {
                 PolicyRule::DestPort { port, action } => {
                     port_table.insert(*port, *action);
                 }
+                PolicyRule::DestAppPath { path, action } => {
+                    app_path_table.push((normalize_app_path(path), *action));
+                }
+                PolicyRule::DestAppDir { dir, action } => {
+                    let mut normalized = normalize_app_path(dir);
+                    if !normalized.ends_with('/') {
+                        normalized.push('/');
+                    }
+                    app_dir_table.push((normalized, *action));
+                }
             }
         }
 
-        Self { rules, default_action, cidr_table, domain_table, port_table }
+        Self {
+            rules,
+            default_action,
+            cidr_table,
+            domain_table,
+            port_table,
+            app_path_table,
+            app_dir_table,
+        }
     }
 
     pub fn mirage_only() -> Self {
         Self::compile(vec![], PolicyDecision::Mirage)
     }
 
-    pub fn decide(&self, dst_ip: IpAddr, dst_port: u16, domain_hint: Option<&str>) -> PolicyDecision {
-        // Check domain first (most specific)
+    pub fn decide(
+        &self,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        domain_hint: Option<&str>,
+        app_info: Option<&crate::process_info::ProcessInfo>,
+    ) -> PolicyDecision {
+        // App-based checks first (most specific — overrides domain/port/CIDR)
+        if let Some(info) = app_info {
+            let paths: Vec<&str> = std::iter::once(info.exe_path.as_str())
+                .chain(info.ancestor_paths.iter().map(|s| s.as_str()))
+                .collect();
+
+            // Exact path match
+            for (rule_path, decision) in &self.app_path_table {
+                for &p in &paths {
+                    if p == rule_path.as_str() {
+                        return *decision;
+                    }
+                }
+            }
+
+            // Directory prefix match
+            for (rule_dir, decision) in &self.app_dir_table {
+                for &p in &paths {
+                    if p.starts_with(rule_dir.as_str()) {
+                        return *decision;
+                    }
+                }
+            }
+        }
+
+        // Check domain (most specific among network rules)
         if let Some(domain) = domain_hint {
             let domain_lower = domain.to_lowercase();
             for (suffix, decision) in &self.domain_table {
@@ -122,6 +179,10 @@ impl CompiledPolicy {
     }
 }
 
+fn normalize_app_path(p: &str) -> String {
+    p.to_lowercase().replace('\\', "/")
+}
+
 fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 { return None; }
@@ -145,9 +206,15 @@ impl PolicyEngine {
         Self::new(CompiledPolicy::mirage_only())
     }
 
-    pub async fn decide(&self, dst_ip: IpAddr, dst_port: u16, domain_hint: Option<&str>) -> PolicyDecision {
+    pub async fn decide(
+        &self,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        domain_hint: Option<&str>,
+        app_info: Option<&crate::process_info::ProcessInfo>,
+    ) -> PolicyDecision {
         let config = self.config.read().await;
-        config.decide(dst_ip, dst_port, domain_hint)
+        config.decide(dst_ip, dst_port, domain_hint, app_info)
     }
 
     pub async fn domain_decision(&self, domain: &str) -> PolicyDecision {
