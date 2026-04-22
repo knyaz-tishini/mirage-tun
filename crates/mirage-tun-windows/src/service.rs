@@ -6,16 +6,15 @@ use tracing::info;
 use windows_service::service_control_handler::ServiceStatusHandle;
 
 use crate::api::AppState;
+use crate::config::TunConfig;
+use crate::metrics::MetricsRegistry;
 use crate::state::ServiceState;
 use crate::wintun::WintunHandle;
 use crate::routing::cleanup_stale_routes;
 
 static STOP_TX: OnceLock<watch::Sender<()>> = OnceLock::new();
 
-const TUN_NAME: &str = "mirage0";
-const TUN_ADDR: &str = "10.0.85.1/24";
 const TUN_MTU: u16 = 1500;
-const API_BIND: &str = "127.0.0.1:19485";
 
 pub(crate) fn find_config() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
@@ -120,8 +119,9 @@ async fn autostart_activate(
     let s = state.service.lock().await;
     if let Some(socks5) = s.socks5_addr {
         let if_index = s.if_index;
+        let dns_upstream = s.dns_upstream;
         drop(s);
-        crate::ipstack::dns_warmup(socks5, if_index).await;
+        crate::ipstack::dns_warmup(socks5, if_index, dns_upstream).await;
     }
     Ok(())
 }
@@ -198,13 +198,24 @@ pub async fn run_service_logic(
     stop_tx: watch::Sender<()>,
     mut stop_rx: watch::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Load config from tun.json if present, otherwise use defaults.
+    let tun_cfg = Arc::new(
+        find_config()
+            .map(|p| TunConfig::load_from_tun_json(&p))
+            .unwrap_or_default()
+    );
+
+    let tun_name = tun_cfg.tun_name.clone();
+    let tun_addr = tun_cfg.tun_addr.clone();
+    let api_bind = tun_cfg.api_bind;
+
     // Stale state cleanup
-    cleanup_stale_routes(TUN_NAME).await;
+    cleanup_stale_routes(&tun_name).await;
     crate::proxy::clear_system_proxy().await;
 
-    let wintun = match WintunHandle::create(TUN_NAME, TUN_ADDR, TUN_MTU).await {
+    let wintun = match WintunHandle::create(&tun_name, &tun_addr, TUN_MTU).await {
         Ok(w) => {
-            info!("Wintun adapter '{TUN_NAME}' ready");
+            info!("Wintun adapter '{tun_name}' ready");
             Some(w)
         }
         Err(e) => {
@@ -216,11 +227,14 @@ pub async fn run_service_logic(
     let policy = Arc::new(crate::policy::PolicyEngine::mirage_only());
     let dns_map = Arc::new(crate::dns_map::DnsMap::new());
     let chains = Arc::new(crate::chains::ChainRegistry::empty());
+    let metrics = Arc::new(MetricsRegistry::new());
 
-    let mut svc_state = ServiceState::new(TUN_NAME.to_owned());
+    let mut svc_state = ServiceState::new(tun_name.clone());
     svc_state.wintun = wintun;
     svc_state.dns_map = Arc::clone(&dns_map);
     svc_state.chains = Arc::clone(&chains);
+    svc_state.drain_timeout_secs = tun_cfg.drain_timeout_secs;
+    svc_state.dns_upstream = tun_cfg.dns_upstream;
     let svc_state = Arc::new(Mutex::new(svc_state));
 
     let app_state = Arc::new(AppState {
@@ -229,11 +243,13 @@ pub async fn run_service_logic(
         policy,
         dns_map,
         chains,
+        metrics,
+        config: Arc::clone(&tun_cfg),
     });
 
     let router = crate::api::build_router(Arc::clone(&app_state));
-    let listener = tokio::net::TcpListener::bind(API_BIND).await?;
-    info!("Management API listening on {API_BIND}");
+    let listener = tokio::net::TcpListener::bind(api_bind).await?;
+    info!("Management API listening on {api_bind}");
 
     // Autostart TUN if config exists
     {

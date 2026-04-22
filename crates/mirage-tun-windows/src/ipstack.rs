@@ -18,13 +18,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::chains::{ChainMap, ChainRegistry};
+use crate::config::TunConfig;
 use crate::dns_map::DnsMap;
 use crate::error::{Result, TunError};
+use crate::metrics::MetricsRegistry;
 use crate::policy::{PolicyDecision, PolicyEngine};
 use crate::process_info::ProcessResolver;
 use crate::wintun::WintunDevice;
 
-pub struct IpStackRunner;
+pub struct IpStackRunner {
+    /// Number of active TCP/bypass connections — used for graceful drain.
+    pub active_conns: Arc<AtomicU64>,
+}
 
 impl IpStackRunner {
     pub async fn start(
@@ -37,6 +42,8 @@ impl IpStackRunner {
         dns_map: Arc<DnsMap>,
         native_dns: Option<SocketAddr>,
         process_resolver: Arc<ProcessResolver>,
+        metrics: Arc<MetricsRegistry>,
+        cfg: &TunConfig,
     ) -> Result<Self> {
         // Snapshot for logging only — not used in the hot path.
         let snap = chain_registry.snapshot().await;
@@ -72,9 +79,15 @@ impl IpStackRunner {
         let (stack_sink, stack_stream) = stack.split();
         let (wintun_rx, wintun_tx) = device.take_channels();
 
-        let socks5_semaphore = Arc::new(Semaphore::new(100));
+        let socks5_semaphore = Arc::new(Semaphore::new(cfg.socks5_concurrency));
 
         let stats = Arc::new(PumpStats::default());
+        let active_conns = Arc::new(AtomicU64::new(0));
+
+        let dns_upstream = cfg.dns_upstream;
+        let dns_cache_ttl = std::time::Duration::from_secs(cfg.dns_cache_ttl_secs);
+        let dns_cache_max = cfg.dns_cache_max;
+        let dns_concurrency = cfg.dns_concurrency;
 
         tokio::spawn(pump_wintun_to_stack(
             wintun_rx,
@@ -98,6 +111,8 @@ impl IpStackRunner {
             policy.clone(),
             dns_map.clone(),
             process_resolver,
+            metrics,
+            active_conns.clone(),
         ));
         tokio::spawn(udp_dns_loop(
             udp_socket,
@@ -107,6 +122,10 @@ impl IpStackRunner {
             policy,
             dns_map,
             native_dns,
+            dns_upstream,
+            dns_cache_ttl,
+            dns_cache_max,
+            dns_concurrency,
         ));
 
         // Stats printer
@@ -134,7 +153,7 @@ impl IpStackRunner {
             }
         });
 
-        Ok(Self)
+        Ok(Self { active_conns })
     }
 }
 
@@ -150,6 +169,15 @@ struct PumpStats {
     sink_errors: AtomicU64,
     bypass_ok: AtomicU64,
     bypass_fail: AtomicU64,
+}
+
+/// RAII guard that decrements `active_conns` when the connection task completes.
+struct ConnGuard(Arc<AtomicU64>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 // ── Wintun ↔ Stack pumps ──────────────────────────────────────────────────────
@@ -229,6 +257,8 @@ async fn tcp_accept_loop(
     policy: Arc<PolicyEngine>,
     dns_map: Arc<DnsMap>,
     process_resolver: Arc<ProcessResolver>,
+    metrics: Arc<MetricsRegistry>,
+    active_conns: Arc<AtomicU64>,
 ) {
     loop {
         tokio::select! {
@@ -273,14 +303,23 @@ async fn tcp_accept_loop(
                         PolicyDecision::Bypass => {
                             info!("TCP {dst}: BYPASS app={} domain={domain_hint:?}",
                                 exe_short.as_deref().unwrap_or("?"));
+                            let metrics2 = metrics.clone();
+                            metrics2.record_bypass_connection();
+                            let ac = active_conns.clone();
+                            ac.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
+                                let _guard = ConnGuard(ac);
                                 tokio::select! {
                                     _ = cancel2.cancelled() => {}
                                     r = handle_bypass_tcp(stream, dst, if_index) => {
                                         match r {
-                                            Ok(_) => { stats2.bypass_ok.fetch_add(1, Ordering::Relaxed); }
+                                            Ok((tx, rx)) => {
+                                                stats2.bypass_ok.fetch_add(1, Ordering::Relaxed);
+                                                metrics2.record_bypass_bytes(tx, rx);
+                                            }
                                             Err(e) => {
                                                 stats2.bypass_fail.fetch_add(1, Ordering::Relaxed);
+                                                metrics2.record_bypass_error();
                                                 warn!("IpStackRunner: TCP {dst} bypass error: {e}");
                                             }
                                         }
@@ -299,14 +338,23 @@ async fn tcp_accept_loop(
                                 }
                             };
                             let sem = socks5_semaphore.clone();
+                            let metrics2 = metrics.clone();
+                            metrics2.record_connection(&chain_name);
+                            let ac = active_conns.clone();
+                            ac.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
+                                let _guard = ConnGuard(ac);
                                 tokio::select! {
                                     _ = cancel2.cancelled() => {}
                                     r = handle_tcp(stream, socks5_addr, dst, sem, if_index) => {
-                                        match &r {
-                                            Ok(_) => { stats2.socks5_ok.fetch_add(1, Ordering::Relaxed); }
+                                        match r {
+                                            Ok((tx, rx)) => {
+                                                stats2.socks5_ok.fetch_add(1, Ordering::Relaxed);
+                                                metrics2.record_bytes(&chain_name, tx, rx);
+                                            }
                                             Err(e) => {
                                                 stats2.socks5_fail.fetch_add(1, Ordering::Relaxed);
+                                                metrics2.record_error(&chain_name);
                                                 warn!("IpStackRunner: TCP {dst} chain '{chain_name}' error: {e}");
                                             }
                                         }
@@ -323,27 +371,21 @@ async fn tcp_accept_loop(
 
 // ── UDP / DNS loop ────────────────────────────────────────────────────────────
 
-const DNS_UPSTREAM: SocketAddr = SocketAddr::new(
-    IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-    53,
-);
-const DNS_CONCURRENCY: usize = 8;
-const DNS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-const DNS_CACHE_MAX: usize = 1024;
-
 struct DnsCache {
     entries: HashMap<Vec<u8>, (Vec<u8>, Instant)>,
+    ttl: std::time::Duration,
+    max: usize,
 }
 
 impl DnsCache {
-    fn new() -> Self {
-        Self { entries: HashMap::new() }
+    fn new(ttl: std::time::Duration, max: usize) -> Self {
+        Self { entries: HashMap::new(), ttl, max }
     }
 
     fn get(&mut self, query: &[u8]) -> Option<Vec<u8>> {
         let key = Self::cache_key(query);
         if let Some((resp, ts)) = self.entries.get(&key) {
-            if ts.elapsed() < DNS_CACHE_TTL {
+            if ts.elapsed() < self.ttl {
                 let mut cached = resp.clone();
                 // Patch transaction ID in response to match query
                 if query.len() >= 2 && cached.len() >= 2 {
@@ -358,7 +400,7 @@ impl DnsCache {
     }
 
     fn put(&mut self, query: &[u8], response: &[u8]) {
-        if self.entries.len() >= DNS_CACHE_MAX {
+        if self.entries.len() >= self.max {
             // Evict oldest
             let oldest = self.entries.iter()
                 .min_by_key(|(_, (_, ts))| *ts)
@@ -539,6 +581,10 @@ async fn udp_dns_loop(
     policy: Arc<PolicyEngine>,
     dns_map: Arc<DnsMap>,
     native_dns: Option<SocketAddr>,
+    dns_upstream: SocketAddr,
+    dns_cache_ttl: std::time::Duration,
+    dns_cache_max: usize,
+    dns_concurrency: usize,
 ) {
     let (mut read_half, write_half) = udp_socket.split();
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<UdpMsg>();
@@ -553,8 +599,8 @@ async fn udp_dns_loop(
         }
     });
 
-    let dns_sem = Arc::new(Semaphore::new(DNS_CONCURRENCY));
-    let cache = Arc::new(Mutex::new(DnsCache::new()));
+    let dns_sem = Arc::new(Semaphore::new(dns_concurrency));
+    let cache = Arc::new(Mutex::new(DnsCache::new(dns_cache_ttl, dns_cache_max)));
     let udp_sessions: UdpSessionMap = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
@@ -670,7 +716,7 @@ async fn udp_dns_loop(
                             Ok(p) => p,
                             Err(_) => return,
                         };
-                        match dns_via_socks5_inner(&payload, socks5_addr, if_index).await {
+                        match dns_via_socks5_inner(&payload, socks5_addr, if_index, dns_upstream).await {
                             Ok(response) => {
                                 if let Some(ref dom) = domain {
                                     let ips = extract_dns_ips(&response);
@@ -849,10 +895,11 @@ pub(crate) async fn dns_via_socks5_inner(
     query: &[u8],
     socks5_addr: SocketAddr,
     if_index: u32,
+    dns_upstream: SocketAddr,
 ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut last_err = None;
     for attempt in 0..2u8 {
-        match dns_tcp_query(query, socks5_addr, if_index).await {
+        match dns_tcp_query(query, socks5_addr, if_index, dns_upstream).await {
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 last_err = Some(e);
@@ -869,8 +916,9 @@ async fn dns_tcp_query(
     query: &[u8],
     socks5_addr: SocketAddr,
     if_index: u32,
+    dns_upstream: SocketAddr,
 ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stream = socks5_connect(socks5_addr, DNS_UPSTREAM, if_index).await?;
+    let mut stream = socks5_connect(socks5_addr, dns_upstream, if_index).await?;
 
     // DNS-over-TCP: 2-byte big-endian length prefix
     let len = query.len() as u16;
@@ -896,10 +944,12 @@ async fn handle_bypass_tcp(
     mut tcp: netstack_smoltcp::TcpStream,
     dst: SocketAddr,
     if_index: u32,
-) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> std::result::Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
     let mut native = connect_via_interface(dst, if_index).await?;
-    tokio::io::copy_bidirectional_with_sizes(&mut tcp, &mut native, 64 * 1024, 64 * 1024).await?;
-    Ok(())
+    let (a_to_b, b_to_a) =
+        tokio::io::copy_bidirectional_with_sizes(&mut tcp, &mut native, 64 * 1024, 64 * 1024)
+            .await?;
+    Ok((a_to_b, b_to_a))
 }
 
 // ── TCP → SOCKS5 ──────────────────────────────────────────────────────────────
@@ -910,7 +960,7 @@ async fn handle_tcp(
     dst: SocketAddr,
     socks5_semaphore: Arc<Semaphore>,
     if_index: u32,
-) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> std::result::Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
     let t0 = Instant::now();
     let mut proxy =
         socks5_connect_with_semaphore(socks5_addr, dst, &socks5_semaphore, if_index).await?;
@@ -928,14 +978,16 @@ async fn handle_tcp(
     }
 
     let t2 = Instant::now();
-    let (a_to_b, b_to_a) = tokio::io::copy_bidirectional_with_sizes(&mut tcp, &mut proxy, 64 * 1024, 64 * 1024).await?;
+    let (a_to_b, b_to_a) =
+        tokio::io::copy_bidirectional_with_sizes(&mut tcp, &mut proxy, 64 * 1024, 64 * 1024)
+            .await?;
     let relay_ms = t2.elapsed().as_millis();
 
     let total_ms = t0.elapsed().as_millis();
     if total_ms > 1000 {
         info!("TCP {dst}: socks5={socks5_ms}ms first_read={first_read_ms}ms({first_n}B) relay={relay_ms}ms tx={a_to_b} rx={b_to_a}");
     }
-    Ok(())
+    Ok((a_to_b, b_to_a))
 }
 
 // ── SOCKS5 connect with concurrency limit ────────────────────────────────────
@@ -1072,7 +1124,7 @@ async fn socks5_connect(
 
 // ── DNS warmup ────────────────────────────────────────────────────────────────
 
-pub(crate) async fn dns_warmup(socks5_addr: SocketAddr, if_index: u32) {
+pub(crate) async fn dns_warmup(socks5_addr: SocketAddr, if_index: u32, dns_upstream: SocketAddr) {
     // Minimal A query for example.com — just to warm up the DNS-over-TCP SOCKS5 path
     let query: &[u8] = &[
         0x00, 0x01, // txn id
@@ -1085,7 +1137,7 @@ pub(crate) async fn dns_warmup(socks5_addr: SocketAddr, if_index: u32) {
         0x00, 0x01, // QTYPE A
         0x00, 0x01, // QCLASS IN
     ];
-    match dns_via_socks5_inner(query, socks5_addr, if_index).await {
+    match dns_via_socks5_inner(query, socks5_addr, if_index, dns_upstream).await {
         Ok(_) => info!("DNS warmup: success"),
         Err(e) => tracing::warn!("DNS warmup: failed: {e}"),
     }

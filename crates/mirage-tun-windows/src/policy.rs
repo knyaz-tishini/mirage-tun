@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -98,56 +99,74 @@ fn parse_cidr(cidr: &str) -> Option<ParsedCidr> {
 pub struct CompiledPolicy {
     pub rules: Vec<PolicyRule>,
     pub default_action: PolicyDecision,
-    cidr_table_v4: Vec<(u32, u32, PolicyDecision)>,    // (network_addr, mask, decision)
-    cidr_table_v6: Vec<(u128, u128, PolicyDecision)>,  // (network_addr, mask, decision)
-    domain_table: Vec<(String, PolicyDecision)>,        // (lowercase suffix, decision)
-    port_table: HashMap<u16, PolicyDecision>,
-    app_path_table: Vec<(String, PolicyDecision)>, // normalized exact exe paths
-    app_dir_table: Vec<(String, PolicyDecision)>,  // normalized dir prefixes (trailing /)
+    cidr_table_v4: Vec<(u32, u32, PolicyDecision, usize)>,    // (network_addr, mask, decision, rule_idx)
+    cidr_table_v6: Vec<(u128, u128, PolicyDecision, usize)>,  // (network_addr, mask, decision, rule_idx)
+    domain_table: Vec<(String, PolicyDecision, usize)>,        // (lowercase suffix, decision, rule_idx)
+    port_table: HashMap<u16, (PolicyDecision, usize)>,
+    app_path_table: Vec<(String, PolicyDecision, usize)>, // normalized exact exe paths
+    app_dir_table: Vec<(String, PolicyDecision, usize)>,  // normalized dir prefixes (trailing /)
+    /// Per-rule hit counters shared with MetricsRegistry. Index matches `rules` vec.
+    pub rule_hits: Arc<Vec<AtomicU64>>,
 }
 
 impl CompiledPolicy {
     pub fn compile(rules: Vec<PolicyRule>, default_action: PolicyDecision) -> Self {
-        let mut cidr_table_v4 = Vec::new();
-        let mut cidr_table_v6 = Vec::new();
-        let mut domain_table = Vec::new();
-        let mut port_table = HashMap::new();
-        let mut app_path_table = Vec::new();
-        let mut app_dir_table = Vec::new();
+        Self::compile_with_hits(rules, default_action, None)
+    }
 
-        for rule in &rules {
+    /// Compile with an externally provided hit counter vec (from MetricsRegistry).
+    pub fn compile_with_hits(
+        rules: Vec<PolicyRule>,
+        default_action: PolicyDecision,
+        rule_hits: Option<Arc<Vec<AtomicU64>>>,
+    ) -> Self {
+        // Each table entry stores (key, decision, rule_index) so we can increment
+        // the correct counter when a rule fires.
+        let mut cidr_table_v4: Vec<(u32, u32, PolicyDecision, usize)> = Vec::new();
+        let mut cidr_table_v6: Vec<(u128, u128, PolicyDecision, usize)> = Vec::new();
+        let mut domain_table: Vec<(String, PolicyDecision, usize)> = Vec::new();
+        let mut port_table: HashMap<u16, (PolicyDecision, usize)> = HashMap::new();
+        let mut app_path_table: Vec<(String, PolicyDecision, usize)> = Vec::new();
+        let mut app_dir_table: Vec<(String, PolicyDecision, usize)> = Vec::new();
+
+        for (idx, rule) in rules.iter().enumerate() {
             match rule {
                 PolicyRule::DestCidr { cidr, action } => {
                     match parse_cidr(cidr) {
                         Some(ParsedCidr::V4(addr, mask)) => {
-                            cidr_table_v4.push((addr, mask, action.clone()));
+                            cidr_table_v4.push((addr, mask, action.clone(), idx));
                         }
                         Some(ParsedCidr::V6(addr, mask)) => {
-                            cidr_table_v6.push((addr, mask, action.clone()));
+                            cidr_table_v6.push((addr, mask, action.clone(), idx));
                         }
                         None => {}
                     }
                 }
                 PolicyRule::DestDomain { domain, action } => {
-                    domain_table.push((domain.to_lowercase(), action.clone()));
+                    domain_table.push((domain.to_lowercase(), action.clone(), idx));
                 }
                 PolicyRule::DestPort { port, action } => {
-                    port_table.insert(*port, action.clone());
+                    port_table.insert(*port, (action.clone(), idx));
                 }
                 PolicyRule::DestAppPath { path, action } => {
-                    app_path_table.push((normalize_app_path(path), action.clone()));
+                    app_path_table.push((normalize_app_path(path), action.clone(), idx));
                 }
                 PolicyRule::DestAppDir { dir, action } => {
                     let mut normalized = normalize_app_path(dir);
                     if !normalized.ends_with('/') {
                         normalized.push('/');
                     }
-                    app_dir_table.push((normalized, action.clone()));
+                    app_dir_table.push((normalized, action.clone(), idx));
                 }
             }
         }
 
+        let hits = rule_hits.unwrap_or_else(|| {
+            Arc::new((0..rules.len()).map(|_| AtomicU64::new(0)).collect())
+        });
+
         Self {
+            rule_hits: hits,
             rules,
             default_action,
             cidr_table_v4,
@@ -177,18 +196,24 @@ impl CompiledPolicy {
                 .collect();
 
             // Exact path match
-            for (rule_path, decision) in &self.app_path_table {
+            for (rule_path, decision, rule_idx) in &self.app_path_table {
                 for &p in &paths {
                     if p == rule_path.as_str() {
+                        if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
                         return decision.clone();
                     }
                 }
             }
 
             // Directory prefix match
-            for (rule_dir, decision) in &self.app_dir_table {
+            for (rule_dir, decision, rule_idx) in &self.app_dir_table {
                 for &p in &paths {
                     if p.starts_with(rule_dir.as_str()) {
+                        if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
                         return decision.clone();
                     }
                 }
@@ -198,27 +223,37 @@ impl CompiledPolicy {
         // Check domain (most specific among network rules)
         if let Some(domain) = domain_hint {
             let domain_lower = domain.to_lowercase();
-            for (suffix, decision) in &self.domain_table {
-                if suffix.starts_with('.') {
-                    if domain_lower.ends_with(suffix.as_str()) || domain_lower == &suffix[1..] {
-                        return decision.clone();
+            for (suffix, decision, rule_idx) in &self.domain_table {
+                let matched = if suffix.starts_with('.') {
+                    domain_lower.ends_with(suffix.as_str()) || domain_lower == &suffix[1..]
+                } else {
+                    domain_lower == *suffix || domain_lower.ends_with(&format!(".{suffix}"))
+                };
+                if matched {
+                    if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                        counter.fetch_add(1, Ordering::Relaxed);
                     }
-                } else if domain_lower == *suffix || domain_lower.ends_with(&format!(".{suffix}")) {
                     return decision.clone();
                 }
             }
         }
 
         // Check port
-        if let Some(decision) = self.port_table.get(&dst_port) {
+        if let Some((decision, rule_idx)) = self.port_table.get(&dst_port) {
+            if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
             return decision.clone();
         }
 
         // Check CIDR — IPv4
         if let IpAddr::V4(v4) = dst_ip {
             let ip_u32 = u32::from(v4);
-            for (network, mask, decision) in &self.cidr_table_v4 {
+            for (network, mask, decision, rule_idx) in &self.cidr_table_v4 {
                 if ip_u32 & mask == network & mask {
+                    if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
                     return decision.clone();
                 }
             }
@@ -227,8 +262,11 @@ impl CompiledPolicy {
         // Check CIDR — IPv6
         if let IpAddr::V6(v6) = dst_ip {
             let ip_u128 = u128::from(v6);
-            for (network, mask, decision) in &self.cidr_table_v6 {
+            for (network, mask, decision, rule_idx) in &self.cidr_table_v6 {
                 if ip_u128 & mask == network & mask {
+                    if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
                     return decision.clone();
                 }
             }
@@ -239,12 +277,16 @@ impl CompiledPolicy {
 
     pub fn domain_decision(&self, domain: &str) -> PolicyDecision {
         let domain_lower = domain.to_lowercase();
-        for (suffix, decision) in &self.domain_table {
-            if suffix.starts_with('.') {
-                if domain_lower.ends_with(suffix.as_str()) || domain_lower == &suffix[1..] {
-                    return decision.clone();
+        for (suffix, decision, rule_idx) in &self.domain_table {
+            let matched = if suffix.starts_with('.') {
+                domain_lower.ends_with(suffix.as_str()) || domain_lower == &suffix[1..]
+            } else {
+                domain_lower == *suffix || domain_lower.ends_with(&format!(".{suffix}"))
+            };
+            if matched {
+                if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                    counter.fetch_add(1, Ordering::Relaxed);
                 }
-            } else if domain_lower == *suffix || domain_lower.ends_with(&format!(".{suffix}")) {
                 return decision.clone();
             }
         }
@@ -253,16 +295,16 @@ impl CompiledPolicy {
 
     pub fn bypass_cidrs(&self) -> Vec<(u32, u32)> {
         self.cidr_table_v4.iter()
-            .filter(|(_, _, d)| *d == PolicyDecision::Bypass)
-            .map(|(addr, mask, _)| (*addr, *mask))
+            .filter(|(_, _, d, _)| *d == PolicyDecision::Bypass)
+            .map(|(addr, mask, _, _)| (*addr, *mask))
             .collect()
     }
 
     /// Bypass CIDRs for IPv6.
     pub fn bypass_cidrs_v6(&self) -> Vec<(u128, u128)> {
         self.cidr_table_v6.iter()
-            .filter(|(_, _, d)| *d == PolicyDecision::Bypass)
-            .map(|(addr, mask, _)| (*addr, *mask))
+            .filter(|(_, _, d, _)| *d == PolicyDecision::Bypass)
+            .map(|(addr, mask, _, _)| (*addr, *mask))
             .collect()
     }
 }

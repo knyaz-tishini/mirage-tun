@@ -12,9 +12,11 @@ use tracing::{info, warn};
 
 use mirage_tun_core::traits::PlatformFirewall;
 
-use crate::chains::{ChainConfig, ChainMap, ChainRegistry};
+use crate::chains::{ChainConfig, ChainMap, ChainProtocol, ChainRegistry};
+use crate::config::TunConfig;
 use crate::error::TunError;
 use crate::ipstack::IpStackRunner;
+use crate::metrics::MetricsRegistry;
 use crate::routing::Routing;
 use crate::state::{ServiceState, TunPhase};
 
@@ -64,12 +66,15 @@ pub struct AppState {
     pub policy: Arc<crate::policy::PolicyEngine>,
     pub dns_map: Arc<crate::dns_map::DnsMap>,
     pub chains: Arc<ChainRegistry>,
+    pub metrics: Arc<MetricsRegistry>,
+    pub config: Arc<TunConfig>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(get_health))
         .route("/status", get(get_status))
+        .route("/config", get(get_config))
         .route("/tun/start", post(post_tun_start))
         .route("/tun/stop", post(post_tun_stop))
         .route("/proxy/set", post(post_proxy_set))
@@ -79,11 +84,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/policy/set", post(set_policy))
         .route("/chains/list", get(get_chains_list))
         .route("/chains/update", post(post_chains_update))
+        .route("/metrics", get(get_metrics))
         .with_state(state)
 }
 
 async fn get_health() -> StatusCode {
     StatusCode::OK
+}
+
+async fn get_config(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::to_value(state.config.as_ref()).unwrap_or(serde_json::Value::Null))
 }
 
 async fn get_status(
@@ -139,7 +151,7 @@ pub async fn activate_tun_inner(
     // Build chain configs — backward compat: if `chains` is empty but `socks5_addr`
     // is present, synthesize a single "default" chain.
     let chain_configs: Vec<ChainConfig> = if params.chains.is_empty() && !params.socks5_addr.is_empty() {
-        vec![ChainConfig { name: "default".to_owned(), socks5_addr: params.socks5_addr.clone() }]
+        vec![ChainConfig { name: "default".to_owned(), socks5_addr: params.socks5_addr.clone(), protocol: ChainProtocol::Socks5 }]
     } else {
         params.chains.clone()
     };
@@ -165,10 +177,11 @@ pub async fn activate_tun_inner(
 
     let t0 = std::time::Instant::now();
 
-    // Point adapter DNS at 8.8.8.8 so Windows sends DNS queries into TUN
-    // (our udp_dns_loop intercepts them and forwards via SOCKS5)
+    // Point adapter DNS at the configured upstream so Windows sends DNS queries
+    // into TUN (our udp_dns_loop intercepts them and forwards via SOCKS5).
+    let dns_ip = state.config.dns_upstream.ip().to_string();
     let _ = tokio::process::Command::new("netsh")
-        .args(["interface", "ip", "set", "dns", &tun_name, "static", "8.8.8.8"])
+        .args(["interface", "ip", "set", "dns", &tun_name, "static", &dns_ip])
         .output()
         .await;
 
@@ -225,7 +238,7 @@ pub async fn activate_tun_inner(
 
     let bypass_addrs_store = relay_ips.clone();
     let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
-    let _runner = IpStackRunner::start(
+    let runner = IpStackRunner::start(
         device,
         Arc::clone(&state.chains),
         cancel.clone(),
@@ -235,9 +248,14 @@ pub async fn activate_tun_inner(
         Arc::clone(&state.dns_map),
         native_dns,
         process_resolver,
+        Arc::clone(&state.metrics),
+        &state.config,
     )
     .await?;
 
+    s.active_conns = Some(runner.active_conns);
+    s.drain_timeout_secs = state.config.drain_timeout_secs;
+    s.dns_upstream = state.config.dns_upstream;
     s.ipstack_cancel = Some(cancel);
     s.socks5_addr = Some(default_socks5);
     s.killswitch = Some(killswitch);
@@ -272,17 +290,49 @@ async fn post_tun_start(
 async fn post_tun_stop(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let (cancel, active_conns, drain_timeout_secs) = {
+        let mut s = state.service.lock().await;
+
+        if s.tun_phase != TunPhase::TunActive {
+            return Err(map_err(TunError::NotActive));
+        }
+
+        s.tun_phase = TunPhase::Transitioning;
+
+        let cancel = s.ipstack_cancel.take();
+        let ac = s.active_conns.clone();
+        let dt = s.drain_timeout_secs;
+        (cancel, ac, dt)
+    };
+
+    // Cancel the token (stops accepting new connections).
+    if let Some(ref c) = cancel {
+        c.cancel();
+    }
+
+    // Drain active connections up to timeout.
+    if let Some(ref ac) = active_conns {
+        let n = ac.load(std::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            info!("TUN stop: draining {n} active connections...");
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(drain_timeout_secs);
+            loop {
+                let remaining = ac.load(std::sync::atomic::Ordering::Relaxed);
+                if remaining == 0 {
+                    info!("TUN stop: drain complete");
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    info!("TUN stop: drain complete ({remaining} connections remained after timeout)");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+
     let mut s = state.service.lock().await;
-
-    if s.tun_phase != TunPhase::TunActive {
-        return Err(map_err(TunError::NotActive));
-    }
-
-    s.tun_phase = TunPhase::Transitioning;
-
-    if let Some(cancel) = s.ipstack_cancel.take() {
-        cancel.cancel();
-    }
 
     if let Some(mut ks) = s.killswitch.take() {
         let _ = ks.deactivate();
@@ -444,6 +494,12 @@ async fn discover_native_dns(if_index: u32) -> Option<SocketAddr> {
     }
     // Fallback to Cloudflare DNS
     Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 53))
+}
+
+async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let rule_hits = state.metrics.rule_hits();
+    let snapshot = state.metrics.snapshot(&rule_hits);
+    Json(serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null))
 }
 
 fn map_err(e: TunError) -> (StatusCode, Json<ErrorBody>) {

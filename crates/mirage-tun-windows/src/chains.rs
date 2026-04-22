@@ -4,11 +4,24 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+/// Transport protocol used by a chain.
+///
+/// Only `Socks5` is implemented; other variants are recognised in config
+/// but will return an error at connection time.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainProtocol {
+    #[default]
+    Socks5,
+}
+
 /// Single chain configuration as sent in JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {
     pub name: String,
     pub socks5_addr: String,
+    #[serde(default)]
+    pub protocol: ChainProtocol,
 }
 
 /// Resolved map: chain name → SOCKS5 SocketAddr.
@@ -60,6 +73,7 @@ impl ChainRegistry {
             .map(|(name, addr)| ChainConfig {
                 name: name.clone(),
                 socks5_addr: addr.to_string(),
+                protocol: ChainProtocol::Socks5,
             })
             .collect()
     }
