@@ -17,7 +17,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::chains::ChainMap;
+use crate::chains::{ChainMap, ChainRegistry};
 use crate::dns_map::DnsMap;
 use crate::error::{Result, TunError};
 use crate::policy::{PolicyDecision, PolicyEngine};
@@ -29,7 +29,7 @@ pub struct IpStackRunner;
 impl IpStackRunner {
     pub async fn start(
         device: WintunDevice,
-        chain_map: Arc<ChainMap>,
+        chain_registry: Arc<ChainRegistry>,
         cancel: CancellationToken,
         relay_addrs: Vec<IpAddr>,
         if_index: u32,
@@ -38,14 +38,15 @@ impl IpStackRunner {
         native_dns: Option<SocketAddr>,
         process_resolver: Arc<ProcessResolver>,
     ) -> Result<Self> {
-        // Resolve default socks5 for DNS path and logging.
-        let default_socks5 = chain_map.get("default").copied()
-            .or_else(|| chain_map.values().next().copied());
+        // Snapshot for logging only — not used in the hot path.
+        let snap = chain_registry.snapshot().await;
+        let default_socks5 = snap.get("default").copied()
+            .or_else(|| snap.values().next().copied());
 
         info!(
             "IpStackRunner: started, default_socks5={default_socks5:?}, chains={}, \
              relay_bypass={relay_addrs:?}, if_index={if_index}",
-            chain_map.len(),
+            snap.len(),
         );
 
         let relay_set: Arc<HashSet<IpAddr>> =
@@ -89,7 +90,7 @@ impl IpStackRunner {
         ));
         tokio::spawn(tcp_accept_loop(
             tcp_listener,
-            chain_map.clone(),
+            chain_registry.clone(),
             socks5_semaphore,
             if_index,
             cancel.clone(),
@@ -100,7 +101,7 @@ impl IpStackRunner {
         ));
         tokio::spawn(udp_dns_loop(
             udp_socket,
-            chain_map,
+            chain_registry,
             if_index,
             cancel.clone(),
             policy,
@@ -220,7 +221,7 @@ async fn pump_stack_to_wintun(
 
 async fn tcp_accept_loop(
     mut tcp_listener: TcpListener,
-    chain_map: Arc<ChainMap>,
+    chain_registry: Arc<ChainRegistry>,
     socks5_semaphore: Arc<Semaphore>,
     if_index: u32,
     cancel: CancellationToken,
@@ -288,10 +289,12 @@ async fn tcp_accept_loop(
                             });
                         }
                         PolicyDecision::Chain(chain_name) => {
-                            let socks5_addr = match chain_map.get(&chain_name).copied() {
+                            // Snapshot the live registry at connection time — always current.
+                            let chain_snap: Arc<ChainMap> = chain_registry.snapshot().await;
+                            let socks5_addr = match chain_snap.get(&chain_name).copied() {
                                 Some(addr) => addr,
                                 None => {
-                                    warn!("TCP {dst}: chain '{chain_name}' not found in chain_map — dropping");
+                                    warn!("TCP {dst}: chain '{chain_name}' not found in registry — dropping");
                                     continue;
                                 }
                             };
@@ -463,33 +466,58 @@ async fn udp_bypass_forward(
     });
 }
 
+/// Bind a socket to a specific interface via `IP_UNICAST_IF` / `IPV6_UNICAST_IF` setsockopt.
+///
+/// For IPv4, the index is passed in big-endian (network byte order) as required by
+/// `IP_UNICAST_IF` on Windows. For IPv6, it is passed in native byte order as required by
+/// `IPV6_UNICAST_IF`. No-op when `if_index == 0`.
+#[cfg(windows)]
+fn bind_to_interface(sock: &socket2::Socket, if_index: u32, is_ipv4: bool) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+
+    if if_index == 0 {
+        return Ok(());
+    }
+
+    let (level, optname, index_val) = if is_ipv4 {
+        (
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
+            31i32, // IP_UNICAST_IF
+            u32::to_be(if_index),
+        )
+    } else {
+        (
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6 as i32,
+            31i32, // IPV6_UNICAST_IF
+            if_index, // native byte order for IPv6
+        )
+    };
+
+    unsafe {
+        let ret = windows_sys::Win32::Networking::WinSock::setsockopt(
+            sock.as_raw_socket() as usize,
+            level,
+            optname,
+            &index_val as *const u32 as *const u8,
+            std::mem::size_of::<u32>() as i32,
+        );
+        if ret == windows_sys::Win32::Networking::WinSock::SOCKET_ERROR {
+            return Err(std::io::Error::from_raw_os_error(
+                windows_sys::Win32::Networking::WinSock::WSAGetLastError(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn create_udp_bypass_socket(if_index: u32) -> std::io::Result<tokio::net::UdpSocket> {
-    use std::os::windows::io::AsRawSocket;
     use socket2::{Domain, Protocol, Socket, Type};
 
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("static addr is valid");
     sock.bind(&bind_addr.into())?;
-
-    if if_index > 0 {
-        unsafe {
-            let index_be = u32::to_be(if_index);
-            let ret = windows_sys::Win32::Networking::WinSock::setsockopt(
-                sock.as_raw_socket() as usize,
-                windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
-                31, // IP_UNICAST_IF
-                &index_be as *const u32 as *const u8,
-                std::mem::size_of::<u32>() as i32,
-            );
-            if ret == windows_sys::Win32::Networking::WinSock::SOCKET_ERROR {
-                return Err(std::io::Error::from_raw_os_error(
-                    windows_sys::Win32::Networking::WinSock::WSAGetLastError(),
-                ));
-            }
-        }
-    }
-
+    bind_to_interface(&sock, if_index, true)?;
     sock.set_nonblocking(true)?;
     let std_udp: std::net::UdpSocket = sock.into();
     tokio::net::UdpSocket::from_std(std_udp)
@@ -505,17 +533,13 @@ fn create_udp_bypass_socket(_if_index: u32) -> std::io::Result<tokio::net::UdpSo
 
 async fn udp_dns_loop(
     udp_socket: UdpSocket,
-    chain_map: Arc<ChainMap>,
+    chain_registry: Arc<ChainRegistry>,
     if_index: u32,
     cancel: CancellationToken,
     policy: Arc<PolicyEngine>,
     dns_map: Arc<DnsMap>,
     native_dns: Option<SocketAddr>,
 ) {
-    // Resolve default socks5 for DNS path.
-    let default_socks5 = chain_map.get("default").copied()
-        .or_else(|| chain_map.values().next().copied());
-
     let (mut read_half, write_half) = udp_socket.split();
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<UdpMsg>();
 
@@ -612,14 +636,31 @@ async fn udp_dns_loop(
                             });
                             continue;
                         }
-                        // native_dns not configured — fall through to SOCKS5
+                        // native_dns not configured — fall through to SOCKS5 default
                     }
 
-                    // SOCKS5 path — use default chain
-                    let socks5_addr = match default_socks5 {
+                    // SOCKS5 path — resolve chain from registry (live snapshot).
+                    // For Bypass that fell through, and for Chain(name), use the
+                    // named chain's SOCKS5; fall back to "default" if name is missing.
+                    let chain_snap: Arc<ChainMap> = chain_registry.snapshot().await;
+                    let socks5_addr = match &decision {
+                        PolicyDecision::Chain(name) => {
+                            // Try the named chain first, then fall back to "default".
+                            chain_snap.get(name.as_str()).copied()
+                                .or_else(|| chain_snap.get("default").copied())
+                                .or_else(|| chain_snap.values().next().copied())
+                        }
+                        PolicyDecision::Bypass => {
+                            // Fell through because native_dns was None.
+                            chain_snap.get("default").copied()
+                                .or_else(|| chain_snap.values().next().copied())
+                        }
+                    };
+
+                    let socks5_addr = match socks5_addr {
                         Some(addr) => addr,
                         None => {
-                            warn!("DNS query: no default chain configured — dropping");
+                            warn!("DNS query: no chain configured — dropping");
                             continue;
                         }
                     };
@@ -765,32 +806,12 @@ async fn dns_via_native(
     native_dns: SocketAddr,
     if_index: u32,
 ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    use std::os::windows::io::AsRawSocket;
     use socket2::{Domain, Protocol, Socket, Type};
 
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("static addr is valid");
     sock.bind(&bind_addr.into())?;
-
-    if if_index > 0 {
-        unsafe {
-            let index_be = u32::to_be(if_index);
-            let ret = windows_sys::Win32::Networking::WinSock::setsockopt(
-                sock.as_raw_socket() as usize,
-                windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
-                31, // IP_UNICAST_IF
-                &index_be as *const u32 as *const u8,
-                std::mem::size_of::<u32>() as i32,
-            );
-            if ret == windows_sys::Win32::Networking::WinSock::SOCKET_ERROR {
-                return Err(std::io::Error::from_raw_os_error(
-                    windows_sys::Win32::Networking::WinSock::WSAGetLastError(),
-                )
-                .into());
-            }
-        }
-    }
-
+    bind_to_interface(&sock, if_index, true)?;
     sock.set_nonblocking(true)?;
     let std_udp: std::net::UdpSocket = sock.into();
     let tokio_udp = tokio::net::UdpSocket::from_std(std_udp)?;
@@ -955,35 +976,12 @@ async fn connect_via_interface(
     remote: SocketAddr,
     if_index: u32,
 ) -> std::io::Result<TcpStream> {
-    use std::os::windows::io::AsRawSocket;
     use socket2::{Domain, Protocol, Socket, Type};
 
-    let domain = if remote.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let is_ipv4 = remote.is_ipv4();
+    let domain = if is_ipv4 { Domain::IPV4 } else { Domain::IPV6 };
     let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-
-    if if_index > 0 {
-        unsafe {
-            let handle = sock.as_raw_socket() as usize;
-            let index_ne = if remote.is_ipv4() {
-                u32::to_be(if_index)
-            } else {
-                if_index
-            };
-            let ret = windows_sys::Win32::Networking::WinSock::setsockopt(
-                handle,
-                windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
-                31, // IP_UNICAST_IF
-                &index_ne as *const u32 as *const u8,
-                std::mem::size_of::<u32>() as i32,
-            );
-            if ret == windows_sys::Win32::Networking::WinSock::SOCKET_ERROR {
-                return Err(std::io::Error::from_raw_os_error(
-                    windows_sys::Win32::Networking::WinSock::WSAGetLastError(),
-                ));
-            }
-        }
-    }
-
+    bind_to_interface(&sock, if_index, is_ipv4)?;
     sock.set_nonblocking(true)?;
     let std_stream: std::net::TcpStream = sock.into();
     let tokio_sock = tokio::net::TcpSocket::from_std_stream(std_stream);

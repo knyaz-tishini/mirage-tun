@@ -79,6 +79,38 @@ pub(crate) fn save_policy_to_config(policy: &crate::policy::PolicyConfigRequest)
     }
 }
 
+/// Persist `chains` into tun.json (read-modify-write).
+/// Best-effort: logs a warning on failure, never returns an error.
+pub(crate) fn save_chains_to_config(chains: &[crate::chains::ChainConfig]) {
+    let path = config_path_for_write();
+
+    let mut obj: serde_json::Map<String, serde_json::Value> = path
+        .exists()
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    match serde_json::to_value(chains) {
+        Ok(v) => { obj.insert("chains".to_owned(), v); }
+        Err(e) => {
+            tracing::warn!("save_chains_to_config: serialize failed: {e}");
+            return;
+        }
+    }
+
+    match serde_json::to_string_pretty(&serde_json::Value::Object(obj)) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("save_chains_to_config: write failed: {e}");
+            } else {
+                tracing::info!("Chains persisted to {}", path.display());
+            }
+        }
+        Err(e) => tracing::warn!("save_chains_to_config: to_string failed: {e}"),
+    }
+}
+
 async fn autostart_activate(
     state: Arc<crate::api::AppState>,
     params: crate::api::TunStartParams,
@@ -187,7 +219,6 @@ pub async fn run_service_logic(
 
     let mut svc_state = ServiceState::new(TUN_NAME.to_owned());
     svc_state.wintun = wintun;
-    svc_state.policy = Some(Arc::clone(&policy));
     svc_state.dns_map = Arc::clone(&dns_map);
     svc_state.chains = Arc::clone(&chains);
     let svc_state = Arc::new(Mutex::new(svc_state));

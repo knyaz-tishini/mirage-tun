@@ -53,11 +53,6 @@ impl ChainRegistry {
         *guard = Arc::new(new_map);
     }
 
-    /// Resolve a chain name to its SocketAddr.
-    pub async fn resolve(&self, chain_name: &str) -> Option<SocketAddr> {
-        self.map.read().await.get(chain_name).copied()
-    }
-
     /// Reconstruct Vec<ChainConfig> from current map (for API responses).
     pub async fn to_configs(&self) -> Vec<ChainConfig> {
         self.map.read().await

@@ -1,14 +1,10 @@
 use std::{
-    collections::VecDeque,
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
-    pin::Pin,
     process::Command,
     ptr,
     sync::Arc,
-    task::{Context, Poll},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use libloading::{Library, Symbol};
 use tracing::{debug, info, warn};
 use windows_sys::Win32::{
@@ -220,17 +216,15 @@ impl WintunHandle {
     }
 }
 
-// ── WintunDevice (AsyncRead + AsyncWrite for mirage-ipstack) ────────────────
+// ── WintunDevice ─────────────────────────────────────────────────────────────
 
-/// Combined read/write device wrapping Wintun for use with `mirage-ipstack`.
+/// Combined read/write device wrapping Wintun.
 ///
-/// `mirage-ipstack` requires a single `AsyncRead + AsyncWrite` device.
-/// This adapter bridges the channel-based `WintunReader` and the
-/// blocking Wintun send API into that interface.
+/// Use `take_channels()` to obtain raw mpsc channels for integration with
+/// `netstack-smoltcp` pump loops.
 pub struct WintunDevice {
-    rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     write_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    read_buf: VecDeque<u8>,
 }
 
 impl WintunDevice {
@@ -239,92 +233,17 @@ impl WintunDevice {
         let reader = handle.reader();
         let rx = reader.start_reader_thread();
         let write_tx = handle.shared.start_writer_thread();
-        Self {
-            rx: Some(rx),
-            write_tx,
-            read_buf: VecDeque::with_capacity(2048),
-        }
+        Self { rx, write_tx }
     }
 
-    /// Extract the raw channels, bypassing the AsyncRead/AsyncWrite wrappers.
-    ///
-    /// Caller owns the receiver; the sender is cloned so the write thread stays alive.
-    /// Panics if called more than once (channels already taken).
+    /// Extract the raw channels for use with pump loops.
     pub fn take_channels(
-        mut self,
+        self,
     ) -> (
         tokio::sync::mpsc::Receiver<Vec<u8>>,
         tokio::sync::mpsc::Sender<Vec<u8>>,
     ) {
-        let rx = self.rx.take().expect("WintunDevice: channels already taken");
-        (rx, self.write_tx)
-    }
-}
-
-impl AsyncRead for WintunDevice {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // Drain carry-over bytes first.
-        if !self.read_buf.is_empty() {
-            let n = std::cmp::min(self.read_buf.len(), buf.remaining());
-            let drained: Vec<u8> = self.read_buf.drain(..n).collect();
-            buf.put_slice(&drained);
-            return Poll::Ready(Ok(()));
-        }
-
-        let rx = match self.rx.as_mut() {
-            Some(rx) => rx,
-            None => return Poll::Ready(Ok(())), // channels taken via take_channels()
-        };
-
-        // Poll channel for next packet.
-        match rx.poll_recv(cx) {
-            Poll::Ready(Some(packet)) => {
-                let n = std::cmp::min(packet.len(), buf.remaining());
-                buf.put_slice(&packet[..n]);
-                if n < packet.len() {
-                    self.read_buf.extend(&packet[n..]);
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(None) => {
-                // Channel closed = Wintun session ended.
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for WintunDevice {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let packet = buf.to_vec();
-        let len = packet.len();
-        match self.write_tx.try_send(packet) {
-            Ok(()) => Poll::Ready(Ok(len)),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // Channel full — drop packet; TCP retransmit timers recover.
-                Poll::Ready(Ok(len))
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "wintun writer closed"),
-            )),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+        (self.rx, self.write_tx)
     }
 }
 

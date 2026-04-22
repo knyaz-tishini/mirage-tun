@@ -159,10 +159,6 @@ pub async fn activate_tun_inner(
                 .map_err(|e| TunError::Other(format!("invalid socks5_addr '{}': {e}", c.socks5_addr)))
         })?;
 
-    // Build ChainMap for IpStackRunner.
-    let chain_registry = ChainRegistry::new(chain_configs.clone());
-    let chain_map = chain_registry.snapshot().await;
-
     s.tun_phase = TunPhase::Transitioning;
 
     let tun_name = s.tun_name.clone();
@@ -220,11 +216,18 @@ pub async fn activate_tun_inner(
 
     let process_resolver = Arc::new(crate::process_info::ProcessResolver::new());
 
+    // Populate the shared chain registry BEFORE starting the ipstack so that
+    // IpStackRunner holds a live Arc<ChainRegistry> and always sees current chains.
+    let new_map: ChainMap = chain_configs.iter().filter_map(|c| {
+        c.socks5_addr.parse::<SocketAddr>().ok().map(|addr| (c.name.clone(), addr))
+    }).collect();
+    state.chains.update(new_map).await;
+
     let bypass_addrs_store = relay_ips.clone();
     let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
     let _runner = IpStackRunner::start(
         device,
-        chain_map,
+        Arc::clone(&state.chains),
         cancel.clone(),
         relay_ips,
         if_index,
@@ -240,6 +243,7 @@ pub async fn activate_tun_inner(
     s.killswitch = Some(killswitch);
     s.tun_phase = TunPhase::TunActive;
     s.if_index = if_index;
+    s.chains = Arc::clone(&state.chains);
 
     // Store routing state
     s.original_gateway = routing.original_gateway().map(|s| s.to_owned());
@@ -252,13 +256,6 @@ pub async fn activate_tun_inner(
         state.policy.update(compiled).await;
         info!("Policy loaded from TUN start params");
     }
-
-    // Update chain registry on AppState.
-    let new_map: ChainMap = chain_configs.iter().filter_map(|c| {
-        c.socks5_addr.parse::<SocketAddr>().ok().map(|addr| (c.name.clone(), addr))
-    }).collect();
-    state.chains.update(new_map).await;
-    s.chains = Arc::clone(&state.chains);
 
     info!("TUN started, default_socks5={default_socks5}, chains={}", chain_configs.len());
     Ok(())
@@ -306,12 +303,19 @@ async fn post_tun_stop(
         s.tun_default_set = false;
     }
 
-    // Remove bypass routes
+    // Remove bypass routes — use same netsh family as add_bypass in routing.rs
     let bypass: Vec<std::net::IpAddr> = s.bypass_addrs.drain(..).collect();
+    let if_index = s.if_index;
     for addr in bypass {
-        let addr_str = addr.to_string();
-        let _ = tokio::process::Command::new("route")
-            .args(["delete", &addr_str, "mask", "255.255.255.255"])
+        let prefix = format!("{}/32", addr);
+        let if_idx_str = if_index.to_string();
+        let _ = tokio::process::Command::new("netsh")
+            .args([
+                "interface", "ipv4", "delete", "route",
+                &prefix,
+                &format!("interface={if_idx_str}"),
+                "store=active",
+            ])
             .output()
             .await;
     }
@@ -414,6 +418,9 @@ async fn post_chains_update(
     let count = new_map.len();
     state.chains.update(new_map).await;
     info!("Chains updated via API: {count} chains");
+
+    // Best-effort persist — failure is logged inside, never fails the response.
+    crate::service::save_chains_to_config(&params.chains);
     StatusCode::OK
 }
 

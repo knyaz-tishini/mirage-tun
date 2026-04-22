@@ -26,7 +26,7 @@ impl DnsMap {
     }
 
     pub fn insert(&self, ip: IpAddr, domain: String) {
-        let mut inner = self.inner.lock().expect("DnsMap lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         if inner.map.insert(ip, (domain, now)).is_none() {
             inner.order.push_back(ip);
@@ -40,7 +40,7 @@ impl DnsMap {
     }
 
     pub fn insert_many(&self, ips: &[IpAddr], domain: &str) {
-        let mut inner = self.inner.lock().expect("DnsMap lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         for &ip in ips {
             if inner.map.insert(ip, (domain.to_owned(), now)).is_none() {
@@ -55,7 +55,7 @@ impl DnsMap {
     }
 
     pub fn get(&self, ip: &IpAddr) -> Option<String> {
-        let inner = self.inner.lock().expect("DnsMap lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((domain, inserted_at)) = inner.map.get(ip) {
             if inserted_at.elapsed() < TTL {
                 return Some(domain.clone());
@@ -65,13 +65,13 @@ impl DnsMap {
     }
 
     pub fn clear(&self) {
-        let mut inner = self.inner.lock().expect("DnsMap lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.clear();
         inner.order.clear();
     }
 
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().expect("DnsMap lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.values().filter(|(_, ts)| ts.elapsed() < TTL).count()
     }
 }
