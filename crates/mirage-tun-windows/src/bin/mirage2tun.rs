@@ -1,13 +1,3 @@
-mod api;
-mod error;
-mod firewall;
-mod ipstack;
-mod proxy;
-mod routing;
-mod service;
-mod state;
-mod wintun;
-
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -58,7 +48,7 @@ fn main() {
             }
         }
         Cmd::Run => {
-            if let Err(e) = service::dispatch() {
+            if let Err(e) = mirage_tun_windows::service::dispatch() {
                 eprintln!("Service dispatch failed: {e}");
                 std::process::exit(1);
             }
@@ -340,7 +330,7 @@ fn debug_run() {
 
     rt.block_on(async move {
         tokio::select! {
-            result = service::run_service_logic(None, stop_tx.clone(), stop_rx) => {
+            result = mirage_tun_windows::service::run_service_logic(None, stop_tx.clone(), stop_rx) => {
                 if let Err(e) = result {
                     tracing::error!("debug-run error: {e}");
                 }
@@ -373,7 +363,7 @@ fn evaluate() {
 
         // Spawn service logic in background
         let svc_handle = tokio::spawn(async move {
-            if let Err(e) = service::run_service_logic(None, stop_tx2, stop_rx).await {
+            if let Err(e) = mirage_tun_windows::service::run_service_logic(None, stop_tx2, stop_rx).await {
                 eprintln!("[evaluate] service error: {e}");
             }
         });

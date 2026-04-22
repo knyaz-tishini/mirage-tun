@@ -1,0 +1,38 @@
+[package]
+name = "mirage-tun-windows"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mirage2tun"
+path = "src/bin/mirage2tun.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = "0.8"
+windows-service = "0.7"
+libloading = "0.8"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }
+socket2 = { version = "0.5", features = ["all"] }
+mirage-wfp = { path = "crates/mirage-wfp" }
+mirage-tun-core = { path = "../mirage-tun-core" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+netstack-smoltcp = { path = "vendor/netstack-smoltcp-0.2.2" }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
+log = "0.4"
+clap = { version = "4", features = ["derive"] }
+mirage-dns = { path = "crates/mirage-dns" }
+mirage-ipstack = { path = "crates/mirage-ipstack" }

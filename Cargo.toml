@@ -1,52 +1,22 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/mirage-ipstack",
-    "crates/mirage-wfp",
     "crates/mirage-tun-core",
-    ".",
+    "crates/mirage-tun-windows",
+    "crates/mirage-tun-windows/crates/mirage-wfp",
+    "crates/mirage-tun-windows/crates/mirage-ipstack",
+    "crates/mirage-tun-windows/crates/mirage-dns",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 
-[package]
-name = "mirage2tun"
-version.workspace = true
-edition.workspace = true
-
-[[bin]]
-name = "mirage2tun"
-path = "src/main.rs"
-
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-axum = "0.8"
-windows-service = "0.7"
-libloading = "0.8"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
-socket2 = { version = "0.5", features = ["all"] }
-mirage-wfp = { path = "crates/mirage-wfp" }
-mirage-tun-core = { path = "crates/mirage-tun-core" }
-thiserror = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-clap = { version = "4", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-netstack-smoltcp = { path = "vendor/netstack-smoltcp-0.2.2" }
-futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
-log = "0.4"
-
 [patch.crates-io]
-smoltcp = { path = "vendor/smoltcp-0.12.0" }
-etherparse = { path = "vendor/etherparse-0.16.0" }
-spin = { path = "vendor/spin-0.9.8" }
-futures = { path = "vendor/futures-0.3.32" }
+smoltcp = { path = "crates/mirage-tun-windows/vendor/smoltcp-0.12.0" }
+etherparse = { path = "crates/mirage-tun-windows/vendor/etherparse-0.16.0" }
+spin = { path = "crates/mirage-tun-windows/vendor/spin-0.9.8" }
+futures = { path = "crates/mirage-tun-windows/vendor/futures-0.3.32" }
 
 [profile.release]
 opt-level = 3
