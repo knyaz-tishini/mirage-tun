@@ -2,7 +2,7 @@
 
 Windows Service — Wintun адаптер, split tunnel, multi-chain routing, app-based bypass, policy engine, DNS (over TCP via SOCKS5), WFP kill-switch, системный прокси. Работает в связке с mirage2web client.
 
-**Статус (2026-04-23): TUN mode 0.3s latency, split tunnel + multi-chain** — on par with direct SOCKS5 (0.2s). DNS via SOCKS5 exit node, zero DNS leak. Policy engine с hot-reload, app-based bypass, multi-SOCKS5 chains.
+**Статус (2026-04-23): Production-ready** — 0.3s latency, split tunnel, multi-chain routing, app-based bypass, per-chain metrics, configurable runtime, graceful drain. 14 API endpoints.
 
 ## Workspace crates
 
@@ -144,7 +144,7 @@ sc start mirage2tun           # SCM подхватит новый бинарь
 
 ### POST /tun/stop
 
-Деактивировать TUN. Убирает маршруты, bypass routes, WFP фильтры, DNS.
+Деактивировать TUN. Graceful drain (5s timeout для активных соединений), затем убирает маршруты, bypass routes, WFP фильтры, DNS.
 
 ### POST /proxy/set
 
@@ -190,7 +190,53 @@ Graceful shutdown → SCM перезапускает (recovery policy).
 
 ### POST /chains/update
 
-Тело — как у GET /chains/list. Hot-reload chain endpoints.
+Тело — как у GET /chains/list. Hot-reload chain endpoints. Персистится в tun.json.
+
+ChainConfig с протоколом:
+```json
+{
+  "chains": [
+    {"name": "default", "socks5_addr": "127.0.0.1:19480", "protocol": "socks5"}
+  ]
+}
+```
+
+`protocol`: `"socks5"` (default). Расширяемо: `"wireguard"`, `"direct"` и т.д.
+
+### GET /metrics
+
+```json
+{
+  "chains": {
+    "default": {"connections": 150, "bytes_tx": 1048576, "bytes_rx": 5242880, "errors": 2},
+    "direct-ru": {"connections": 30, "bytes_tx": 204800, "bytes_rx": 819200, "errors": 0}
+  },
+  "bypass": {"connections": 45, "bytes_tx": 102400, "bytes_rx": 409600, "errors": 0},
+  "rules": [
+    {"index": 0, "hits": 30},
+    {"index": 1, "hits": 45}
+  ]
+}
+```
+
+Per-chain: connections, bytes_tx, bytes_rx, errors. Per-rule: hit count. Bypass выделен отдельно. Все счётчики атомарные (AtomicU64), без блокировок в hot path.
+
+### GET /config
+
+```json
+{
+  "api_bind": "127.0.0.1:19485",
+  "tun_name": "mirage0",
+  "tun_addr": "10.0.85.1",
+  "dns_upstream": "8.8.8.8:53",
+  "dns_cache_ttl_secs": 60,
+  "dns_cache_max": 1024,
+  "dns_concurrency": 8,
+  "socks5_concurrency": 100
+}
+```
+
+Загружается из `tun.json` → `"config"` секция. Если отсутствует — дефолты.
 
 ## Split Tunnel
 
@@ -273,7 +319,9 @@ mirage2tun (Windows Service, SYSTEM)
 ├── mirage-wfp (WFP kill-switch: блокирует всё кроме relay IPs + loopback, покрывает ConnectV6)
 ├── Routing (netsh + route.exe fallback, if_index=19 физический NIC)
 ├── System proxy (WinINET/WinHTTP)
-└── Axum API (127.0.0.1:19485, 11 endpoints)
+├── MetricsRegistry (per-chain connections/bytes/errors, per-rule hits, AtomicU64)
+├── TunConfig (конфигурируемые параметры: DNS, concurrency, timeouts)
+└── Axum API (127.0.0.1:19485, 14 endpoints)
 ```
 
 ### Traffic flow
@@ -317,8 +365,8 @@ mirage0 побеждает для `0.0.0.0/1` и `128.0.0.0/1`.
 |------|-----------|
 | `main.rs` | CLI: install/uninstall/run/debug-run/evaluate/update/test-read |
 | `service.rs` | SCM integration, service lifecycle, run_service_logic |
-| `api.rs` | Axum management API (11 endpoints) |
-| `wintun.rs` | Wintun FFI + dedicated reader/writer threads + `WintunDevice` (AsyncRead+AsyncWrite, optional raw channel extraction) |
+| `api.rs` | Axum management API (14 endpoints) |
+| `wintun.rs` | Wintun FFI + dedicated reader/writer threads + `WintunDevice` (channel extraction) |
 | `routing.rs` | Route management (default route, bypass, gateway detection) |
 | `ipstack.rs` | netstack-smoltcp bridge: TCP→SOCKS5, UDP DNS→DNS-over-TCP via SOCKS5, direct channel pumps |
 | `firewall.rs` | WFP kill-switch (block all except relay+loopback) |
@@ -327,6 +375,8 @@ mirage0 побеждает для `0.0.0.0/1` и `128.0.0.0/1`.
 | `policy.rs` | Policy engine (split tunnel rules, hot-reload) |
 | `process_info.rs` | Process resolver (PID lookup, ancestor walk) |
 | `dns_map.rs` | DNS reverse map (ip→domain, TTL 5min) |
+| `metrics.rs` | Per-chain метрики + per-rule hit counters (AtomicU64) |
+| `config.rs` | TunConfig — все конфигурируемые параметры |
 | `state.rs` | ServiceState, TunPhase |
 | `error.rs` | TunError enum |
 
