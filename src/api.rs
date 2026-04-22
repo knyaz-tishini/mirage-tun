@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
-use mirage_dns::{DnsConfig, DnsResolver};
 use mirage_tun_core::traits::PlatformFirewall;
 
 use crate::error::TunError;
@@ -76,21 +75,21 @@ async fn get_status(
     })
 }
 
-async fn post_tun_start(
-    State(state): State<Arc<AppState>>,
-    Json(params): Json<TunStartParams>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+pub async fn activate_tun_inner(
+    state: &Arc<AppState>,
+    params: TunStartParams,
+) -> Result<(), TunError> {
     let mut s = state.service.lock().await;
 
     if s.wintun.is_none() {
-        return Err(map_err(TunError::AdapterNotReady));
+        return Err(TunError::AdapterNotReady);
     }
     if s.tun_phase == TunPhase::TunActive {
-        return Err(map_err(TunError::AlreadyActive));
+        return Err(TunError::AlreadyActive);
     }
 
     let socks5_addr: SocketAddr = params.socks5_addr.parse().map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(ErrorBody { error: format!("invalid socks5_addr: {e}") }))
+        TunError::Other(format!("invalid socks5_addr: {e}"))
     })?;
 
     s.tun_phase = TunPhase::Transitioning;
@@ -99,17 +98,17 @@ async fn post_tun_start(
 
     // Set DNS on adapter
     let _ = std::process::Command::new("netsh")
-        .args(["interface", "ip", "set", "dns", &tun_name, "static", "10.0.85.1"])
+        .args(["interface", "ip", "set", "dns", &tun_name, "static", "198.18.0.1"])
         .output();
 
     // Routes AFTER adapter exists — otherwise they vanish with destroyed interface
     let mut routing = Routing::new(&tun_name);
-    routing.set_default_route().map_err(map_err)?;
+    routing.set_default_route()?;
 
     let mut relay_ips: Vec<IpAddr> = Vec::new();
     for relay in &params.relay_addrs {
         if let Ok(ip) = relay.parse::<IpAddr>() {
-            routing.add_bypass(ip).map_err(map_err)?;
+            routing.add_bypass(ip)?;
             relay_ips.push(ip);
         }
     }
@@ -124,26 +123,15 @@ async fn post_tun_start(
 
     let if_index = routing.original_interface_idx().unwrap_or(0);
 
-    let dns_config = DnsConfig {
-        doh_url: "https://1.1.1.1/dns-query".into(),
-        http_proxy: Some("http://127.0.0.1:19481".into()),
-        cache_size: 4096,
-        timeout: std::time::Duration::from_secs(5),
-        fallback_dns: "8.8.8.8:53".parse().unwrap(),
-    };
-    let dns_resolver = DnsResolver::new(dns_config).map_err(|e| {
-        map_err(TunError::Routing(format!("DNS resolver init failed: {e}")))
-    })?;
-
     let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
-    let _runner = IpStackRunner::start(device, socks5_addr, cancel.clone(), relay_ips, if_index, dns_resolver)
-        .await
-        .map_err(map_err)?;
+    let _runner = IpStackRunner::start(device, socks5_addr, cancel.clone(), relay_ips, if_index)
+        .await?;
 
     s.ipstack_cancel = Some(cancel);
     s.socks5_addr = Some(socks5_addr);
     s.killswitch = Some(killswitch);
     s.tun_phase = TunPhase::TunActive;
+    s.if_index = if_index;
 
     // Store routing state
     s.original_gateway = routing.original_gateway().map(|s| s.to_owned());
@@ -152,6 +140,14 @@ async fn post_tun_start(
     std::mem::forget(routing);
 
     info!("TUN started, socks5={socks5_addr}");
+    Ok(())
+}
+
+async fn post_tun_start(
+    State(state): State<Arc<AppState>>,
+    Json(params): Json<TunStartParams>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    activate_tun_inner(&state, params).await.map_err(map_err)?;
     Ok(StatusCode::OK)
 }
 

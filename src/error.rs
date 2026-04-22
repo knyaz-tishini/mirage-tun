@@ -17,6 +17,10 @@ pub enum TunError {
     NotActive,
     #[error("wfp: {0}")]
     Wfp(String),
+    #[error("netstack build: {0}")]
+    SmoltcpBuild(std::io::Error),
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, TunError>;

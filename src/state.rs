@@ -20,6 +20,7 @@ pub struct ServiceState {
     pub socks5_addr: Option<SocketAddr>,
     pub tun_name: String,
     pub killswitch: Option<crate::firewall::WfpKillSwitch>,
+    pub if_index: u32,
 }
 
 impl ServiceState {
@@ -35,6 +36,7 @@ impl ServiceState {
             socks5_addr: None,
             tun_name,
             killswitch: None,
+            if_index: 0,
         }
     }
 }

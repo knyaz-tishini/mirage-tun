@@ -33,6 +33,12 @@ enum Cmd {
     TestRead,
     /// End-to-end TUN test: start service, activate TUN, verify exit IP + DNS, stop (requires admin + mirage2web running)
     Evaluate,
+    /// Diagnose: start TUN, send traffic, collect probe reports from L1+L2, show where packets drop (requires admin + mirage2web running)
+    Diagnose {
+        /// Path to client-config.json (reads management_key)
+        #[arg(long)]
+        config: String,
+    },
 }
 
 fn main() {
@@ -71,6 +77,9 @@ fn main() {
         }
         Cmd::Evaluate => {
             evaluate();
+        }
+        Cmd::Diagnose { config } => {
+            diagnose(&config);
         }
     }
 }
@@ -318,7 +327,7 @@ fn debug_run() {
         .with_writer(std::io::stdout)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mirage2tun::ipstack=debug,netstack_smoltcp=debug")),
         )
         .init();
 
@@ -506,4 +515,431 @@ async fn deactivate_tun(client: &reqwest::Client, api: &str) -> bool {
             false
         }
     }
+}
+
+fn diagnose(config_path: &str) {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stdout)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime build failed: system resources exhausted");
+
+    rt.block_on(async move {
+        run_diagnose(config_path).await;
+    });
+}
+
+/// Extract port number from an addr string like "91.218.245.247:4702" → 4702.
+fn port_from_addr(addr: &str) -> Option<u16> {
+    addr.rsplit(':').next().and_then(|p| p.parse().ok())
+}
+
+/// Read chain ports (l1_port, l2_port) for the given chain_id from config.
+/// If chain_id is empty, falls back to the first chain.
+fn read_chain_ports(config_path: &str, chain_id: &str) -> (Option<u16>, Option<u16>) {
+    let data = match std::fs::read_to_string(config_path) {
+        Ok(d) => d,
+        Err(_) => return (None, None),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+
+    let chains = match v.get("chains").and_then(|c| c.as_array()) {
+        Some(arr) => arr,
+        None => return (None, None),
+    };
+
+    // Find matching chain by chain_id, fall back to first.
+    let chain = chains
+        .iter()
+        .find(|c| {
+            c.get("chain_id")
+                .and_then(|x| x.as_str())
+                .map(|id| id == chain_id)
+                .unwrap_or(false)
+        })
+        .or_else(|| chains.first());
+
+    let chain = match chain {
+        Some(c) => c,
+        None => return (None, None),
+    };
+
+    let l1_port = chain
+        .get("l1")
+        .and_then(|l| l.get("addr"))
+        .and_then(|a| a.as_str())
+        .and_then(port_from_addr);
+
+    let l2_port = chain
+        .get("l2")
+        .and_then(|l| l.get("addr"))
+        .and_then(|a| a.as_str())
+        .and_then(port_from_addr);
+
+    (l1_port, l2_port)
+}
+
+async fn run_diagnose(config_path: &str) {
+    println!("=== mirage2tun diagnose ===");
+    println!();
+
+    let management_key = read_management_key(config_path);
+
+    let api = "http://127.0.0.1:19485";
+
+    // Direct client — no proxy
+    let direct = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .no_proxy()
+        .build()
+        .expect("direct reqwest client");
+
+    // ── Step 1: mirage2tun API health ────────────────────────────────────────
+    print!("[1/6] Waiting for mirage2tun API (127.0.0.1:19485)...");
+    let api_ok = poll_health(&direct, api).await;
+    println!(" {}", verdict(api_ok));
+    if !api_ok {
+        eprintln!("ABORT: mirage2tun API not reachable");
+        std::process::exit(1);
+    }
+
+    // ── Step 2: mirage2web health ─────────────────────────────────────────────
+    print!("[2/6] GET http://127.0.0.1:4498/admin/health ...");
+    let health_ok = match direct.get("http://127.0.0.1:4498/admin/health").send().await {
+        Ok(r) if r.status().is_success() => {
+            println!(" PASS");
+            true
+        }
+        Ok(r) => {
+            println!(" FAIL (HTTP {})", r.status());
+            false
+        }
+        Err(e) => {
+            println!(" FAIL: {e}");
+            false
+        }
+    };
+
+    // ── Step 3: mirage2web status → active_chain_id → resolve ports ──────────
+    let mut active_chain_id = String::new();
+    let mut pool_size: u64 = 0;
+    let mut pool_idle: u64 = 0;
+    let mut pool_leased: u64 = 0;
+    let mut pool_reconnecting: u64 = 0;
+
+    print!("[3/6] GET http://127.0.0.1:4498/admin/status ...");
+    if let Some(ref key) = management_key {
+        match direct
+            .get("http://127.0.0.1:4498/admin/status")
+            .header("Authorization", format!("Bearer {key}"))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                match r.json::<serde_json::Value>().await {
+                    Ok(v) => {
+                        if let Some(chain) = v.get("active_chain_id").and_then(|x| x.as_str()) {
+                            active_chain_id = chain.to_string();
+                        }
+                        if let Some(n) = v.get("pool_size").and_then(|x| x.as_u64()) {
+                            pool_size = n;
+                        }
+                        if let Some(n) = v.get("pool_idle").and_then(|x| x.as_u64()) {
+                            pool_idle = n;
+                        }
+                        if let Some(n) = v.get("pool_leased").and_then(|x| x.as_u64()) {
+                            pool_leased = n;
+                        }
+                        if let Some(n) = v.get("pool_reconnecting").and_then(|x| x.as_u64()) {
+                            pool_reconnecting = n;
+                        }
+                        println!(" PASS");
+                        println!("  active_chain_id:  {active_chain_id}");
+                        println!("  pool_size:        {pool_size}");
+                        println!("  pool_idle:        {pool_idle}");
+                        println!("  pool_leased:      {pool_leased}");
+                        println!("  pool_reconnecting:{pool_reconnecting}");
+                    }
+                    Err(e) => println!(" FAIL (parse): {e}"),
+                }
+            }
+            Ok(r) => println!(" FAIL (HTTP {})", r.status()),
+            Err(e) => println!(" FAIL: {e}"),
+        }
+    } else {
+        println!(" SKIP (no management_key)");
+    }
+
+    // Resolve L1/L2 ports from config using the active chain id.
+    let (l1_port, l2_port) = read_chain_ports(config_path, &active_chain_id);
+    println!(
+        "  [config] L1 port: {}  L2 port: {}  (chain: {})",
+        l1_port.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        l2_port.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        if active_chain_id.is_empty() { "fallback-to-first" } else { &active_chain_id },
+    );
+    println!();
+
+    // ── Step 4: 10 sequential SOCKS5 requests ────────────────────────────────
+    println!("[4/6] Sending 10 requests via socks5h://127.0.0.1:19480 -> http://ifconfig.me/ip");
+    let socks_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .proxy(reqwest::Proxy::all("socks5h://127.0.0.1:19480").expect("socks5 proxy url"))
+        .build()
+        .expect("socks5 reqwest client");
+
+    let mut pass_count = 0u32;
+    let mut fail_count = 0u32;
+    for i in 1u32..=10 {
+        let start = std::time::Instant::now();
+        match socks_client.get("http://ifconfig.me/ip").send().await {
+            Ok(r) => {
+                let elapsed = start.elapsed().as_secs_f64();
+                match r.text().await {
+                    Ok(body) => {
+                        let ip = body.trim().to_string();
+                        println!("  [{i}/10] OK {ip} ({:.1}s)", elapsed);
+                        pass_count += 1;
+                    }
+                    Err(e) => {
+                        println!("  [{i}/10] FAIL: body read error: {e}");
+                        fail_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let label = if msg.contains("timed out") || msg.contains("timeout") {
+                    "timeout"
+                } else if msg.contains("refused") {
+                    "connection refused"
+                } else {
+                    &msg
+                };
+                println!("  [{i}/10] FAIL: {label}");
+                fail_count += 1;
+            }
+        }
+    }
+
+    // ── Step 5: L1 probe report ──────────────────────────────────────────────
+    println!();
+    let l1_port_val = l1_port.unwrap_or(4702);
+    println!("[5/6] GET http://91.218.245.247:19411/report (filter port {l1_port_val})");
+    let (l1_conns, l1_rtt, l1_retrans) = fetch_probe_report(
+        &direct,
+        "http://91.218.245.247:19411/report",
+        "m2m-probe-l1-secret-2026",
+        l1_port_val,
+    )
+    .await;
+
+    // ── Step 6: L2 probe report ──────────────────────────────────────────────
+    let l2_port_val = l2_port.unwrap_or(4700);
+    println!("[6/6] GET http://45.59.119.139:19411/report (filter port {l2_port_val})");
+    let (l2_conns, l2_rtt, l2_retrans) = fetch_probe_report(
+        &direct,
+        "http://45.59.119.139:19411/report",
+        "m2m-probe-l2-test-2026",
+        l2_port_val,
+    )
+    .await;
+
+    // ── Summary ───────────────────────────────────────────────────────────────
+    let total = pass_count + fail_count;
+    let loss_pct = if total > 0 {
+        (fail_count as f64 / total as f64 * 100.0) as u32
+    } else {
+        0
+    };
+
+    println!();
+    println!("=== SUMMARY ===");
+    println!("mirage2tun API:    {}", verdict(api_ok));
+    println!("mirage2web health: {}", verdict(health_ok));
+    println!("Active chain:      {}", if active_chain_id.is_empty() { "unknown" } else { &active_chain_id });
+    println!(
+        "Pool: size={pool_size} idle={pool_idle} leased={pool_leased} reconnecting={pool_reconnecting}"
+    );
+    println!("Requests:          {pass_count}/{total} passed ({loss_pct}% loss)");
+    println!("L1 :{l1_port_val}: {l1_conns} conns | RTT avg {l1_rtt}ms | retrans {l1_retrans}");
+    println!("L2 :{l2_port_val}: {l2_conns} conns | RTT avg {l2_rtt}ms | retrans {l2_retrans}");
+}
+
+fn read_management_key(config_path: &str) -> Option<String> {
+    let data = std::fs::read_to_string(config_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    v.get("management_key")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Fetch probe report JSON, filter connections by ESTABLISHED state + `local_port`,
+/// return (count, avg_rtt_ms, total_retrans). Also prints up to 5 individual connections.
+async fn fetch_probe_report(
+    client: &reqwest::Client,
+    url: &str,
+    bearer: &str,
+    port: u16,
+) -> (usize, u64, u64) {
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => parse_probe_report(&v, port),
+            Err(e) => {
+                println!("  FAIL (parse): {e}");
+                (0, 0, 0)
+            }
+        },
+        Ok(r) => {
+            println!("  FAIL (HTTP {})", r.status());
+            (0, 0, 0)
+        }
+        Err(e) => {
+            println!("  FAIL: {e}");
+            (0, 0, 0)
+        }
+    }
+}
+
+fn parse_probe_report(v: &serde_json::Value, port: u16) -> (usize, u64, u64) {
+    let conns = match v.get("connections").and_then(|c| c.as_array()) {
+        Some(arr) => arr,
+        None => return (0, 0, 0),
+    };
+
+    // ── ALL established connections summary ───────────────────────────────────
+    let all_established: Vec<&serde_json::Value> = conns
+        .iter()
+        .filter(|c| {
+            c.get("state")
+                .and_then(|x| x.as_str())
+                .map(|s| s == "ESTABLISHED")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    println!("  Total ESTABLISHED: {}", all_established.len());
+
+    // Group by local_port
+    let mut by_port: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for c in &all_established {
+        let lp = c
+            .get("local_port")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        *by_port.entry(lp).or_insert(0) += 1;
+    }
+    if !by_port.is_empty() {
+        let mut entries: Vec<(u64, usize)> = by_port.into_iter().collect();
+        entries.sort_by_key(|(p, _)| *p);
+        let summary = entries
+            .iter()
+            .map(|(p, n)| format!(":{p} ({n})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("  By port: {summary}");
+    }
+
+    // ── Filtered: ESTABLISHED + matching local_port ───────────────────────────
+    let filtered: Vec<&serde_json::Value> = all_established
+        .iter()
+        .copied()
+        .filter(|c| {
+            c.get("local_port")
+                .and_then(|x| x.as_u64())
+                .map(|p| p == port as u64)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let count = filtered.len();
+    if count == 0 {
+        println!("  Filtered to :{port}: 0 conns");
+        return (0, 0, 0);
+    }
+
+    let total_rtt: f64 = filtered
+        .iter()
+        .filter_map(|c| {
+            c.get("metrics")
+                .and_then(|m| m.get("rtt_ms"))
+                .and_then(|x| x.as_f64())
+        })
+        .sum();
+    let rtt_samples = filtered
+        .iter()
+        .filter(|c| {
+            c.get("metrics")
+                .and_then(|m| m.get("rtt_ms"))
+                .and_then(|x| x.as_f64())
+                .is_some()
+        })
+        .count();
+    let avg_rtt = if rtt_samples > 0 {
+        total_rtt / rtt_samples as f64
+    } else {
+        0.0
+    };
+
+    let total_retrans: u64 = filtered
+        .iter()
+        .filter_map(|c| {
+            c.get("metrics")
+                .and_then(|m| m.get("retransmits"))
+                .and_then(|x| x.as_u64())
+        })
+        .sum();
+
+    println!(
+        "  Filtered to :{port}: {count} conns | RTT avg {avg_rtt:.1}ms | retrans {total_retrans}"
+    );
+
+    // Print up to 5 individual connections
+    for (idx, c) in filtered.iter().take(5).enumerate() {
+        let remote = c
+            .get("remote_addr")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?");
+        let rtt = c
+            .get("metrics")
+            .and_then(|m| m.get("rtt_ms"))
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let retrans = c
+            .get("metrics")
+            .and_then(|m| m.get("retransmits"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let bytes_rx = c
+            .get("metrics")
+            .and_then(|m| m.get("bytes_received"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let bytes_tx = c
+            .get("metrics")
+            .and_then(|m| m.get("bytes_sent"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        println!(
+            "    [{idx}] {remote} RTT={rtt:.1}ms retrans={retrans} rx={bytes_rx}B tx={bytes_tx}B"
+        );
+    }
+
+    (count, avg_rtt as u64, total_retrans)
 }

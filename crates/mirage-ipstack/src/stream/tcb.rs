@@ -2,15 +2,15 @@ use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
 use std::{collections::BTreeMap, time::Duration};
 
-pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
-pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+pub(super) const MAX_UNACK: u32 = 1024 * 256; // 256KB — allows decent throughput over WAN
+pub(super) const READ_BUFFER_SIZE: usize = 1024 * 256; // 256KB — match send buffer
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3;
 
 /// Retransmission timeout
-pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
+pub(super) const RTO: std::time::Duration = std::time::Duration::from_millis(200); // 200ms initial RTO — more responsive
 
 /// Maximum count of retransmissions before dropping the packet
-pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
+pub(super) const MAX_RETRANSMIT_COUNT: usize = 10; // 10 retries before giving up — standard TCP behavior
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {

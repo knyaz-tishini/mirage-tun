@@ -143,20 +143,21 @@ impl WintunReader {
                         break;
                     }
 
-                    let mut pkt_size: u32 = 0;
-                    let pkt_ptr = unsafe { (shared.fn_receive)(shared.session.0, &mut pkt_size) };
+                    // Drain all available packets before going back to wait.
+                    loop {
+                        let mut pkt_size: u32 = 0;
+                        let pkt_ptr = unsafe { (shared.fn_receive)(shared.session.0, &mut pkt_size) };
+                        if pkt_ptr.is_null() {
+                            break; // ring empty
+                        }
+                        let len = pkt_size as usize;
+                        let data = unsafe { std::slice::from_raw_parts(pkt_ptr, len).to_vec() };
+                        unsafe { (shared.fn_release)(shared.session.0, pkt_ptr) };
 
-                    if pkt_ptr.is_null() {
-                        continue; // timeout or spurious wake
-                    }
-
-                    let len = pkt_size as usize;
-                    let data = unsafe { std::slice::from_raw_parts(pkt_ptr, len).to_vec() };
-                    unsafe { (shared.fn_release)(shared.session.0, pkt_ptr) };
-
-                    if tx.blocking_send(data).is_err() {
-                        info!("wintun-reader: channel closed, exiting");
-                        break;
+                        if tx.blocking_send(data).is_err() {
+                            info!("wintun-reader: channel closed, exiting");
+                            return;
+                        }
                     }
                 }
                 info!("wintun-reader thread exiting");
@@ -167,6 +168,34 @@ impl WintunReader {
     }
 }
 
+
+impl WintunShared {
+    /// Spawn a dedicated OS thread that writes packets to Wintun from a channel.
+    /// Returns the sender half; drop it to shut down the writer thread.
+    fn start_writer_thread(self: &Arc<Self>) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+        let shared = Arc::clone(self);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+
+        std::thread::Builder::new()
+            .name("wintun-writer".into())
+            .spawn(move || {
+                while let Some(packet) = rx.blocking_recv() {
+                    let pkt_len = packet.len() as u32;
+                    let send_buf = unsafe { (shared.fn_alloc_send)(shared.session.0, pkt_len) };
+                    if !send_buf.is_null() {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(packet.as_ptr(), send_buf, packet.len());
+                            (shared.fn_send)(shared.session.0, send_buf);
+                        }
+                    }
+                }
+                info!("wintun-writer thread exiting");
+            })
+            .expect("wintun-writer thread spawn failed");
+
+        tx
+    }
+}
 
 // ── WintunHandle ──────────────────────────────────────────────────────────
 
@@ -199,21 +228,36 @@ impl WintunHandle {
 /// This adapter bridges the channel-based `WintunReader` and the
 /// blocking Wintun send API into that interface.
 pub struct WintunDevice {
-    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    writer: Arc<WintunShared>,
+    rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    write_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     read_buf: VecDeque<u8>,
 }
 
 impl WintunDevice {
-    /// Create from a WintunHandle. Starts the blocking reader thread internally.
+    /// Create from a WintunHandle. Starts reader and writer threads internally.
     pub fn new(handle: &WintunHandle) -> Self {
         let reader = handle.reader();
         let rx = reader.start_reader_thread();
+        let write_tx = handle.shared.start_writer_thread();
         Self {
-            rx,
-            writer: Arc::clone(&handle.shared),
+            rx: Some(rx),
+            write_tx,
             read_buf: VecDeque::with_capacity(2048),
         }
+    }
+
+    /// Extract the raw channels, bypassing the AsyncRead/AsyncWrite wrappers.
+    ///
+    /// Caller owns the receiver; the sender is cloned so the write thread stays alive.
+    /// Panics if called more than once (channels already taken).
+    pub fn take_channels(
+        mut self,
+    ) -> (
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) {
+        let rx = self.rx.take().expect("WintunDevice: channels already taken");
+        (rx, self.write_tx)
     }
 }
 
@@ -231,8 +275,13 @@ impl AsyncRead for WintunDevice {
             return Poll::Ready(Ok(()));
         }
 
+        let rx = match self.rx.as_mut() {
+            Some(rx) => rx,
+            None => return Poll::Ready(Ok(())), // channels taken via take_channels()
+        };
+
         // Poll channel for next packet.
-        match self.rx.poll_recv(cx) {
+        match rx.poll_recv(cx) {
             Poll::Ready(Some(packet)) => {
                 let n = std::cmp::min(packet.len(), buf.remaining());
                 buf.put_slice(&packet[..n]);
@@ -256,25 +305,18 @@ impl AsyncWrite for WintunDevice {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // mirage-ipstack calls write_all with exactly one serialized IP packet.
-        // Send it to Wintun immediately via spawn_blocking.
         let packet = buf.to_vec();
         let len = packet.len();
-        let shared = Arc::clone(&self.writer);
-        tokio::spawn(async move {
-            let shared2 = shared;
-            let _ = tokio::task::spawn_blocking(move || {
-                let pkt_len = packet.len() as u32;
-                let send_buf = unsafe { (shared2.fn_alloc_send)(shared2.session.0, pkt_len) };
-                if !send_buf.is_null() {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(packet.as_ptr(), send_buf, packet.len());
-                        (shared2.fn_send)(shared2.session.0, send_buf);
-                    }
-                }
-            }).await;
-        });
-        Poll::Ready(Ok(len))
+        match self.write_tx.try_send(packet) {
+            Ok(()) => Poll::Ready(Ok(len)),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Channel full — drop packet; TCP retransmit timers recover.
+                Poll::Ready(Ok(len))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "wintun writer closed"),
+            )),
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {

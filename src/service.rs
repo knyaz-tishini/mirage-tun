@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{watch, Mutex};
 use tracing::info;
@@ -15,6 +16,38 @@ const TUN_NAME: &str = "mirage0";
 const TUN_ADDR: &str = "10.0.85.1/24";
 const TUN_MTU: u16 = 1500;
 const API_BIND: &str = "127.0.0.1:19485";
+
+fn find_config() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        let beside_exe = exe
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("tun.json");
+        if beside_exe.exists() {
+            return Some(beside_exe);
+        }
+    }
+    let prog_data = PathBuf::from(r"C:\ProgramData\mirage2tun\tun.json");
+    if prog_data.exists() {
+        return Some(prog_data);
+    }
+    None
+}
+
+async fn autostart_activate(
+    state: Arc<crate::api::AppState>,
+    params: crate::api::TunStartParams,
+) -> Result<(), Box<dyn std::error::Error>> {
+    crate::api::activate_tun_inner(&state, params).await?;
+
+    let s = state.service.lock().await;
+    if let Some(socks5) = s.socks5_addr {
+        let if_index = s.if_index;
+        drop(s);
+        crate::ipstack::dns_warmup(socks5, if_index).await;
+    }
+    Ok(())
+}
 
 windows_service::define_windows_service!(ffi_service_main, service_main);
 
@@ -72,7 +105,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
-        .with_env_filter("info")
+        .with_env_filter("info,mirage2tun::ipstack=debug,netstack_smoltcp=debug")
         .init();
 
     // Retrieve stop_tx from OnceLock to pass into logic
@@ -115,6 +148,33 @@ pub async fn run_service_logic(
     let router = crate::api::build_router(Arc::clone(&app_state));
     let listener = tokio::net::TcpListener::bind(API_BIND).await?;
     info!("Management API listening on {API_BIND}");
+
+    // Autostart TUN if config exists
+    {
+        let autostart_state = Arc::clone(&app_state);
+        tokio::spawn(async move {
+            if let Some(config_path) = find_config() {
+                info!("Autostart: found config at {}", config_path.display());
+                match std::fs::read_to_string(&config_path) {
+                    Ok(contents) => {
+                        match serde_json::from_str::<crate::api::TunStartParams>(&contents) {
+                            Ok(params) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                match autostart_activate(autostart_state, params).await {
+                                    Ok(()) => info!("Autostart: TUN activated successfully"),
+                                    Err(e) => tracing::warn!("Autostart: TUN activation failed: {e}"),
+                                }
+                            }
+                            Err(e) => tracing::warn!("Autostart: invalid config: {e}"),
+                        }
+                    }
+                    Err(e) => tracing::warn!("Autostart: failed to read config: {e}"),
+                }
+            } else {
+                info!("Autostart: no tun.json found, waiting for API call");
+            }
+        });
+    }
 
     // Report Running to SCM after successful bind
     if let Some(ref handle) = status_handle {

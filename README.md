@@ -1,18 +1,19 @@
 # mirage2tun
 
-Windows Service — Wintun адаптер, маршрутизация, DNS (DoH), WFP kill-switch, системный прокси. Работает в связке с mirage2web client.
+Windows Service — Wintun адаптер, маршрутизация, DNS (over TCP via SOCKS5), WFP kill-switch, системный прокси. Работает в связке с mirage2web client.
 
-**Статус (2026-04-21): TUN mode ALL PASS** — `evaluate` выходит через `45.59.119.139`, DNS OK, start/stop чистые.
+**Статус (2026-04-22): TUN mode 0.3s latency** — on par with direct SOCKS5 (0.2s). DNS via SOCKS5 exit node, zero DNS leak.
 
 ## Workspace crates
 
 ```
 mirage2tun/
 ├── crates/
-│   ├── mirage-ipstack/    # Userspace TCP/IP стек (fork of narrowlink/ipstack)
+│   ├── mirage-ipstack/    # Legacy (unused)
 │   ├── mirage-wfp/        # Windows Filtering Platform (dynamic WFP engine)
-│   ├── mirage-tun-core/   # Platform traits (PlatformFirewall, PlatformRouting, PlatformTun)
-│   └── mirage-dns/        # DoH resolver + TTL-aware LRU cache
+│   └── mirage-tun-core/   # Platform traits (PlatformFirewall, PlatformRouting, PlatformTun)
+├── vendor/
+│   └── netstack-smoltcp-0.2.2/  # Vendored + modified userspace TCP/IP stack (smoltcp)
 └── src/                   # Main binary (Windows Service)
 ```
 
@@ -120,10 +121,10 @@ sc start mirage2tun           # SCM подхватит новый бинарь
 }
 ```
 
-- `socks5_addr` — куда IpStack форвардит TCP (mirage2web client)
+- `socks5_addr` — куда netstack форвардит TCP (mirage2web client)
 - `relay_addrs` — IP relay/exit серверов; для них добавляются bypass routes через физический шлюз (иначе loop)
 - Маршруты: `0.0.0.0/1` + `128.0.0.0/1` через `mirage0`, metric 2 (iface=1 + route=1)
-- DNS на адаптере: `10.0.85.1` (DoH через 1.1.1.1 via HTTP proxy)
+- DNS: DNS-over-TCP via SOCKS5 → 8.8.8.8:53 на exit node (in-memory cache, 60s TTL, 1024 entries)
 - Session reuse: не пересоздаёт WintunHandle, использует тот что создан при старте сервиса
 
 ### POST /tun/stop
@@ -151,10 +152,13 @@ Graceful shutdown → SCM перезапускает (recovery policy).
 ```
 mirage2tun (Windows Service, SYSTEM)
 ├── Wintun adapter "mirage0" (10.0.85.1/24, MTU 1500)
-├── Dedicated reader thread (std::thread, sync WaitForSingleObject loop → mpsc channel)
-├── mirage-ipstack (userspace TCP/IP стек)
+├── Dedicated reader thread (std::thread, WaitForSingleObject loop, batch drain → mpsc channel 256)
+├── Dedicated writer thread (std::thread, mpsc channel 1024 → WintunSendPacket)
+├── netstack-smoltcp (vendored userspace TCP/IP, Nagle off, ACK delay off)
+│   ├── pump_wintun_to_stack: batch feed (SinkExt::feed) + single flush per burst
+│   ├── pump_stack_to_wintun: direct channel send, no AsyncWrite indirection
 │   ├── TCP → SOCKS5 connect 127.0.0.1:19480 (IP_UNICAST_IF → физический NIC, bypass TUN loop)
-│   └── UDP:53 → mirage-dns (DoH via 1.1.1.1 через HTTP proxy 127.0.0.1:19481, TTL-aware LRU cache)
+│   └── UDP:53 → DNS-over-TCP via SOCKS5 → 8.8.8.8:53 (in-memory cache, 60s TTL, max 8 concurrent)
 ├── mirage-wfp (WFP kill-switch: блокирует всё кроме relay IPs + loopback)
 ├── Routing (netsh + route.exe fallback, if_index=19 физический NIC)
 ├── System proxy (WinINET/WinHTTP)
@@ -166,20 +170,21 @@ mirage2tun (Windows Service, SYSTEM)
 ```
 App → Windows routing (0.0.0.0/1 → mirage0, metric 2)
   → Wintun adapter "mirage0" (10.0.85.1/24)
-  → wintun-reader thread (WaitForSingleObject loop)
+  → wintun-reader thread (WaitForSingleObject loop, batch drain)
   → mpsc channel (256 buffer)
-  → mirage-ipstack (IpStack::accept)
+  → pump_wintun_to_stack (batch feed + single flush)
+  → netstack-smoltcp (userspace TCP/IP, Nagle off, ACK delay off)
   → TCP: SOCKS5 connect 127.0.0.1:19480 (IP_UNICAST_IF на физическом NIC)
-      → mirage2web client → relay chain → exit node 45.59.119.139 → internet
-  → UDP:53: DoH resolver (1.1.1.1 via HTTP proxy 127.0.0.1:19481)
-      → mirage-dns TTL-aware LRU cache → DoH POST → fallback TCP DNS
+      → mirage2web client → relay chain → exit node → internet
+  → UDP:53: DNS-over-TCP via SOCKS5 → 8.8.8.8:53 (cached, 60s TTL)
+  → Response: netstack-smoltcp → pump_stack_to_wintun → wintun-writer thread → Wintun → app
   → WFP kill-switch: блокирует non-relay, non-loopback outbound
 ```
 
 ### Bypass routes
 
 `relay_addrs` из `/tun/start` получают `/32` маршрут через оригинальный gateway, минуя TUN.
-Без этого: пакеты к relay → mirage0 → IpStack → SOCKS5 → relay → mirage0 → бесконечный цикл.
+Без этого: пакеты к relay → mirage0 → netstack → SOCKS5 → relay → mirage0 → бесконечный цикл.
 
 ### Route metric
 
@@ -197,9 +202,9 @@ mirage0 побеждает для `0.0.0.0/1` и `128.0.0.0/1`.
 | `main.rs` | CLI: install/uninstall/run/debug-run/evaluate/update/test-read |
 | `service.rs` | SCM integration, service lifecycle, run_service_logic |
 | `api.rs` | Axum management API (6 endpoints) |
-| `wintun.rs` | Wintun FFI + WintunDevice (AsyncRead+AsyncWrite) |
+| `wintun.rs` | Wintun FFI + dedicated reader/writer threads + `WintunDevice` (AsyncRead+AsyncWrite, optional raw channel extraction) |
 | `routing.rs` | Route management (default route, bypass, gateway detection) |
-| `ipstack.rs` | IpStack bridge: TCP→SOCKS5, UDP DNS→DoH resolver |
+| `ipstack.rs` | netstack-smoltcp bridge: TCP→SOCKS5, UDP DNS→DNS-over-TCP via SOCKS5, direct channel pumps |
 | `firewall.rs` | WFP kill-switch (block all except relay+loopback) |
 | `proxy.rs` | System proxy (WinINET + WinHTTP) |
 | `state.rs` | ServiceState, TunPhase |
@@ -209,7 +214,20 @@ mirage0 побеждает для `0.0.0.0/1` и `128.0.0.0/1`.
 
 ### Dedicated reader thread
 
-`tokio::spawn_blocking` для `WintunReceivePacket` зависает после первого успешного вызова — несовместимость Wintun event handle (`WintunGetReadWaitEvent`) + `WaitForSingleObject` с пулом потоков tokio. Решение: один persistent `std::thread` с синхронным циклом → `tokio::sync::mpsc::channel(256)`.
+`tokio::spawn_blocking` для `WintunReceivePacket` зависает после первого успешного вызова — несовместимость Wintun event handle (`WintunGetReadWaitEvent`) + `WaitForSingleObject` с пулом потоков tokio. Решение: один persistent `std::thread` с синхронным циклом → `tokio::sync::mpsc::channel(256)`. Внутренний цикл дренирует все доступные пакеты за одно пробуждение (`WintunReceivePacket` до NULL).
+
+### Dedicated writer thread
+
+Отдельный `std::thread` читает из mpsc channel (1024 buffer) и вызывает `WintunSendPacket`. Ранее: `tokio::spawn` + `spawn_blocking` на каждый пакет — 2 task allocation на пакет, massовый overhead.
+
+### Performance: poll loop + data path
+
+4 оптимизации, давшие 10x ускорение (4-10s → 0.3s):
+
+1. **Batch drain в reader**: inner loop `WintunReceivePacket` до NULL — smoltcp обрабатывает весь burst за один `iface.poll()`
+2. **`SinkExt::feed()` + batch flush** в `pump_wintun_to_stack`: вместо `send()` (3 async polls) — feed все пакеты, один flush
+3. **smoltcp poll loop**: при `SocketStateChanged` → `yield_now()` + `continue` вместо `sleep(1ms)` — убирает искусственную задержку на каждый шаг handshake
+4. **Direct mpsc channels**: нет `tokio::io::split()` mutex, нет double-copy, нет AsyncRead/AsyncWrite indirection на data path
 
 ### Session reuse
 
@@ -223,13 +241,21 @@ mirage0 побеждает для `0.0.0.0/1` и `128.0.0.0/1`.
 
 Фильтры привязаны к процессу — исчезают при крэше, нет stale sublayers.
 
-### DoH via HTTP proxy
+### DNS-over-TCP via SOCKS5
 
-DNS запросы идут через relay chain (HTTP proxy `:19481`), не напрямую — нет DNS leak.
+DNS запросы идут через SOCKS5 туннель как TCP соединения к 8.8.8.8:53 на exit node. RFC 1035 TCP DNS с 2-byte length prefix. Кешируются in-memory (60s TTL, 1024 entries, txn ID нормализован). Максимум 8 одновременных DNS запросов (semaphore). Нет DNS leak — запросы выходят через relay chain.
 
 ### IP_UNICAST_IF
 
 SOCKS5 соединения привязаны к физическому NIC (if_index=19) — пакеты не попадают в TUN loop.
+
+## Производительность
+
+| Метрика | До оптимизаций | После |
+|---------|---------------|-------|
+| HTTP latency через TUN | 4–10 секунд | **0.3s** |
+| `first_read` latency | 800–13000ms | 0–5ms |
+| Direct SOCKS5 baseline | — | 0.2s |
 
 ## Известные ограничения
 

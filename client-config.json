@@ -152,5 +152,6 @@
   },
   "psk": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
   "management_key": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
-  "management_addr": "0.0.0.0:4498"
+  "management_addr": "0.0.0.0:4498",
+  "use_mux": true
 }

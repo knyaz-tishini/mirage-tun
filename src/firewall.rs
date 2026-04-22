@@ -3,8 +3,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 use tracing::{info, warn};
 use mirage_wfp::{
-    Action, AddrConditionBuilder, FilterBuilder, FilterWeight, Layer,
-    PortConditionBuilder, SubLayerBuilder, WfpEngine, WfpTransaction, WeightRange, GUID,
+    Action, AddrConditionBuilder, FilterBuilder, FilterWeight, InterfaceConditionBuilder,
+    Layer, PortConditionBuilder, SubLayerBuilder, WfpEngine, WfpTransaction, WeightRange, GUID,
 };
 use mirage_tun_core::traits::PlatformFirewall;
 use crate::error::TunError;
@@ -27,15 +27,34 @@ impl WfpKillSwitch {
     }
 }
 
+fn resolve_interface_index(name: &str) -> Option<u32> {
+    let output = std::process::Command::new("netsh")
+        .args(["interface", "ipv4", "show", "interfaces"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.ends_with(name) || trimmed.contains(&format!(" {name}")) {
+            let idx_str = trimmed.split_whitespace().next()?;
+            return idx_str.parse().ok();
+        }
+    }
+    None
+}
+
 impl PlatformFirewall for WfpKillSwitch {
     type Error = TunError;
 
     fn activate(
         &mut self,
         relay_addrs: &[IpAddr],
-        _tun_name: &str,
+        tun_name: &str,
         exempt_ports: &[u16],
     ) -> Result<(), TunError> {
+        let tun_if_index = resolve_interface_index(tun_name);
+        info!(tun_name, ?tun_if_index, "WFP: resolved TUN interface index");
+
         // Drop old engine first — removes all previously installed dynamic filters.
         self.engine.take();
 
@@ -97,7 +116,21 @@ impl PlatformFirewall for WfpKillSwitch {
                 }
             }
 
-            // 4. Permit exempt local ports — management API etc. (weight 13).
+            // 4. Permit all traffic on TUN interface (weight 14) — fires before routing.
+            if let Some(tun_idx) = tun_if_index {
+                FilterBuilder::new()
+                    .name("Mirage: permit TUN interface")
+                    .action(Action::Permit)
+                    .layer(Layer::ConnectV4)
+                    .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                    .weight(Self::weight(14))
+                    .condition(InterfaceConditionBuilder::equal(tun_idx))
+                    .add(&tx)
+                    .map_err(|e| TunError::Wfp(format!("TUN interface permit failed: {e}")))?;
+                info!(tun_idx, "WFP: permit TUN interface");
+            }
+
+            // 5. Permit exempt local ports — management API etc. (weight 13).
             for &port in exempt_ports {
                 FilterBuilder::new()
                     .name("Mirage: permit exempt port")
