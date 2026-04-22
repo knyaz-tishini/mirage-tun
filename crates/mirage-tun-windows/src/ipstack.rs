@@ -246,24 +246,25 @@ async fn tcp_accept_loop(
                     .ok()
                     .flatten();
 
-                    if let Some(ref info) = app_info {
-                        tracing::debug!(
-                            "TCP {dst}: src_port={src_port} exe={}",
-                            info.exe_path
-                        );
-                    }
-
                     // Policy decision
                     let domain_hint = dns_map.get(&dst.ip());
                     let decision = policy
                         .decide(dst.ip(), dst.port(), domain_hint.as_deref(), app_info.as_ref())
                         .await;
 
+                    let exe_short = app_info.as_ref().map(|i| {
+                        i.exe_path.rsplit_once('\\')
+                            .map(|(_, name)| name)
+                            .unwrap_or(&i.exe_path)
+                            .to_owned()
+                    });
+
                     let cancel2 = cancel.clone();
                     let stats2 = stats.clone();
 
                     if decision == PolicyDecision::Bypass {
-                        tracing::debug!("TCP {dst}: BYPASS (domain={domain_hint:?})");
+                        info!("TCP {dst}: BYPASS app={} domain={domain_hint:?}",
+                            exe_short.as_deref().unwrap_or("?"));
                         tokio::spawn(async move {
                             tokio::select! {
                                 _ = cancel2.cancelled() => {}
