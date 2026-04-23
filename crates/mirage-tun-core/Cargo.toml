@@ -7,3 +7,7 @@ description = "TUN device abstractions: traits, NAT table, packet parser"
 [dependencies]
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "net", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"

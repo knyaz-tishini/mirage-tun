@@ -1,4 +1,16 @@
-pub mod tun_device;
-pub mod firewall;
-pub mod routing;
+//! macOS TUN stack implementation for mirage2tun.
+//!
+//! Provides `MacosTunStack` which implements `mirage_tun_core::traits::TunStack`.
+//! Uses the native macOS utun kernel control socket for the TUN device and the
+//! kernel TCP/UDP stack (no smoltcp).
+
 pub mod dns;
+pub mod error;
+pub mod firewall;
+pub mod kernel_tcp;
+pub mod kernel_udp;
+pub mod routing;
+pub mod stack;
+pub mod tun_device;
+
+pub use stack::MacosTunStack;

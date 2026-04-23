@@ -1,10 +1,22 @@
 [package]
 name = "mirage-tun-ios"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["lib"]
 
 [dependencies]
 mirage-tun-core = { path = "../mirage-tun-core" }
 mirage-tcpip-stack = { path = "../mirage-tcpip-stack" }
-tokio = { version = "1", features = ["rt", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
 tracing = "0.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+libc = "0.2"
