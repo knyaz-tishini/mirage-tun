@@ -16,11 +16,6 @@ members = [
 version = "0.1.0"
 edition = "2021"
 
-[patch.crates-io]
-etherparse = { path = "vendor/etherparse-0.16.0" }
-spin = { path = "vendor/spin-0.9.8" }
-futures = { path = "vendor/futures-0.3.32" }
-
 [profile.release]
 opt-level = 3
 strip = "symbols"
