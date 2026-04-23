@@ -34,6 +34,7 @@
 13. **80a7701** (23 апр 19:13) — remove vendor/ and [patch.crates-io]
 14. **2b5443e** (23 апр 19:31) — remove etherparse + spin deps from mirage-tcpip-stack
 15. **3626bd3** (24 апр) — cross-platform TUN stack: core traits + Linux + macOS + Android + iOS (5673 LOC)
+16. **1007c99** (24 апр) — WindowsTunStack wrapper + chains/dns_map migrated to core imports
 
 ---
 
@@ -45,3 +46,5 @@
 - **Restructure** — workspace переделан под мультиплатформу: mirage-tcpip-stack (бывший netstack-smoltcp), стабы для linux/macos/android/ios, mirage-dns вынесен на уровень workspace
 - **smoltcp fork** — smoltcp 0.12.0 форкнут внутрь mirage-tcpip-stack, удалены etherparse и spin, все зависимости чистые
 - **Cross-platform stack** — единый API `TunStack::start(cfg, cancel) -> StackHandle<Tcp, Udp>` для всех платформ. Core traits (TunDevice, TcpAcceptor, UdpSocket, PlatformFirewall, PlatformRouting, PlatformDns) + StackConfig с per-chain DNS/isolation. Linux (kernel TCP + nftables + systemd-resolved), macOS (kernel TCP + pf + /etc/resolver/), Android (JNI + smoltcp + VpnService.protect), iOS (C FFI + smoltcp + current_thread runtime, 15 MB NE limit)
+- **Windows TunStack wrapper** — WindowsTunStack реализует TunStack trait поверх существующего IpStackRunner. WintunTcpAcceptor/WintunUdpSocket оборачивают mirage_tcpip_stack. chains.rs/dns_map.rs мигрированы на re-export из core
+- **Consumer integration** — mirage2web/mirage-client-core получил tun_platform.rs с compile-time `PlatformStack` selection (#[cfg] по платформам). mirage2web теперь не импортирует платформенные крейты напрямую
