@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures::Stream;
-use smoltcp::{
+use crate::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::Device,
     socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState},
@@ -233,7 +233,7 @@ impl TcpListenerRunner {
             let updated_sockets = iface.poll(before_poll, &mut device, &mut socket_set);
             if matches!(
                 updated_sockets,
-                smoltcp::iface::PollResult::SocketStateChanged
+                crate::iface::PollResult::SocketStateChanged
             ) {
                 trace!("VirtDevice::poll costed {}", Instant::now() - before_poll);
             }
@@ -374,7 +374,7 @@ impl TcpListenerRunner {
             // poll iteration to send.  Yield to let pump tasks run.
             if matches!(
                 updated_sockets,
-                smoltcp::iface::PollResult::SocketStateChanged
+                crate::iface::PollResult::SocketStateChanged
             ) {
                 tokio::task::yield_now().await;
                 continue;

@@ -6,7 +6,7 @@ use std::{
 
 use etherparse::PacketBuilder;
 use futures::{ready, Sink, SinkExt, Stream};
-use smoltcp::wire::UdpPacket;
+use crate::wire::UdpPacket;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::PollSender;
 use tracing::{error, trace};

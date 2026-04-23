@@ -5,7 +5,7 @@ use std::{
 };
 
 use futures::{Sink, Stream};
-use smoltcp::wire::IpProtocol;
+use crate::wire::IpProtocol;
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::sync::PollSender;
 use tracing::{debug, trace};

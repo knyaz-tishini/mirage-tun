@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
 };
 
-use smoltcp::{
+use crate::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant,
 };

@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use smoltcp::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
+use crate::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
 
 pub type AnyIpPktFrame = Vec<u8>;
 
@@ -11,7 +11,7 @@ pub(super) enum IpPacket<T: AsRef<[u8]>> {
 }
 
 impl<T: AsRef<[u8]> + Copy> IpPacket<T> {
-    pub fn new_checked(packet: T) -> smoltcp::wire::Result<IpPacket<T>> {
+    pub fn new_checked(packet: T) -> crate::wire::Result<IpPacket<T>> {
         let buffer = packet.as_ref();
         match IpVersion::of_packet(buffer)? {
             IpVersion::Ipv4 => Ok(IpPacket::Ipv4(Ipv4Packet::new_checked(packet)?)),

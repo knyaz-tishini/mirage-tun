@@ -1,3 +1,6 @@
+// BoxFuture manually implements Send — safe because the bound `T: Send` is upheld.
+#![allow(unsafe_code)]
+
 use std::{
     future::{Future, IntoFuture},
     pin::Pin,
