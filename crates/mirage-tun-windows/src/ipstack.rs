@@ -56,6 +56,13 @@ impl IpStackRunner {
             snap.len(),
         );
 
+        if native_dns.is_none() {
+            warn!(
+                "IpStackRunner: bypass rules active but native_dns not configured, \
+                 using 8.8.8.8 as fallback for bypass DNS"
+            );
+        }
+
         let relay_set: Arc<HashSet<IpAddr>> =
             Arc::new(relay_addrs.into_iter().collect());
         let relay_set2 = relay_set.clone();
@@ -655,39 +662,39 @@ async fn udp_dns_loop(
                     let dns_map2 = dns_map.clone();
 
                     if decision == PolicyDecision::Bypass {
-                        if let Some(ndns) = native_dns {
-                            tokio::spawn(async move {
-                                let _permit = match sem.acquire().await {
-                                    Ok(p) => p,
-                                    Err(_) => return,
-                                };
-                                match dns_via_native(&payload, ndns, if_index).await {
-                                    Ok(response) => {
-                                        if let Some(ref dom) = domain {
-                                            let ips = extract_dns_ips(&response);
-                                            if !ips.is_empty() {
-                                                dns_map2.insert_many(&ips, dom);
-                                            }
+                        const FALLBACK_DNS: SocketAddr = SocketAddr::new(
+                            IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+                            53,
+                        );
+                        let ndns = native_dns.unwrap_or(FALLBACK_DNS);
+                        tokio::spawn(async move {
+                            let _permit = match sem.acquire().await {
+                                Ok(p) => p,
+                                Err(_) => return,
+                            };
+                            match dns_via_native(&payload, ndns, if_index).await {
+                                Ok(response) => {
+                                    if let Some(ref dom) = domain {
+                                        let ips = extract_dns_ips(&response);
+                                        if !ips.is_empty() {
+                                            dns_map2.insert_many(&ips, dom);
                                         }
-                                        {
-                                            let mut c = cache2.lock().await;
-                                            c.put(&payload, &response);
-                                        }
-                                        let _ = tx.send((response, dst_addr, src_addr));
                                     }
-                                    Err(e) => {
-                                        warn!("IpStackRunner: DNS via native failed: {e}");
+                                    {
+                                        let mut c = cache2.lock().await;
+                                        c.put(&payload, &response);
                                     }
+                                    let _ = tx.send((response, dst_addr, src_addr));
                                 }
-                            });
-                            continue;
-                        }
-                        // native_dns not configured — fall through to SOCKS5 default
+                                Err(e) => {
+                                    warn!("IpStackRunner: DNS via native failed: {e}");
+                                }
+                            }
+                        });
+                        continue;
                     }
 
-                    // SOCKS5 path — resolve chain from registry (live snapshot).
-                    // For Bypass that fell through, and for Chain(name), use the
-                    // named chain's SOCKS5; fall back to "default" if name is missing.
+                    // SOCKS5 path — only reached for Chain decisions (Bypass continues above).
                     let chain_snap: Arc<ChainMap> = chain_registry.snapshot().await;
                     let socks5_addr = match &decision {
                         PolicyDecision::Chain(name) => {
@@ -696,11 +703,7 @@ async fn udp_dns_loop(
                                 .or_else(|| chain_snap.get("default").copied())
                                 .or_else(|| chain_snap.values().next().copied())
                         }
-                        PolicyDecision::Bypass => {
-                            // Fell through because native_dns was None.
-                            chain_snap.get("default").copied()
-                                .or_else(|| chain_snap.values().next().copied())
-                        }
+                        PolicyDecision::Bypass => unreachable!("bypass handled above"),
                     };
 
                     let socks5_addr = match socks5_addr {
