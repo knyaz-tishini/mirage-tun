@@ -70,17 +70,11 @@ default-features = false
 features = ["map", "std"]
 
 # ── wrapper deps ─────────────────────────────────────────────────────────────
-[dependencies.etherparse]
-version = "0.16"
-
 [dependencies.futures]
 version = "0.3"
 
 [dependencies.rand]
 version = "0.8"
-
-[dependencies.spin]
-version = "0.9"
 
 [dependencies.tokio]
 version = "1"

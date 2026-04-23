@@ -4,9 +4,12 @@ use std::{
     task::{Context, Poll},
 };
 
-use etherparse::PacketBuilder;
 use futures::{ready, Sink, SinkExt, Stream};
-use crate::wire::UdpPacket;
+use crate::wire::{
+    IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr,
+    UdpPacket, UdpRepr,
+};
+use crate::phy::ChecksumCapabilities;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::PollSender;
 use tracing::{error, trace};
@@ -109,26 +112,80 @@ impl Sink<UdpMsg> for WriteHalf {
             return Ok(());
         }
 
-        let builder = match (src_addr, dst_addr) {
+        let cksum = ChecksumCapabilities::default();
+        let udp_repr = UdpRepr {
+            src_port: src_addr.port(),
+            dst_port: dst_addr.port(),
+        };
+        let udp_len = udp_repr.header_len() + data.len();
+
+        let buf = match (src_addr, dst_addr) {
             (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
-                PacketBuilder::ipv4(src.ip().octets(), dst.ip().octets(), 20)
-                    .udp(src_addr.port(), dst_addr.port())
+                let src_ip = Ipv4Address::from(*src.ip());
+                let dst_ip = Ipv4Address::from(*dst.ip());
+                let ipv4_repr = Ipv4Repr {
+                    src_addr: src_ip,
+                    dst_addr: dst_ip,
+                    next_header: IpProtocol::Udp,
+                    payload_len: udp_len,
+                    hop_limit: 64,
+                };
+                let total_len = ipv4_repr.buffer_len() + udp_len;
+                let mut buf = vec![0u8; total_len];
+                {
+                    let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf[..]);
+                    ipv4_repr.emit(&mut ip_pkt, &cksum);
+                }
+                let ip_hdr_len = ipv4_repr.buffer_len();
+                {
+                    let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_hdr_len..]);
+                    udp_repr.emit(
+                        &mut udp_pkt,
+                        &IpAddress::from(src_ip),
+                        &IpAddress::from(dst_ip),
+                        data.len(),
+                        |payload| payload.copy_from_slice(&data),
+                        &cksum,
+                    );
+                }
+                buf
             }
             (SocketAddr::V6(src), SocketAddr::V6(dst)) => {
-                PacketBuilder::ipv6(src.ip().octets(), dst.ip().octets(), 20)
-                    .udp(src_addr.port(), dst_addr.port())
+                let src_ip = Ipv6Address::from(*src.ip());
+                let dst_ip = Ipv6Address::from(*dst.ip());
+                let ipv6_repr = Ipv6Repr {
+                    src_addr: src_ip,
+                    dst_addr: dst_ip,
+                    next_header: IpProtocol::Udp,
+                    payload_len: udp_len,
+                    hop_limit: 64,
+                };
+                let total_len = ipv6_repr.buffer_len() + udp_len;
+                let mut buf = vec![0u8; total_len];
+                {
+                    let mut ip_pkt = Ipv6Packet::new_unchecked(&mut buf[..]);
+                    ipv6_repr.emit(&mut ip_pkt);
+                }
+                let ip_hdr_len = ipv6_repr.buffer_len();
+                {
+                    let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_hdr_len..]);
+                    udp_repr.emit(
+                        &mut udp_pkt,
+                        &IpAddress::from(src_ip),
+                        &IpAddress::from(dst_ip),
+                        data.len(),
+                        |payload| payload.copy_from_slice(&data),
+                        &cksum,
+                    );
+                }
+                buf
             }
             _ => {
                 return Err(Error::new(InvalidData, "src or destination type unmatch"));
             }
         };
 
-        let mut ip_packet_writer = Vec::with_capacity(builder.size(data.len()));
-        builder
-            .write(&mut ip_packet_writer, &data)
-            .map_err(|err| Error::other(format!("PacketBuilder::write: {err}")))?;
-
-        match self.stack_tx.start_send_unpin(ip_packet_writer) {
+        match self.stack_tx.start_send_unpin(buf) {
             Ok(()) => Ok(()),
             Err(err) => Err(Error::other(format!("send error: {err}"))),
         }

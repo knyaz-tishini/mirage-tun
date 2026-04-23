@@ -18,7 +18,7 @@ use crate::{
     time::{Duration, Instant},
     wire::{HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv6Address, TcpPacket},
 };
-use spin::Mutex as SpinMutex;
+use std::sync::Mutex as SpinMutex;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{
@@ -62,6 +62,10 @@ struct TcpSocketCreation {
 
 type SharedNotify = Arc<Notify>;
 type SharedControl = Arc<SpinMutex<TcpSocketControl>>;
+
+fn lock_control(m: &SpinMutex<TcpSocketControl>) -> std::sync::MutexGuard<'_, TcpSocketControl> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct TcpListenerRunner;
 
@@ -244,7 +248,7 @@ impl TcpListenerRunner {
             for (socket_handle, control) in sockets.iter() {
                 let socket_handle = *socket_handle;
                 let socket = socket_set.get_mut::<TcpSocket>(socket_handle);
-                let mut control = control.lock();
+                let mut control = lock_control(&control);
 
                 // Remove the socket only when it is in the closed state.
                 if socket.state() == TcpState::Closed {
@@ -482,7 +486,7 @@ pub struct TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut control = self.control.lock();
+        let mut control = lock_control(&self.control);
 
         if matches!(control.recv_state, TcpSocketState::Normal) {
             control.recv_state = TcpSocketState::Close;
@@ -512,7 +516,7 @@ impl AsyncRead for TcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut control = self.control.lock();
+        let mut control = lock_control(&self.control);
 
         // Read from buffer
         if control.recv_buffer.is_empty() {
@@ -549,7 +553,7 @@ impl AsyncWrite for TcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut control = self.control.lock();
+        let mut control = lock_control(&self.control);
 
         // If state == Close | Closing | Closed, the TCP stream WR half is closed.
         if !matches!(control.send_state, TcpSocketState::Normal) {
@@ -582,7 +586,7 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut control = self.control.lock();
+        let mut control = lock_control(&self.control);
 
         if matches!(control.send_state, TcpSocketState::Closed) {
             return Ok(()).into();

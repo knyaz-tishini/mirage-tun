@@ -2,10 +2,14 @@
 
 use std::time::Duration;
 
-use etherparse::{IpNumber, Ipv4Header, UdpHeader};
 use futures::SinkExt;
 use tokio::time::timeout;
 
+use mirage_tcpip_stack::phy::ChecksumCapabilities;
+use mirage_tcpip_stack::wire::{
+    IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr,
+    UdpPacket, UdpRepr, UDP_HEADER_LEN,
+};
 use mirage_tcpip_stack::StackBuilder;
 
 fn make_udp_ipv4(
@@ -15,34 +19,36 @@ fn make_udp_ipv4(
     dst_port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let udp_hdr = UdpHeader::with_ipv4_checksum(
-        src_port,
-        dst_port,
-        &Ipv4Header::new(
-            (UdpHeader::LEN + payload.len()) as u16,
-            64,
-            IpNumber::UDP,
-            src_ip,
-            dst_ip,
-        )
-        .unwrap(),
-        payload,
-    )
-    .unwrap();
-
-    let ip_hdr = Ipv4Header::new(
-        (UdpHeader::LEN + payload.len()) as u16,
-        64,
-        IpNumber::UDP,
-        src_ip,
-        dst_ip,
-    )
-    .unwrap();
-
-    let mut buf = Vec::with_capacity(Ipv4Header::MIN_LEN + UdpHeader::LEN + payload.len());
-    ip_hdr.write(&mut buf).unwrap();
-    udp_hdr.write(&mut buf).unwrap();
-    buf.extend_from_slice(payload);
+    let cksum = ChecksumCapabilities::default();
+    let src_addr = Ipv4Address::from(src_ip);
+    let dst_addr = Ipv4Address::from(dst_ip);
+    let udp_len = UDP_HEADER_LEN + payload.len();
+    let ipv4_repr = Ipv4Repr {
+        src_addr,
+        dst_addr,
+        next_header: IpProtocol::Udp,
+        payload_len: udp_len,
+        hop_limit: 64,
+    };
+    let udp_repr = UdpRepr { src_port, dst_port };
+    let total_len = ipv4_repr.buffer_len() + udp_len;
+    let mut buf = vec![0u8; total_len];
+    {
+        let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf[..]);
+        ipv4_repr.emit(&mut ip_pkt, &cksum);
+    }
+    let ip_hdr_len = ipv4_repr.buffer_len();
+    {
+        let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_hdr_len..]);
+        udp_repr.emit(
+            &mut udp_pkt,
+            &IpAddress::from(src_addr),
+            &IpAddress::from(dst_addr),
+            payload.len(),
+            |b| b.copy_from_slice(payload),
+            &cksum,
+        );
+    }
     buf
 }
 
