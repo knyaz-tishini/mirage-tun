@@ -12,31 +12,37 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use mirage_tun_core::chains::{ChainConfig, ChainRegistry};
 use mirage_tun_core::metrics::StackMetrics;
 use mirage_tun_core::stack_config::{ChainEntry, StackConfig};
+use mirage_tun_core::traits::TunStack;
 
 use crate::error::IosTunError;
-use crate::packet_tunnel::{IosTunDevice, WriteFn, WriteCallback};
-use crate::stack::IosTunStack;
+use crate::packet_tunnel::{WriteFn, WriteCallback};
+use crate::stack::{clone_inbound_tx, IosTunStack};
 
 // ── TunContext ────────────────────────────────────────────────────────────────
 
 /// Internal state kept alive for the duration of the tunnel session.
 struct TunContext {
-    /// Feed packets arriving from Swift (inbound from device apps).
-    inbound_tx: mpsc::Sender<Vec<u8>>,
     /// Cancels all spawned tasks on stop.
     cancel: CancellationToken,
-    /// Write callback: used by the outbound pump to push packets back to Swift.
+    /// Write callback — kept alive so the outbound pump's Arc<WriteCallback>
+    /// remains valid for the tunnel lifetime.
     _write_cb: Arc<WriteCallback>,
+    /// Hot-reloadable chain registry — shared with stack tasks.
+    chain_registry: Arc<ChainRegistry>,
+    /// Handle into the tokio runtime — used for synchronous-context dispatches
+    /// (e.g. `mirage_tun_update_chains` called from the NE dispatch queue).
+    rt_handle: tokio::runtime::Handle,
     /// Tokio single-thread runtime — kept alive while the tunnel runs.
     _rt: tokio::runtime::Runtime,
-    /// Metrics (bytes rx/tx).
-    metrics: Arc<StackMetrics>,
+    /// Metrics (bytes rx/tx) — kept alive; values are read via atomic loads
+    /// from the Arc clones held by the pump tasks.
+    _metrics: Arc<StackMetrics>,
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
@@ -57,7 +63,7 @@ struct TunContext {
 /// # Safety
 ///
 /// All pointer arguments must be valid for the duration of the call.
-/// `write_callback` and `write_ctx` must remain valid until `mirage_tun_stop` is called.
+/// `write_callback` and `write_ctx` must remain valid until `mirage_tun_stop`.
 #[no_mangle]
 pub unsafe extern "C" fn mirage_tun_start(
     config_json: *const u8,
@@ -92,55 +98,58 @@ pub unsafe extern "C" fn mirage_tun_start(
         }
     };
 
-    // Construct write callback wrapper.
-    // SAFETY: caller guarantees fn_ptr and ctx are valid.
+    // Build the write callback wrapper.
+    // SAFETY: caller guarantees fn_ptr and ctx are valid for tunnel lifetime.
     let write_cb = Arc::new(unsafe { WriteCallback::new(write_callback, write_ctx) });
-    let write_cb2 = write_cb.clone();
+
+    // Build chain registry from initial config.
+    let chain_configs: Vec<ChainConfig> = cfg
+        .chains
+        .iter()
+        .map(|c| ChainConfig {
+            name: c.name.clone(),
+            socks5_addr: c.socks5_addr.to_string(),
+            protocol: mirage_tun_core::chains::ChainProtocol::Socks5,
+        })
+        .collect();
+    let chain_registry = Arc::new(ChainRegistry::new(chain_configs));
 
     let cancel = CancellationToken::new();
-    let cancel2 = cancel.clone();
     let metrics = Arc::new(StackMetrics::default());
-    let metrics2 = metrics.clone();
 
-    // Build IosTunDevice channels.
-    let (_device, inbound_tx, outbound_rx) = IosTunDevice::new("ios-tun");
-    let inbound_tx2 = inbound_tx.clone();
-    let inbound_rx_for_stack = {
-        // We need a receiver to pass to the stack. The device was built with
-        // inbound_rx inside it; we extract it by taking the device apart.
-        // Since IosTunDevice::new returns the sender and receiver separately
-        // alongside the device, we pass the device's inbound_rx directly.
-        // Reconstruct: build a fresh channel pair for the stack runner.
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
-        // Replace inbound_tx with the new tx so FFI feeds the stack.
-        let _ = inbound_tx; // drop old
-        (tx, rx)
-    };
-    let (stack_inbound_tx, stack_inbound_rx) = inbound_rx_for_stack;
+    // Capture the runtime handle before block_on so we can store it in TunContext.
+    let rt_handle = rt.handle().clone();
 
-    // Spawn outbound pump: drains stack→outbound channel, calls write_cb.
-    let cancel3 = cancel2.clone();
-    rt.spawn(outbound_pump(outbound_rx, write_cb2, cancel3));
-
-    // Start smoltcp stack runners inside the runtime.
-    let _stack_result = rt.block_on(async {
-        IosTunStack::start_with_channels(
-            &cfg,
-            stack_inbound_rx,
-            // outbound_tx is already extracted inside IosTunDevice::new above,
-            // but we need to wire it to the stack. Re-create for this call.
-            mpsc::channel::<Vec<u8>>(64).0, // placeholder — real wiring below
-            cancel2.clone(),
-            metrics2,
-        )
+    // Register write callback with IosTunStack before calling start().
+    // set_write_callback() stores the Arc<WriteCallback> in a static so that
+    // TunStack::start() can pick it up and wire the outbound pump correctly.
+    let write_cb_for_stack = write_cb.clone();
+    let result = rt.block_on(async {
+        IosTunStack::set_write_callback(write_cb_for_stack).await;
+        IosTunStack::start(cfg, cancel.clone()).await
     });
 
+    match result {
+        Ok(_handle) => {
+            // _handle contains tcp/udp acceptors — iOS FFI consumers use the
+            // raw C entry points (mirage_tun_process_packet) rather than the
+            // Rust trait objects, so the handle is intentionally not stored.
+            // The write callback pump and inbound pump are already running as
+            // tokio tasks owned by the runtime.
+        }
+        Err(e) => {
+            error!("mirage_tun_start: stack start failed: {e}");
+            return std::ptr::null_mut();
+        }
+    }
+
     let ctx = Box::new(TunContext {
-        inbound_tx: stack_inbound_tx,
         cancel,
         _write_cb: write_cb,
+        chain_registry,
+        rt_handle,
         _rt: rt,
-        metrics,
+        _metrics: metrics,
     });
 
     info!("mirage_tun_start: tunnel started");
@@ -152,8 +161,7 @@ pub unsafe extern "C" fn mirage_tun_start(
 /// Called by Swift for every IP packet read from `packetFlow.readPacketObjects`.
 ///
 /// `data` is a raw IP packet. This function copies the bytes and feeds them
-/// into the smoltcp stack via an async channel. The function returns immediately
-/// (non-blocking).
+/// into the smoltcp stack via an async channel. Returns immediately (non-blocking).
 ///
 /// # Safety
 ///
@@ -170,12 +178,18 @@ pub unsafe extern "C" fn mirage_tun_process_packet(
         return;
     }
 
-    let ctx = unsafe { &*(ctx as *mut TunContext) };
+    // Verify ctx is alive (we don't use it directly — inbound_tx is in the static).
+    let _ctx = unsafe { &*(ctx as *mut TunContext) };
     let packet = unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec();
 
+    // Retrieve the sender from the static set during TunStack::start().
     // Non-blocking send — if the channel is full, drop the packet (back-pressure).
-    if ctx.inbound_tx.try_send(packet).is_err() {
-        warn!("mirage_tun_process_packet: inbound channel full, packet dropped");
+    if let Some(tx) = clone_inbound_tx() {
+        if tx.try_send(packet).is_err() {
+            warn!("mirage_tun_process_packet: inbound channel full, packet dropped");
+        }
+    } else {
+        warn!("mirage_tun_process_packet: stack not started yet, packet dropped");
     }
 }
 
@@ -206,6 +220,7 @@ pub unsafe extern "C" fn mirage_tun_stop(ctx: *mut c_void) {
 /// Hot-reload SOCKS5 chain configuration.
 ///
 /// `json` is a UTF-8 JSON array of `{"name":"...","socks5_addr":"..."}` objects.
+/// The chain registry inside the running stack is atomically replaced.
 ///
 /// # Safety
 ///
@@ -220,40 +235,28 @@ pub unsafe extern "C" fn mirage_tun_update_chains(
         return;
     }
 
+    let ctx_ref = unsafe { &*(ctx as *mut TunContext) };
     let bytes = unsafe { std::slice::from_raw_parts(json, json_len) };
+
     match parse_chains_json(bytes) {
-        Ok(chains) => {
-            let _ctx = unsafe { &*(ctx as *mut TunContext) };
-            info!("mirage_tun_update_chains: {} chains received", chains.len());
-            // In a full implementation, the chain registry would be updated here
-            // via an Arc<Mutex<ChainRegistry>>. Stub logs the intent.
+        Ok(entries) => {
+            let count = entries.len();
+            let registry = ctx_ref.chain_registry.clone();
+            // block_on drives the async update synchronously from the NE
+            // dispatch queue (which is outside the tokio runtime context).
+            ctx_ref.rt_handle.block_on(async move {
+                let new_map = entries
+                    .into_iter()
+                    .map(|e| (e.name, e.socks5_addr))
+                    .collect();
+                registry.update(new_map).await;
+            });
+            info!("mirage_tun_update_chains: updated {} chains", count);
         }
         Err(e) => {
             warn!("mirage_tun_update_chains: parse error: {e}");
         }
     }
-}
-
-// ── Outbound pump ─────────────────────────────────────────────────────────────
-
-/// Drains the stack outbound channel and calls `write_cb` for each packet.
-async fn outbound_pump(
-    mut outbound_rx: mpsc::Receiver<Vec<u8>>,
-    write_cb: Arc<WriteCallback>,
-    cancel: CancellationToken,
-) {
-    info!("ios: outbound_pump started");
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            pkt = outbound_rx.recv() => match pkt {
-                None => break,
-                Some(pkt) => write_cb.send(&pkt),
-            }
-        }
-    }
-    info!("ios: outbound_pump stopped");
 }
 
 // ── Config parsing ────────────────────────────────────────────────────────────
@@ -344,13 +347,13 @@ fn parse_ffi_config(json: &[u8]) -> Result<StackConfig, IosTunError> {
     })
 }
 
-#[derive(serde::Deserialize)]
-struct FfiChain {
-    name: String,
-    socks5_addr: String,
-}
-
 fn parse_chains_json(json: &[u8]) -> Result<Vec<ChainEntry>, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct FfiChain {
+        name: String,
+        socks5_addr: String,
+    }
+
     let raw: Vec<FfiChain> = serde_json::from_slice(json)?;
     Ok(raw
         .into_iter()

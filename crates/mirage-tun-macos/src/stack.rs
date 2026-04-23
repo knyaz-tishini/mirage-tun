@@ -89,6 +89,10 @@ impl TunStack for MacosTunStack {
         let (udp_socket, udp_tx, mut reply_rx) = MacosKernelUdpSocket::new();
         let metrics = Arc::new(StackMetrics::default());
 
+        // Wrap device in Arc so the read and write loops can share it.
+        let device = Arc::new(device);
+        let device_writer = Arc::clone(&device);
+
         // TUN read loop: receives raw IP packets from utun, dispatches to UDP channel.
         // TCP packets are handled by the kernel — no further action needed for TCP.
         let read_metrics = Arc::clone(&metrics);
@@ -133,27 +137,26 @@ impl TunStack for MacosTunStack {
             if let Err(e) = firewall.deactivate() {
                 error!("firewall deactivate failed: {}", e);
             }
-            if let Err(e) = device.close().await {
-                error!("utun close failed: {}", e);
-            }
+            // device is dropped here (last Arc ref) — OwnedFd closes the utun fd.
         });
 
-        // Reply write loop: takes crafted UDP reply packets and writes them to the TUN fd.
-        // NOTE: We need a separate handle to the device fd for writes.
-        // Since MacosTunDevice wraps OwnedFd+AsyncFd, and we moved `device` into the
-        // read loop above, the reply channel is drained by a dummy task here.
-        // In a full production impl the device would be Arc-wrapped or split into
-        // read/write halves. For now, replies are dropped (caller's SOCKS5 proxy
-        // handles UDP at application level).
+        // Reply write loop: injects crafted UDP reply packets back into the utun fd.
+        // `device_writer` is the second Arc clone — safe to use concurrently with the
+        // read loop because `write_packet` takes `&self` (no exclusive borrow).
         let write_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = write_cancel.cancelled() => break,
                     pkt = reply_rx.recv() => {
-                        if pkt.is_none() { break; }
-                        // NOTE: Packet write skipped — see comment above.
-                        // In a production impl: device_writer.write_packet(&pkt).await.ok();
+                        match pkt {
+                            None => break,
+                            Some(p) => {
+                                if let Err(e) = device_writer.write_packet(&p).await {
+                                    error!("TUN write error: {}", e);
+                                }
+                            }
+                        }
                     }
                 }
             }
