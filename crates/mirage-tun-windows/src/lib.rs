@@ -11,5 +11,10 @@ pub mod process_info;
 pub mod proxy;
 pub mod routing;
 pub mod service;
+pub mod stack;
 pub mod state;
+pub mod tcp_acceptor;
+pub mod udp_socket;
 pub mod wintun;
+
+pub use stack::WindowsTunStack;
