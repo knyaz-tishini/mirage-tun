@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures::{SinkExt, StreamExt};
-use netstack_smoltcp::{
+use mirage_tcpip_stack::{
     udp::UdpMsg, AnyIpPktFrame, StackBuilder, TcpListener, UdpSocket,
 };
 use tokio::{
@@ -191,7 +191,7 @@ impl Drop for ConnGuard {
 
 async fn pump_wintun_to_stack(
     mut wintun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    mut stack_sink: futures::stream::SplitSink<netstack_smoltcp::Stack, AnyIpPktFrame>,
+    mut stack_sink: futures::stream::SplitSink<mirage_tcpip_stack::Stack, AnyIpPktFrame>,
     cancel: CancellationToken,
     stats: Arc<PumpStats>,
 ) {
@@ -228,7 +228,7 @@ async fn pump_wintun_to_stack(
 }
 
 async fn pump_stack_to_wintun(
-    mut stack_stream: futures::stream::SplitStream<netstack_smoltcp::Stack>,
+    mut stack_stream: futures::stream::SplitStream<mirage_tcpip_stack::Stack>,
     wintun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     cancel: CancellationToken,
     stats: Arc<PumpStats>,
@@ -944,7 +944,7 @@ async fn dns_tcp_query(
 // ── TCP bypass (direct via native interface) ──────────────────────────────────
 
 async fn handle_bypass_tcp(
-    mut tcp: netstack_smoltcp::TcpStream,
+    mut tcp: mirage_tcpip_stack::TcpStream,
     dst: SocketAddr,
     if_index: u32,
 ) -> std::result::Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
@@ -958,7 +958,7 @@ async fn handle_bypass_tcp(
 // ── TCP → SOCKS5 ──────────────────────────────────────────────────────────────
 
 async fn handle_tcp(
-    mut tcp: netstack_smoltcp::TcpStream,
+    mut tcp: mirage_tcpip_stack::TcpStream,
     socks5_addr: SocketAddr,
     dst: SocketAddr,
     socks5_semaphore: Arc<Semaphore>,

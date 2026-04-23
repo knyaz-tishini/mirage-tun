@@ -182,7 +182,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
-        .with_env_filter("info,mirage2tun::ipstack=debug,netstack_smoltcp=debug")
+        .with_env_filter("info,mirage2tun::ipstack=debug,mirage_tcpip_stack=debug")
         .init();
 
     // Retrieve stop_tx from OnceLock to pass into logic

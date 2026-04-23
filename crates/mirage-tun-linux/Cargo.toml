@@ -1,0 +1,9 @@
+[package]
+name = "mirage-tun-linux"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mirage-tun-core = { path = "../mirage-tun-core" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

@@ -1,0 +1,10 @@
+[package]
+name = "mirage-tun-android"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mirage-tun-core = { path = "../mirage-tun-core" }
+mirage-tcpip-stack = { path = "../mirage-tcpip-stack" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

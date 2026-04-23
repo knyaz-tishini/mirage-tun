@@ -3,18 +3,6 @@
 version = 4
 
 [[package]]
-name = "ahash"
-version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
-dependencies = [
- "cfg-if",
- "once_cell",
- "version_check",
- "zerocopy",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -468,15 +456,6 @@ dependencies = [
 [[package]]
 name = "etherparse"
 version = "0.16.0"
-dependencies = [
- "arrayvec",
-]
-
-[[package]]
-name = "etherparse"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b119b9796ff800751a220394b8b3613f26dd30c48f254f6837e64c464872d1c7"
 dependencies = [
  "arrayvec",
 ]
@@ -1168,15 +1147,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "mirage-ipstack"
+name = "mirage-tcpip-stack"
+version = "0.2.2"
+dependencies = [
+ "etherparse",
+ "futures",
+ "rand 0.8.6",
+ "smoltcp",
+ "socket2 0.5.10",
+ "socket2-ext",
+ "spin",
+ "structopt",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "tun-rs",
+ "tun2",
+]
+
+[[package]]
+name = "mirage-tun-android"
 version = "0.1.0"
 dependencies = [
- "ahash",
- "etherparse 0.19.0",
- "log",
- "rand 0.8.6",
- "thiserror 2.0.18",
+ "mirage-tcpip-stack",
+ "mirage-tun-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1185,6 +1182,34 @@ version = "0.1.0"
 dependencies = [
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "mirage-tun-ios"
+version = "0.1.0"
+dependencies = [
+ "mirage-tcpip-stack",
+ "mirage-tun-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mirage-tun-linux"
+version = "0.1.0"
+dependencies = [
+ "mirage-tun-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mirage-tun-macos"
+version = "0.1.0"
+dependencies = [
+ "mirage-tun-core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1197,10 +1222,9 @@ dependencies = [
  "libloading 0.8.9",
  "log",
  "mirage-dns",
- "mirage-ipstack",
+ "mirage-tcpip-stack",
  "mirage-tun-core",
  "mirage-wfp",
- "netstack-smoltcp",
  "reqwest",
  "serde",
  "serde_json",
@@ -1286,26 +1310,6 @@ dependencies = [
  "bytes",
  "libc",
  "log",
-]
-
-[[package]]
-name = "netstack-smoltcp"
-version = "0.2.2"
-dependencies = [
- "etherparse 0.16.0",
- "futures",
- "rand 0.8.6",
- "smoltcp",
- "socket2 0.5.10",
- "socket2-ext",
- "spin",
- "structopt",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "tun-rs",
- "tun2",
 ]
 
 [[package]]
