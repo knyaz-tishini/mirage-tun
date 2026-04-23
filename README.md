@@ -292,6 +292,12 @@ Policy привязывает правила к цепочкам: `.ru` → dire
 - Mirage домены → DNS-over-TCP via SOCKS5 → 8.8.8.8 на exit node
 - DnsMap: ip→domain reverse mapping для TCP policy lookup (8192 entries, 5min TTL)
 
+#### DNS Bypass Guarantee
+
+Bypass DNS NEVER routes through SOCKS5. When `native_dns` is not configured, falls back to `8.8.8.8:53` via native UDP. This ensures bypass connections survive SOCKS5 pool exhaustion — DNS resolution for bypass domains is independent of the proxy tunnel.
+
+Previously, unconfigured `native_dns` caused bypass DNS to silently route through SOCKS5, creating a single point of failure.
+
 ### UDP Bypass
 
 Non-DNS UDP (QUIC, game traffic, VoIP):
