@@ -35,4 +35,4 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
 log = "0.4"
 clap = { version = "4", features = ["derive"] }
-mirage-dns = { path = "crates/mirage-dns" }
+mirage-dns = { path = "../mirage-dns" }

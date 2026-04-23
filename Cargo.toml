@@ -4,7 +4,7 @@ members = [
     "crates/mirage-tun-core",
     "crates/mirage-tun-windows",
     "crates/mirage-tun-windows/crates/mirage-wfp",
-    "crates/mirage-tun-windows/crates/mirage-dns",
+    "crates/mirage-dns",
     "crates/mirage-tcpip-stack",
     "crates/mirage-tun-linux",
     "crates/mirage-tun-macos",
