@@ -17,7 +17,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::chains::{ChainMap, ChainRegistry};
+use crate::chains::{ChainEntry, ChainMap, ChainRegistry};
 use crate::config::TunConfig;
 use crate::dns_map::DnsMap;
 use crate::error::{Result, TunError};
@@ -47,8 +47,8 @@ impl IpStackRunner {
     ) -> Result<Self> {
         // Snapshot for logging only — not used in the hot path.
         let snap = chain_registry.snapshot().await;
-        let default_socks5 = snap.get("default").copied()
-            .or_else(|| snap.values().next().copied());
+        let default_socks5 = snap.get("default").map(|e| e.socks5_addr)
+            .or_else(|| snap.values().next().map(|e| e.socks5_addr));
 
         info!(
             "IpStackRunner: started, default_socks5={default_socks5:?}, chains={}, \
@@ -337,7 +337,7 @@ async fn tcp_accept_loop(
                         PolicyDecision::Chain(chain_name) => {
                             // Snapshot the live registry at connection time — always current.
                             let chain_snap: Arc<ChainMap> = chain_registry.snapshot().await;
-                            let socks5_addr = match chain_snap.get(&chain_name).copied() {
+                            let socks5_addr = match chain_snap.get(&chain_name).map(|e| e.socks5_addr) {
                                 Some(addr) => addr,
                                 None => {
                                     warn!("TCP {dst}: chain '{chain_name}' not found in registry — dropping");
@@ -696,30 +696,35 @@ async fn udp_dns_loop(
 
                     // SOCKS5 path — only reached for Chain decisions (Bypass continues above).
                     let chain_snap: Arc<ChainMap> = chain_registry.snapshot().await;
-                    let socks5_addr = match &decision {
+                    let chain_entry: Option<ChainEntry> = match &decision {
                         PolicyDecision::Chain(name) => {
                             // Try the named chain first, then fall back to "default".
-                            chain_snap.get(name.as_str()).copied()
-                                .or_else(|| chain_snap.get("default").copied())
-                                .or_else(|| chain_snap.values().next().copied())
+                            chain_snap.get(name.as_str())
+                                .or_else(|| chain_snap.get("default"))
+                                .or_else(|| chain_snap.values().next())
+                                .cloned()
                         }
                         PolicyDecision::Bypass => unreachable!("bypass handled above"),
                     };
 
-                    let socks5_addr = match socks5_addr {
-                        Some(addr) => addr,
+                    let chain_entry = match chain_entry {
+                        Some(entry) => entry,
                         None => {
                             warn!("DNS query: no chain configured — dropping");
                             continue;
                         }
                     };
 
+                    // Use per-chain DNS upstream if configured; fall back to global.
+                    let chain_dns = chain_entry.dns_upstream.unwrap_or(dns_upstream);
+                    let socks5_addr = chain_entry.socks5_addr;
+
                     tokio::spawn(async move {
                         let _permit = match sem.acquire().await {
                             Ok(p) => p,
                             Err(_) => return,
                         };
-                        match dns_via_socks5_inner(&payload, socks5_addr, if_index, dns_upstream).await {
+                        match dns_via_socks5_inner(&payload, socks5_addr, if_index, chain_dns).await {
                             Ok(response) => {
                                 if let Some(ref dom) = domain {
                                     let ips = extract_dns_ips(&response);

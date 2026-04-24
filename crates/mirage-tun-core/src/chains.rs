@@ -22,10 +22,21 @@ pub struct ChainConfig {
     pub socks5_addr: String,
     #[serde(default)]
     pub protocol: ChainProtocol,
+    /// Per-chain DNS upstream. Falls back to global TunConfig.dns_upstream if None.
+    #[serde(default)]
+    pub dns_upstream: Option<String>,
 }
 
-/// Resolved map: chain name → SOCKS5 SocketAddr.
-pub type ChainMap = HashMap<String, SocketAddr>;
+/// Resolved entry for a single chain.
+#[derive(Debug, Clone)]
+pub struct ChainEntry {
+    pub socks5_addr: SocketAddr,
+    /// Per-chain DNS upstream. None means use the global fallback.
+    pub dns_upstream: Option<SocketAddr>,
+}
+
+/// Resolved map: chain name → ChainEntry.
+pub type ChainMap = HashMap<String, ChainEntry>;
 
 /// Hot-reloadable registry of SOCKS5 chains.
 pub struct ChainRegistry {
@@ -39,8 +50,17 @@ impl ChainRegistry {
         let mut map = ChainMap::new();
         for cfg in configs {
             match cfg.socks5_addr.parse::<SocketAddr>() {
-                Ok(addr) => {
-                    map.insert(cfg.name, addr);
+                Ok(socks5_addr) => {
+                    let dns_upstream = cfg.dns_upstream.as_ref().and_then(|d| {
+                        d.parse::<SocketAddr>().map_err(|e| {
+                            tracing::warn!(
+                                "chains: invalid dns_upstream '{}' for chain '{}': {e}",
+                                d,
+                                cfg.name
+                            );
+                        }).ok()
+                    });
+                    map.insert(cfg.name, ChainEntry { socks5_addr, dns_upstream });
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -76,10 +96,11 @@ impl ChainRegistry {
             .read()
             .await
             .iter()
-            .map(|(name, addr)| ChainConfig {
+            .map(|(name, entry)| ChainConfig {
                 name: name.clone(),
-                socks5_addr: addr.to_string(),
+                socks5_addr: entry.socks5_addr.to_string(),
                 protocol: ChainProtocol::Socks5,
+                dns_upstream: entry.dns_upstream.map(|a| a.to_string()),
             })
             .collect()
     }

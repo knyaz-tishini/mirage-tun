@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use mirage_tun_core::traits::PlatformFirewall;
 
-use crate::chains::{ChainConfig, ChainMap, ChainProtocol, ChainRegistry};
+use crate::chains::{ChainConfig, ChainEntry, ChainMap, ChainProtocol, ChainRegistry};
 use crate::config::TunConfig;
 use crate::error::TunError;
 use crate::ipstack::IpStackRunner;
@@ -151,7 +151,7 @@ pub async fn activate_tun_inner(
     // Build chain configs — backward compat: if `chains` is empty but `socks5_addr`
     // is present, synthesize a single "default" chain.
     let chain_configs: Vec<ChainConfig> = if params.chains.is_empty() && !params.socks5_addr.is_empty() {
-        vec![ChainConfig { name: "default".to_owned(), socks5_addr: params.socks5_addr.clone(), protocol: ChainProtocol::Socks5 }]
+        vec![ChainConfig { name: "default".to_owned(), socks5_addr: params.socks5_addr.clone(), protocol: ChainProtocol::Socks5, dns_upstream: None }]
     } else {
         params.chains.clone()
     };
@@ -232,7 +232,9 @@ pub async fn activate_tun_inner(
     // Populate the shared chain registry BEFORE starting the ipstack so that
     // IpStackRunner holds a live Arc<ChainRegistry> and always sees current chains.
     let new_map: ChainMap = chain_configs.iter().filter_map(|c| {
-        c.socks5_addr.parse::<SocketAddr>().ok().map(|addr| (c.name.clone(), addr))
+        let socks5_addr = c.socks5_addr.parse::<SocketAddr>().ok()?;
+        let dns_upstream = c.dns_upstream.as_ref().and_then(|d| d.parse::<SocketAddr>().ok());
+        Some((c.name.clone(), ChainEntry { socks5_addr, dns_upstream }))
     }).collect();
     state.chains.update(new_map).await;
 
@@ -459,10 +461,11 @@ async fn post_chains_update(
     Json(params): Json<ChainsUpdateParams>,
 ) -> StatusCode {
     let new_map: ChainMap = params.chains.iter().filter_map(|c| {
-        c.socks5_addr.parse::<SocketAddr>()
+        let socks5_addr = c.socks5_addr.parse::<SocketAddr>()
             .map_err(|e| warn!("chains/update: invalid addr '{}' for '{}': {e}", c.socks5_addr, c.name))
-            .ok()
-            .map(|addr| (c.name.clone(), addr))
+            .ok()?;
+        let dns_upstream = c.dns_upstream.as_ref().and_then(|d| d.parse::<SocketAddr>().ok());
+        Some((c.name.clone(), ChainEntry { socks5_addr, dns_upstream }))
     }).collect();
 
     let count = new_map.len();

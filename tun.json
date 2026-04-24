@@ -1,0 +1,11 @@
+{
+  "socks5_addr": "127.0.0.1:19480",
+  "relay_addrs": ["91.218.245.247", "45.59.119.139"],
+  "chains": [
+    {"name": "default", "socks5_addr": "127.0.0.1:19480", "dns_upstream": "8.8.8.8:53"},
+    {"name": "classic-direct", "socks5_addr": "127.0.0.1:19482", "dns_upstream": "8.8.4.4:53"},
+    {"name": "crypto-relay-classic", "socks5_addr": "127.0.0.1:19483", "dns_upstream": "1.1.1.1:53"},
+    {"name": "three-hop-onion", "socks5_addr": "127.0.0.1:19484", "dns_upstream": "1.0.0.1:53"},
+    {"name": "three-hop-telescopic", "socks5_addr": "127.0.0.1:19486", "dns_upstream": "9.9.9.9:53"}
+  ]
+}

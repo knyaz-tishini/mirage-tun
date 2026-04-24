@@ -4,6 +4,7 @@
   "chains": [
     {
       "chain_id": "classic-direct",
+      "socks5_bind": "127.0.0.1:19482",
       "l1": {
         "addr": "91.218.245.247:4700",
         "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
@@ -46,6 +47,7 @@
     },
     {
       "chain_id": "crypto-relay-classic",
+      "socks5_bind": "127.0.0.1:19483",
       "l1": {
         "addr": "91.218.245.247:4703",
         "public_key": "9eed1443f3a1f86b40d251f8ae965b719190b41cf6c3951561f8bd4701cdfe2f",
@@ -67,6 +69,7 @@
     },
     {
       "chain_id": "three-hop-onion",
+      "socks5_bind": "127.0.0.1:19484",
       "l1": null,
       "l2": {
         "addr": "45.59.119.139:4701",
@@ -102,6 +105,7 @@
     },
     {
       "chain_id": "three-hop-telescopic",
+      "socks5_bind": "127.0.0.1:19486",
       "l1": null,
       "l2": {
         "addr": "45.59.119.139:4701",
