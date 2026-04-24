@@ -1,10 +1,14 @@
 # CHANGELOG — mirage2tun
 
-## Последний стабильный: bf78233 (22 апр 2026)
+## Стабильный: c159484 (24 апр 2026)
 
-`log process name + domain on bypass decisions`
+`docs: changelog — SOCKS5 UDP ASSOCIATE entry`
 
-Локальный клиент работает на этом коммите. Всё до bf78233 включительно — протестировано.
+5 чейнов, per-chain DNS, socks5_fail=0. E2E verified через CLI+TUN 24 апр.
+
+### Предыдущий стабильный: bf78233 (22 апр 2026)
+
+Локальный клиент работал на этом коммите.
 
 ### Коммиты до стабильного
 
@@ -17,7 +21,7 @@
 
 ---
 
-## Нетестированные коммиты после стабильного
+## Коммиты после bf78233 (все протестированы 24 апр)
 
 1. **2424548** (23 апр 01:54) — 9 audit fixes: route cleanup, UDP bypass, IPv6 WFP, policy persistence
 2. **30c1ae8** (23 апр 02:11) — multi-chain SOCKS5 routing — PolicyDecision routes to named chains
@@ -35,7 +39,11 @@
 14. **2b5443e** (23 апр 19:31) — remove etherparse + spin deps from mirage-tcpip-stack
 15. **3626bd3** (24 апр) — cross-platform TUN stack: core traits + Linux + macOS + Android + iOS (5673 LOC)
 16. **1007c99** (24 апр) — WindowsTunStack wrapper + chains/dns_map migrated to core imports
-17. **0b6ba4b** (24 апр) — SOCKS5 UDP ASSOCIATE proxy (replaces hard UDP drop), iOS/Android dns_upstream fix
+17. **8327a21** (24 апр) — docs: update CHANGELOG — Windows wrapper + consumer integration
+18. **374a583** (24 апр) — fix: Android/iOS/macOS platform backends — wire traffic loops + fix channels
+19. **3418d92** (24 апр) — multi-chain registry + per-chain DNS upstream
+20. **0b6ba4b** (24 апр) — SOCKS5 UDP ASSOCIATE proxy (replaces hard UDP drop)
+21. **c159484** (24 апр) — docs: changelog — SOCKS5 UDP ASSOCIATE entry
 
 ---
 
