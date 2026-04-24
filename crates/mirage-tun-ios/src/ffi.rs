@@ -109,6 +109,7 @@ pub unsafe extern "C" fn mirage_tun_start(
         .map(|c| ChainConfig {
             name: c.name.clone(),
             socks5_addr: c.socks5_addr.to_string(),
+            dns_upstream: None,
             protocol: mirage_tun_core::chains::ChainProtocol::Socks5,
         })
         .collect();
@@ -247,7 +248,10 @@ pub unsafe extern "C" fn mirage_tun_update_chains(
             ctx_ref.rt_handle.block_on(async move {
                 let new_map = entries
                     .into_iter()
-                    .map(|e| (e.name, e.socks5_addr))
+                    .map(|e| (e.name, mirage_tun_core::chains::ChainEntry {
+                        socks5_addr: e.socks5_addr,
+                        dns_upstream: None,
+                    }))
                     .collect();
                 registry.update(new_map).await;
             });
@@ -287,6 +291,8 @@ struct FfiStackConfig {
 struct FfiChainEntry {
     name: String,
     socks5_addr: String,
+    #[serde(default)]
+    dns_upstream: Option<String>,
 }
 
 fn default_mtu() -> u16 {

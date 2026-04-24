@@ -538,6 +538,7 @@ mod android {
                 .map(|c| ChainConfig {
                     name: c.name.clone(),
                     socks5_addr: c.socks5_addr.clone(),
+                    dns_upstream: None,
                     protocol: mirage_tun_core::chains::ChainProtocol::Socks5,
                 })
                 .collect();

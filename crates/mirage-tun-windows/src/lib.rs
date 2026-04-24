@@ -15,6 +15,7 @@ pub mod stack;
 pub mod state;
 pub mod tcp_acceptor;
 pub mod udp_socket;
+pub mod udp_socks5;
 pub mod wintun;
 
 pub use stack::WindowsTunStack;

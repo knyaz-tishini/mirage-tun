@@ -121,6 +121,8 @@ impl IpStackRunner {
             metrics,
             active_conns.clone(),
         ));
+        let udp_proxy_sessions: crate::udp_socks5::UdpProxySessionMap =
+            Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(udp_dns_loop(
             udp_socket,
             chain_registry,
@@ -133,6 +135,7 @@ impl IpStackRunner {
             dns_cache_ttl,
             dns_cache_max,
             dns_concurrency,
+            udp_proxy_sessions,
         ));
 
         // Stats printer
@@ -580,6 +583,20 @@ fn create_udp_bypass_socket(_if_index: u32) -> std::io::Result<tokio::net::UdpSo
     tokio::net::UdpSocket::from_std(std_sock)
 }
 
+/// pub(crate) wrapper for use by udp_socks5.
+/// For SOCKS5 relay on localhost, always pass if_index=0.
+pub(crate) fn create_udp_bypass_socket_for_proxy(if_index: u32) -> std::io::Result<tokio::net::UdpSocket> {
+    create_udp_bypass_socket(if_index)
+}
+
+/// pub(crate) wrapper for use by udp_socks5.
+pub(crate) async fn connect_via_interface_pub(
+    remote: SocketAddr,
+    if_index: u32,
+) -> std::io::Result<TcpStream> {
+    connect_via_interface(remote, if_index).await
+}
+
 async fn udp_dns_loop(
     udp_socket: UdpSocket,
     chain_registry: Arc<ChainRegistry>,
@@ -592,6 +609,7 @@ async fn udp_dns_loop(
     dns_cache_ttl: std::time::Duration,
     dns_cache_max: usize,
     dns_concurrency: usize,
+    udp_proxy_sessions: crate::udp_socks5::UdpProxySessionMap,
 ) {
     let (mut read_half, write_half) = udp_socket.split();
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<UdpMsg>();
@@ -635,7 +653,31 @@ async fn udp_dns_loop(
                             )
                             .await;
                         } else {
-                            warn!("UDP non-DNS {dst_addr}: Chain policy — dropped (SOCKS5 UDP not supported)");
+                            // Proxy non-DNS UDP through SOCKS5 UDP ASSOCIATE
+                            let chain_snap = chain_registry.snapshot().await;
+                            let socks5_addr = match &decision {
+                                PolicyDecision::Chain(name) => {
+                                    chain_snap.get(name.as_str())
+                                        .or_else(|| chain_snap.get("default"))
+                                        .or_else(|| chain_snap.values().next())
+                                        .map(|e| e.socks5_addr)
+                                }
+                                PolicyDecision::Bypass => unreachable!("bypass handled above"),
+                            };
+                            if let Some(socks5_addr) = socks5_addr {
+                                crate::udp_socks5::udp_proxy_forward(
+                                    payload,
+                                    src_addr,
+                                    dst_addr,
+                                    resp_tx.clone(),
+                                    udp_proxy_sessions.clone(),
+                                    socks5_addr,
+                                    if_index,
+                                )
+                                .await;
+                            } else {
+                                warn!("UDP {dst_addr}: no chain available — dropped");
+                            }
                         }
                         continue;
                     }
