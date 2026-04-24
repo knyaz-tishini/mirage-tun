@@ -35,6 +35,7 @@
 14. **2b5443e** (23 апр 19:31) — remove etherparse + spin deps from mirage-tcpip-stack
 15. **3626bd3** (24 апр) — cross-platform TUN stack: core traits + Linux + macOS + Android + iOS (5673 LOC)
 16. **1007c99** (24 апр) — WindowsTunStack wrapper + chains/dns_map migrated to core imports
+17. **0b6ba4b** (24 апр) — SOCKS5 UDP ASSOCIATE proxy (replaces hard UDP drop), iOS/Android dns_upstream fix
 
 ---
 
@@ -49,3 +50,4 @@
 - **Windows TunStack wrapper** — WindowsTunStack реализует TunStack trait поверх существующего IpStackRunner. WintunTcpAcceptor/WintunUdpSocket оборачивают mirage_tcpip_stack. chains.rs/dns_map.rs мигрированы на re-export из core
 - **Consumer integration** — mirage2web/mirage-client-core получил tun_platform.rs с compile-time `PlatformStack` selection (#[cfg] по платформам). mirage2web теперь не импортирует платформенные крейты напрямую
 - **Multi-chain + per-chain DNS** — TUN теперь видит все 5 чейнов (вместо 1 "default"). Каждый чейн имеет свой `dns_upstream` — если чейн лёг, DNS остальных продолжает работать. `ChainMap` хранит `ChainEntry { socks5_addr, dns_upstream }` вместо голого `SocketAddr`. tun.json вынесен из target/ в корень репо, build.rs автокопирует рядом с бинарём
+- **SOCKS5 UDP ASSOCIATE** — полный стек UDP через SOCKS5: TUN делает UDP ASSOCIATE хендшейк, клиент открывает tunnel с "udp:" префиксом, exit node открывает UdpSocket. Per-flow сессии с 30s idle timeout. Заменяет hard drop non-DNS UDP пакетов
