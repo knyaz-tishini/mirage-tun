@@ -343,8 +343,15 @@ async fn tcp_accept_loop(
                             let socks5_addr = match chain_snap.get(&chain_name).map(|e| e.socks5_addr) {
                                 Some(addr) => addr,
                                 None => {
-                                    warn!("TCP {dst}: chain '{chain_name}' not found in registry — dropping");
-                                    continue;
+                                    if let Some(addr) = chain_snap.get("default").map(|e| e.socks5_addr)
+                                        .or_else(|| chain_snap.values().next().map(|e| e.socks5_addr))
+                                    {
+                                        warn!("TCP {dst}: chain '{chain_name}' not found, falling back");
+                                        addr
+                                    } else {
+                                        warn!("TCP {dst}: no chains available — dropping");
+                                        continue;
+                                    }
                                 }
                             };
                             let sem = socks5_semaphore.clone();
