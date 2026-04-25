@@ -7,5 +7,12 @@
     {"name": "crypto-relay-classic", "socks5_addr": "127.0.0.1:19483", "dns_upstream": "1.1.1.1:53"},
     {"name": "three-hop-onion", "socks5_addr": "127.0.0.1:19484", "dns_upstream": "1.0.0.1:53"},
     {"name": "three-hop-telescopic", "socks5_addr": "127.0.0.1:19486", "dns_upstream": "9.9.9.9:53"}
-  ]
+  ],
+  "policy": {
+    "rules": [
+      {"type": "dest_app_dir", "dir": "E:\\MU\\", "action": "bypass"},
+      {"type": "dest_domain", "domain": ".ru", "action": "bypass"}
+    ],
+    "default_action": "mirage"
+  }
 }
