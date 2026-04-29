@@ -72,6 +72,8 @@ impl IpStackRunner {
             .enable_udp(true)
             .enable_icmp(false)
             .mtu(1500)
+            .tcp_send_buffer_size(cfg.tcp_send_buffer_size)
+            .tcp_recv_buffer_size(cfg.tcp_recv_buffer_size)
             .add_ip_filter_fn(move |_src, dst| !relay_set2.contains(dst))
             .build()
             .map_err(TunError::SmoltcpBuild)?;

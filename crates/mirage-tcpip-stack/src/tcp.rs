@@ -34,9 +34,11 @@ use crate::{
     Runner,
 };
 
-// NOTE: Default buffer could contain 20 AEAD packets
-const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 0x3FFF * 20;
-const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 0x3FFF * 20;
+/// Default TCP socket-level send/recv buffer — 512 KB.
+/// Used by `TcpListener::new` unless overridden via `send_buffer_size`/`recv_buffer_size`.
+pub const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 0x3FFF * 8; // ~524 KB
+/// Default TCP socket-level recv buffer — 512 KB.
+pub const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 0x3FFF * 8; // ~524 KB
 
 /// Established sockets with no send/recv activity for this long are aborted.
 /// Covers peers that vanish without sending FIN (e.g. mobile handoff, NAT expiry).
@@ -100,12 +102,14 @@ impl TcpListenerRunner {
         tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         sockets: HashMap<SocketHandle, SharedControl>,
+        send_buffer_size: u32,
+        recv_buffer_size: u32,
     ) -> Runner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
             let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, send_buffer_size, recv_buffer_size) => v,
                 v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
             };
             res?;
@@ -121,6 +125,8 @@ impl TcpListenerRunner {
         mut tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         socket_tx: UnboundedSender<TcpSocketCreation>,
+        send_buffer_size: u32,
+        recv_buffer_size: u32,
     ) -> std::io::Result<()> {
         while let Some(frame) = tcp_rx.recv().await {
             Self::process_one_frame(
@@ -130,6 +136,8 @@ impl TcpListenerRunner {
                 &stream_tx,
                 &socket_tx,
                 frame,
+                send_buffer_size,
+                recv_buffer_size,
             )?;
 
             // Drain any additional packets already in the channel —
@@ -142,6 +150,8 @@ impl TcpListenerRunner {
                     &stream_tx,
                     &socket_tx,
                     frame,
+                    send_buffer_size,
+                    recv_buffer_size,
                 )?;
             }
         }
@@ -155,6 +165,8 @@ impl TcpListenerRunner {
         stream_tx: &UnboundedSender<TcpStream>,
         socket_tx: &UnboundedSender<TcpSocketCreation>,
         frame: AnyIpPktFrame,
+        send_buffer_size: u32,
+        recv_buffer_size: u32,
     ) -> std::io::Result<()> {
         let packet = match IpPacket::new_checked(frame.as_slice()) {
             Ok(p) => p,
@@ -194,8 +206,8 @@ impl TcpListenerRunner {
         // TCP first handshake packet, create a new Connection
         if packet.syn() && !packet.ack() {
             let mut socket = TcpSocket::new(
-                TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
-                TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                TcpSocketBuffer::new(vec![0u8; recv_buffer_size as usize]),
+                TcpSocketBuffer::new(vec![0u8; send_buffer_size as usize]),
             );
             socket.set_keep_alive(Some(Duration::from_secs(28)));
             socket.set_timeout(Some(Duration::from_secs(7200)));
@@ -211,9 +223,9 @@ impl TcpListenerRunner {
 
             let now = std::time::Instant::now();
             let control = Arc::new(SpinMutex::new(TcpSocketControl {
-                send_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                send_buffer: RingBuffer::new(vec![0u8; send_buffer_size as usize]),
                 send_waker: None,
-                recv_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
+                recv_buffer: RingBuffer::new(vec![0u8; recv_buffer_size as usize]),
                 recv_waker: None,
                 recv_state: TcpSocketState::Normal,
                 send_state: TcpSocketState::Normal,
@@ -501,6 +513,8 @@ impl TcpListener {
         tcp_rx: Receiver<AnyIpPktFrame>,
         stack_tx: Sender<AnyIpPktFrame>,
         mtu: usize,
+        send_buffer_size: u32,
+        recv_buffer_size: u32,
     ) -> std::io::Result<(Runner, Self)> {
         let (mut device, iface_ingress_tx, iface_ingress_tx_avail) =
             VirtualDevice::new(stack_tx, mtu);
@@ -516,6 +530,8 @@ impl TcpListener {
             tcp_rx,
             stream_tx,
             HashMap::new(),
+            send_buffer_size,
+            recv_buffer_size,
         );
 
         Ok((runner, Self { stream_rx }))

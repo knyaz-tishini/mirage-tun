@@ -30,6 +30,14 @@ pub struct TunConfig {
     /// Optional Bearer token sent to the monitor on every request.
     #[serde(default)]
     pub monitor_api_key: Option<String>,
+    /// Per-connection TCP send buffer size inside smoltcp (bytes).
+    /// Default: 524288 (512 KB).
+    #[serde(default = "default_tcp_send_buffer_size")]
+    pub tcp_send_buffer_size: u32,
+    /// Per-connection TCP recv buffer size inside smoltcp (bytes).
+    /// Default: 524288 (512 KB).
+    #[serde(default = "default_tcp_recv_buffer_size")]
+    pub tcp_recv_buffer_size: u32,
 }
 
 fn default_api_bind() -> SocketAddr {
@@ -68,6 +76,14 @@ fn default_drain_timeout_secs() -> u64 {
     5
 }
 
+fn default_tcp_send_buffer_size() -> u32 {
+    mirage_tcpip_stack::tcp::DEFAULT_TCP_SEND_BUFFER_SIZE
+}
+
+fn default_tcp_recv_buffer_size() -> u32 {
+    mirage_tcpip_stack::tcp::DEFAULT_TCP_RECV_BUFFER_SIZE
+}
+
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
@@ -82,6 +98,8 @@ impl Default for TunConfig {
             drain_timeout_secs: default_drain_timeout_secs(),
             monitor_url: None,
             monitor_api_key: None,
+            tcp_send_buffer_size: default_tcp_send_buffer_size(),
+            tcp_recv_buffer_size: default_tcp_recv_buffer_size(),
         }
     }
 }

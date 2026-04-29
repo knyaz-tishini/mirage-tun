@@ -27,6 +27,10 @@ pub struct StackBuilder {
     tcp_buffer_size: usize,
     mtu: usize,
     ip_filters: IpFilters<'static>,
+    /// Per-connection TCP send buffer allocated inside smoltcp (bytes).
+    tcp_send_buffer_size: u32,
+    /// Per-connection TCP recv buffer allocated inside smoltcp (bytes).
+    tcp_recv_buffer_size: u32,
 }
 
 impl Default for StackBuilder {
@@ -40,6 +44,8 @@ impl Default for StackBuilder {
             tcp_buffer_size: 512,
             mtu: 1504, // 1500 for Ethernet + 4 for VLAN
             ip_filters: IpFilters::with_non_broadcast(),
+            tcp_send_buffer_size: crate::tcp::DEFAULT_TCP_SEND_BUFFER_SIZE,
+            tcp_recv_buffer_size: crate::tcp::DEFAULT_TCP_RECV_BUFFER_SIZE,
         }
     }
 }
@@ -99,6 +105,18 @@ impl StackBuilder {
         self
     }
 
+    /// Set per-connection TCP send buffer size in bytes (default: 512 KB).
+    pub fn tcp_send_buffer_size(mut self, size: u32) -> Self {
+        self.tcp_send_buffer_size = size;
+        self
+    }
+
+    /// Set per-connection TCP recv buffer size in bytes (default: 512 KB).
+    pub fn tcp_recv_buffer_size(mut self, size: u32) -> Self {
+        self.tcp_recv_buffer_size = size;
+        self
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn build(
         self,
@@ -139,7 +157,13 @@ impl StackBuilder {
         let udp_socket = udp_rx.map(|udp_rx| UdpSocket::new(udp_rx, stack_tx.clone()));
 
         let (tcp_runner, tcp_listener) = if let Some(tcp_rx) = tcp_rx {
-            let (tcp_runner, tcp_listener) = TcpListener::new(tcp_rx, stack_tx, self.mtu)?;
+            let (tcp_runner, tcp_listener) = TcpListener::new(
+                tcp_rx,
+                stack_tx,
+                self.mtu,
+                self.tcp_send_buffer_size,
+                self.tcp_recv_buffer_size,
+            )?;
             (Some(tcp_runner), Some(tcp_listener))
         } else {
             (None, None)
