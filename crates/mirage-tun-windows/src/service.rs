@@ -209,6 +209,17 @@ pub async fn run_service_logic(
     let tun_addr = tun_cfg.tun_addr.clone();
     let api_bind = tun_cfg.api_bind;
 
+    // ── Memory guard ──────────────────────────────────────────────────────────
+    // TUN runs as a Windows service; on fatal pressure exit(0) so the SCM /
+    // d-watchdog restarts the service cleanly.
+    let _memory_guard = crate::runtime_guard::MemoryGuard::spawn(
+        crate::runtime_guard::MemoryGuardConfig::default(),
+        Box::new(|| {
+            tracing::warn!("mirage2tun memory guard: fatal threshold — exiting for respawn");
+            std::process::exit(0);
+        }),
+    );
+
     // Stale state cleanup
     cleanup_stale_routes(&tun_name).await;
     crate::proxy::clear_system_proxy().await;

@@ -32,6 +32,22 @@ enum Cmd {
 }
 
 fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        tracing::error!(location = %location, message = %msg, "panic — process exiting for respawn");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::process::exit(1);
+    }));
+
     let cli = Cli::parse();
 
     match cli.command {

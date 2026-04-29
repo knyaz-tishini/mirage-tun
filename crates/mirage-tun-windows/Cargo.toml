@@ -38,3 +38,4 @@ clap = { version = "4", features = ["derive"] }
 mirage-dns = { path = "../mirage-dns" }
 async-trait = "0.1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+sysinfo = "0.32"

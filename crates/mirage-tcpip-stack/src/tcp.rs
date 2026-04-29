@@ -26,7 +26,7 @@ use tokio::{
         Notify,
     },
 };
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 use crate::{
     device::VirtualDevice,
@@ -37,6 +37,20 @@ use crate::{
 // NOTE: Default buffer could contain 20 AEAD packets
 const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 0x3FFF * 20;
 const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 0x3FFF * 20;
+
+/// Established sockets with no send/recv activity for this long are aborted.
+/// Covers peers that vanish without sending FIN (e.g. mobile handoff, NAT expiry).
+pub const IDLE_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Half-closed sockets (CloseWait / FinWait2 / Closing / LastAck / TimeWait)
+/// that linger for this long are aborted.  These should complete quickly;
+/// a 60-second cap prevents buffer-leaks when the peer disappears mid-teardown.
+pub const HALF_CLOSED_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Minimum age a socket must reach before the idle-reaper considers it.
+/// Prevents aborting brand-new connections that haven't yet exchanged the
+/// first byte (SYN-RECEIVED → ESTABLISHED transition takes a round trip).
+const REAPER_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
@@ -53,6 +67,14 @@ struct TcpSocketControl {
     recv_waker: Option<Waker>,
     recv_state: TcpSocketState,
     send_state: TcpSocketState,
+    /// Wall-clock instant of the last successful send or recv on this socket.
+    /// Updated by the `handle_socket` loop whenever bytes flow.  Used by the
+    /// idle-reaper to decide when to abort stale connections.
+    last_active: std::time::Instant,
+    /// Wall-clock instant when this socket was created (SYN received).
+    /// The reaper ignores sockets younger than `REAPER_GRACE_PERIOD` so that
+    /// connections that haven't exchanged the first byte yet are not killed.
+    creation_time: std::time::Instant,
 }
 
 struct TcpSocketCreation {
@@ -187,6 +209,7 @@ impl TcpListenerRunner {
 
             trace!("created TCP connection for {} <-> {}", src_addr, dst_addr);
 
+            let now = std::time::Instant::now();
             let control = Arc::new(SpinMutex::new(TcpSocketControl {
                 send_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
                 send_waker: None,
@@ -194,6 +217,8 @@ impl TcpListenerRunner {
                 recv_waker: None,
                 recv_state: TcpSocketState::Normal,
                 send_state: TcpSocketState::Normal,
+                last_active: now,
+                creation_time: now,
             }));
 
             stream_tx
@@ -290,7 +315,10 @@ impl TcpListenerRunner {
                     });
 
                     match result {
-                        Ok(..) => wake_receiver = true,
+                        Ok(..) => {
+                            wake_receiver = true;
+                            control.last_active = std::time::Instant::now();
+                        }
                         Err(err) => {
                             error!("socket recv error: {:?}, {:?}", err, socket.state());
 
@@ -343,7 +371,10 @@ impl TcpListenerRunner {
                     });
 
                     match result {
-                        Ok(..) => wake_sender = true,
+                        Ok(..) => {
+                            wake_sender = true;
+                            control.last_active = std::time::Instant::now();
+                        }
                         Err(err) => {
                             error!("socket send error: {:?}, {:?}", err, socket.state());
 
@@ -371,6 +402,64 @@ impl TcpListenerRunner {
             for socket_handle in sockets_to_remove {
                 sockets.remove(&socket_handle);
                 socket_set.remove(socket_handle);
+            }
+
+            // ── Idle-socket reaper ────────────────────────────────────────────
+            // Walk all live sockets and abort those that have been silent too
+            // long.  Two thresholds:
+            //   • IDLE_KILL_TIMEOUT     — fully Established, no bytes flowing
+            //   • HALF_CLOSED_KILL_TIMEOUT — lingering teardown states
+            //
+            // Sockets younger than REAPER_GRACE_PERIOD are always skipped so
+            // that brand-new connections completing their SYN/SYN-ACK handshake
+            // are not killed before the first byte arrives.
+            {
+                let reaper_now = std::time::Instant::now();
+                let mut reaper_abort = Vec::new();
+
+                for (handle, control) in sockets.iter() {
+                    let socket = socket_set.get_mut::<TcpSocket>(*handle);
+                    let ctrl = lock_control(control);
+
+                    // Skip sockets still in early establishment phases —
+                    // they haven't had a chance to transfer data yet.
+                    if reaper_now.duration_since(ctrl.creation_time) < REAPER_GRACE_PERIOD {
+                        continue;
+                    }
+
+                    let idle = reaper_now.duration_since(ctrl.last_active);
+                    let state = socket.state();
+
+                    let should_abort = match state {
+                        TcpState::Established => idle >= IDLE_KILL_TIMEOUT,
+                        TcpState::CloseWait
+                        | TcpState::FinWait2
+                        | TcpState::Closing
+                        | TcpState::LastAck
+                        | TcpState::TimeWait => idle >= HALF_CLOSED_KILL_TIMEOUT,
+                        // All other states (Listen, SynSent, SynReceived, FinWait1,
+                        // Closed) are either transient or already handled elsewhere.
+                        _ => false,
+                    };
+
+                    if should_abort {
+                        let peer = socket.remote_endpoint();
+                        reaper_abort.push((*handle, peer, state, idle));
+                    }
+                }
+
+                for (handle, peer, state, idle) in reaper_abort {
+                    warn!(
+                        "idle-reaper: aborting {} socket peer={:?} idle={:.1}s",
+                        state,
+                        peer,
+                        idle.as_secs_f64(),
+                    );
+                    let socket = socket_set.get_mut::<TcpSocket>(handle);
+                    socket.abort();
+                    // The next poll iteration will see state == Closed and
+                    // enqueue the handle in sockets_to_remove normally.
+                }
             }
 
             // If poll processed something, immediately loop again — there
