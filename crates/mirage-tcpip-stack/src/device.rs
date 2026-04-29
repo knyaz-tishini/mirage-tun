@@ -7,13 +7,14 @@ use crate::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant,
 };
-use tokio::sync::mpsc::{unbounded_channel, Permit, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, Permit, Receiver, Sender};
 
 use crate::packet::AnyIpPktFrame;
+use crate::tcp::INGRESS_CHANNEL_SIZE;
 
 pub(super) struct VirtualDevice {
     in_buf_avail: Arc<AtomicBool>,
-    in_buf: UnboundedReceiver<Vec<u8>>,
+    in_buf: Receiver<Vec<u8>>,
     out_buf: Sender<AnyIpPktFrame>,
     mtu: usize,
 }
@@ -22,9 +23,9 @@ impl VirtualDevice {
     pub(super) fn new(
         iface_egress_tx: Sender<AnyIpPktFrame>,
         mtu: usize,
-    ) -> (Self, UnboundedSender<Vec<u8>>, Arc<AtomicBool>) {
+    ) -> (Self, Sender<Vec<u8>>, Arc<AtomicBool>) {
         let iface_ingress_tx_avail = Arc::new(AtomicBool::new(false));
-        let (iface_ingress_tx, iface_ingress_rx) = unbounded_channel();
+        let (iface_ingress_tx, iface_ingress_rx) = channel(INGRESS_CHANNEL_SIZE);
         (
             Self {
                 in_buf_avail: iface_ingress_tx_avail.clone(),

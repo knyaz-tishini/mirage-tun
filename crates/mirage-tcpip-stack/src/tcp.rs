@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
@@ -22,11 +22,36 @@ use std::sync::Mutex as SpinMutex;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{
-        mpsc::{unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+        mpsc::{channel, Receiver, Sender},
         Notify,
     },
 };
 use tracing::{error, trace, warn};
+
+/// Capacity of the wintun→smoltcp ingress packet channel.
+pub const INGRESS_CHANNEL_SIZE: usize = 4096;
+/// Capacity of the newly-accepted TcpStream channel.
+pub const STREAM_CHANNEL_SIZE: usize = 1024;
+/// Capacity of the internal socket-creation event channel.
+pub const SOCKET_EVENT_CHANNEL_SIZE: usize = 1024;
+
+/// Monotonically-incrementing drop counters shared between the packet handler
+/// and the periodic logger task.
+pub(crate) struct DropCounters {
+    pub dropped_ingress: AtomicU64,
+    pub dropped_streams: AtomicU64,
+    pub dropped_socket_events: AtomicU64,
+}
+
+impl DropCounters {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            dropped_ingress: AtomicU64::new(0),
+            dropped_streams: AtomicU64::new(0),
+            dropped_socket_events: AtomicU64::new(0),
+        })
+    }
+}
 
 use crate::{
     device::VirtualDevice,
@@ -97,19 +122,41 @@ impl TcpListenerRunner {
     fn create(
         device: VirtualDevice,
         iface: Interface,
-        iface_ingress_tx: UnboundedSender<Vec<u8>>,
+        iface_ingress_tx: Sender<Vec<u8>>,
         iface_ingress_tx_avail: Arc<AtomicBool>,
         tcp_rx: Receiver<AnyIpPktFrame>,
-        stream_tx: UnboundedSender<TcpStream>,
+        stream_tx: Sender<TcpStream>,
         sockets: HashMap<SocketHandle, SharedControl>,
         send_buffer_size: u32,
         recv_buffer_size: u32,
     ) -> Runner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
-            let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
+            let (socket_tx, socket_rx) = channel::<TcpSocketCreation>(SOCKET_EVENT_CHANNEL_SIZE);
+            let counters = DropCounters::new();
+
+            // Periodic logger: every 60 s emit a warn! if any drops occurred.
+            let log_counters = counters.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                // Skip the immediate tick so we don't log at t=0.
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let ingress = log_counters.dropped_ingress.swap(0, Ordering::Relaxed);
+                    let streams = log_counters.dropped_streams.swap(0, Ordering::Relaxed);
+                    let sock_ev = log_counters.dropped_socket_events.swap(0, Ordering::Relaxed);
+                    if ingress > 0 || streams > 0 || sock_ev > 0 {
+                        warn!(
+                            "tcpip-stack channel drops (last 60s): ingress={} streams={} socket_events={}",
+                            ingress, streams, sock_ev
+                        );
+                    }
+                }
+            });
+
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, send_buffer_size, recv_buffer_size) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, send_buffer_size, recv_buffer_size, counters) => v,
                 v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
             };
             res?;
@@ -120,13 +167,14 @@ impl TcpListenerRunner {
 
     async fn handle_packet(
         notify: SharedNotify,
-        iface_ingress_tx: UnboundedSender<Vec<u8>>,
+        iface_ingress_tx: Sender<Vec<u8>>,
         iface_ingress_tx_avail: Arc<AtomicBool>,
         mut tcp_rx: Receiver<AnyIpPktFrame>,
-        stream_tx: UnboundedSender<TcpStream>,
-        socket_tx: UnboundedSender<TcpSocketCreation>,
+        stream_tx: Sender<TcpStream>,
+        socket_tx: Sender<TcpSocketCreation>,
         send_buffer_size: u32,
         recv_buffer_size: u32,
+        counters: Arc<DropCounters>,
     ) -> std::io::Result<()> {
         while let Some(frame) = tcp_rx.recv().await {
             Self::process_one_frame(
@@ -138,6 +186,7 @@ impl TcpListenerRunner {
                 frame,
                 send_buffer_size,
                 recv_buffer_size,
+                &counters,
             )?;
 
             // Drain any additional packets already in the channel —
@@ -152,6 +201,7 @@ impl TcpListenerRunner {
                     frame,
                     send_buffer_size,
                     recv_buffer_size,
+                    &counters,
                 )?;
             }
         }
@@ -160,13 +210,14 @@ impl TcpListenerRunner {
 
     fn process_one_frame(
         notify: &SharedNotify,
-        iface_ingress_tx: &UnboundedSender<Vec<u8>>,
+        iface_ingress_tx: &Sender<Vec<u8>>,
         iface_ingress_tx_avail: &Arc<AtomicBool>,
-        stream_tx: &UnboundedSender<TcpStream>,
-        socket_tx: &UnboundedSender<TcpSocketCreation>,
+        stream_tx: &Sender<TcpStream>,
+        socket_tx: &Sender<TcpSocketCreation>,
         frame: AnyIpPktFrame,
         send_buffer_size: u32,
         recv_buffer_size: u32,
+        counters: &DropCounters,
     ) -> std::io::Result<()> {
         let packet = match IpPacket::new_checked(frame.as_slice()) {
             Ok(p) => p,
@@ -178,11 +229,21 @@ impl TcpListenerRunner {
 
         // Specially handle icmp packet by TCP interface.
         if matches!(packet.protocol(), IpProtocol::Icmp | IpProtocol::Icmpv6) {
-            iface_ingress_tx
-                .send(frame)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-            iface_ingress_tx_avail.store(true, Ordering::Release);
-            notify.notify_one();
+            match iface_ingress_tx.try_send(frame) {
+                Ok(_) => {
+                    iface_ingress_tx_avail.store(true, Ordering::Release);
+                    notify.notify_one();
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    counters.dropped_ingress.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "iface_ingress_tx closed",
+                    ));
+                }
+            }
             return Ok(());
         }
 
@@ -233,25 +294,60 @@ impl TcpListenerRunner {
                 creation_time: now,
             }));
 
-            stream_tx
-                .send(TcpStream {
-                    src_addr,
-                    dst_addr,
-                    notify: notify.clone(),
-                    control: control.clone(),
-                })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-            socket_tx
-                .send(TcpSocketCreation { control, socket })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+            let stream = TcpStream {
+                src_addr,
+                dst_addr,
+                notify: notify.clone(),
+                control: control.clone(),
+            };
+            match stream_tx.try_send(stream) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Consumer is not keeping up — drop this incoming connection.
+                    // The SYN packet is still forwarded to smoltcp below, but
+                    // no TcpStream reaches the consumer; smoltcp will RST it
+                    // naturally when the socket is never polled.
+                    counters.dropped_streams.fetch_add(1, Ordering::Relaxed);
+                    // Still pipeline the SYN frame so smoltcp can RST cleanly.
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "stream_tx closed",
+                    ));
+                }
+            }
+
+            match socket_tx.try_send(TcpSocketCreation { control, socket }) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    counters.dropped_socket_events.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "socket_tx closed",
+                    ));
+                }
+            }
         }
 
         // Pipeline tcp stream packet
-        iface_ingress_tx
-            .send(frame)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-        iface_ingress_tx_avail.store(true, Ordering::Release);
-        notify.notify_one();
+        match iface_ingress_tx.try_send(frame) {
+            Ok(_) => {
+                iface_ingress_tx_avail.store(true, Ordering::Release);
+                notify.notify_one();
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                counters.dropped_ingress.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "iface_ingress_tx closed",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -261,7 +357,7 @@ impl TcpListenerRunner {
         mut iface: Interface,
         iface_ingress_tx_avail: Arc<AtomicBool>,
         mut sockets: HashMap<SocketHandle, SharedControl>,
-        mut socket_rx: UnboundedReceiver<TcpSocketCreation>,
+        mut socket_rx: Receiver<TcpSocketCreation>,
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
         loop {
@@ -505,7 +601,7 @@ impl TcpListenerRunner {
 }
 
 pub struct TcpListener {
-    stream_rx: UnboundedReceiver<TcpStream>,
+    stream_rx: Receiver<TcpStream>,
 }
 
 impl TcpListener {
@@ -520,7 +616,7 @@ impl TcpListener {
             VirtualDevice::new(stack_tx, mtu);
         let iface = Self::create_interface(&mut device)?;
 
-        let (stream_tx, stream_rx) = unbounded_channel();
+        let (stream_tx, stream_rx) = channel(STREAM_CHANNEL_SIZE);
 
         let runner = TcpListenerRunner::create(
             device,
