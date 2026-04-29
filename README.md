@@ -2,6 +2,14 @@
 
 Windows Service — Wintun адаптер, split tunnel, multi-chain routing, app-based bypass, policy engine, DNS (over TCP via SOCKS5), WFP kill-switch, системный прокси. Работает в связке с mirage2web client.
 
+## Место в L0 stack
+
+`mirage2tun` — низкоуровневый перехватчик пакетов. Часть **L0 stack клиента** вместе с `mirage-l0-sentinel` и `mirage-client-cli` (см. `mirage2app/CLAUDE.md`).
+
+Стандартный поток: monitor → sentinel → cli → TUN (через `POST /chains/update`). TUN сам в монитор **не ходит** — chains получает от cli.
+
+В `TunConfig` есть optional `monitor_url` + `monitor_api_key` (etap E), включающий собственный MonitorLink в TUN. Это **fallback для headless сценариев без cli/sentinel** (server-side TUN, mobile native service). На обычной desktop-конфигурации не использовать — sentinel + cli уже покрывают.
+
 **Статус (2026-04-23): Production-ready** — 0.3s latency, split tunnel, multi-chain routing, app-based bypass, per-chain metrics, configurable runtime, graceful drain. 14 API endpoints.
 
 ## Workspace crates
