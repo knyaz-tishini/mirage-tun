@@ -1,6 +1,7 @@
 pub mod api;
 pub mod chains;
 pub mod config;
+pub mod monitor_link;
 pub mod dns_map;
 pub mod error;
 pub mod firewall;

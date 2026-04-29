@@ -247,6 +247,17 @@ pub async fn run_service_logic(
         config: Arc::clone(&tun_cfg),
     });
 
+    // Spawn MonitorLink if monitor_url is configured.
+    if let Some(monitor_url) = tun_cfg.monitor_url.clone() {
+        info!("MonitorLink: connecting to monitor at {monitor_url}");
+        let (link, chain_rx) = crate::monitor_link::MonitorLink::new(
+            monitor_url,
+            tun_cfg.monitor_api_key.clone(),
+        );
+        link.spawn();
+        crate::monitor_link::spawn_chain_watcher(chain_rx, Arc::clone(&app_state.chains));
+    }
+
     let router = crate::api::build_router(Arc::clone(&app_state));
     let listener = tokio::net::TcpListener::bind(api_bind).await?;
     info!("Management API listening on {api_bind}");

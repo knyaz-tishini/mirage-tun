@@ -21,6 +21,15 @@ pub struct TunConfig {
     pub socks5_concurrency: usize,
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
+    /// Optional: URL of mirage2monitor to pull chain config from.
+    /// When set, mirage2tun spawns an internal MonitorLink and updates the
+    /// chain registry automatically — no mirage2app required.
+    /// Example: `"http://127.0.0.1:19410"`
+    #[serde(default)]
+    pub monitor_url: Option<String>,
+    /// Optional Bearer token sent to the monitor on every request.
+    #[serde(default)]
+    pub monitor_api_key: Option<String>,
 }
 
 fn default_api_bind() -> SocketAddr {
@@ -71,6 +80,8 @@ impl Default for TunConfig {
             dns_concurrency: default_dns_concurrency(),
             socks5_concurrency: default_socks5_concurrency(),
             drain_timeout_secs: default_drain_timeout_secs(),
+            monitor_url: None,
+            monitor_api_key: None,
         }
     }
 }
