@@ -43,6 +43,7 @@ impl IpStackRunner {
         native_dns: Option<SocketAddr>,
         process_resolver: Arc<ProcessResolver>,
         metrics: Arc<MetricsRegistry>,
+        connections: Arc<crate::metrics::ConnectionRegistry>,
         cfg: &TunConfig,
     ) -> Result<Self> {
         // Snapshot for logging only — not used in the hot path.
@@ -121,6 +122,7 @@ impl IpStackRunner {
             dns_map.clone(),
             process_resolver,
             metrics,
+            connections,
             active_conns.clone(),
         ));
         let udp_proxy_sessions: crate::udp_socks5::UdpProxySessionMap =
@@ -270,6 +272,7 @@ async fn tcp_accept_loop(
     dns_map: Arc<DnsMap>,
     process_resolver: Arc<ProcessResolver>,
     metrics: Arc<MetricsRegistry>,
+    connections: Arc<crate::metrics::ConnectionRegistry>,
     active_conns: Arc<AtomicU64>,
 ) {
     loop {
@@ -317,6 +320,8 @@ async fn tcp_accept_loop(
                                 exe_short.as_deref().unwrap_or("?"));
                             let metrics2 = metrics.clone();
                             metrics2.record_bypass_connection();
+                            let conns = connections.clone();
+                            conns.record_open("__bypass__", dst, domain_hint.clone());
                             let ac = active_conns.clone();
                             ac.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
@@ -328,6 +333,7 @@ async fn tcp_accept_loop(
                                             Ok((tx, rx)) => {
                                                 stats2.bypass_ok.fetch_add(1, Ordering::Relaxed);
                                                 metrics2.record_bypass_bytes(tx, rx);
+                                                conns.record_bytes("__bypass__", dst, tx, rx);
                                             }
                                             Err(e) => {
                                                 stats2.bypass_fail.fetch_add(1, Ordering::Relaxed);
@@ -359,6 +365,9 @@ async fn tcp_accept_loop(
                             let sem = socks5_semaphore.clone();
                             let metrics2 = metrics.clone();
                             metrics2.record_connection(&chain_name);
+                            let conns = connections.clone();
+                            conns.record_open(&chain_name, dst, domain_hint.clone());
+                            let chain_for_task = chain_name.clone();
                             let ac = active_conns.clone();
                             ac.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
@@ -369,12 +378,13 @@ async fn tcp_accept_loop(
                                         match r {
                                             Ok((tx, rx)) => {
                                                 stats2.socks5_ok.fetch_add(1, Ordering::Relaxed);
-                                                metrics2.record_bytes(&chain_name, tx, rx);
+                                                metrics2.record_bytes(&chain_for_task, tx, rx);
+                                                conns.record_bytes(&chain_for_task, dst, tx, rx);
                                             }
                                             Err(e) => {
                                                 stats2.socks5_fail.fetch_add(1, Ordering::Relaxed);
-                                                metrics2.record_error(&chain_name);
-                                                warn!("IpStackRunner: TCP {dst} chain '{chain_name}' error: {e}");
+                                                metrics2.record_error(&chain_for_task);
+                                                warn!("IpStackRunner: TCP {dst} chain '{chain_for_task}' error: {e}");
                                             }
                                         }
                                     }

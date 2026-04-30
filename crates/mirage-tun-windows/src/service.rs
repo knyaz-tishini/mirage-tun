@@ -239,6 +239,8 @@ pub async fn run_service_logic(
     let dns_map = Arc::new(crate::dns_map::DnsMap::new());
     let chains = Arc::new(crate::chains::ChainRegistry::empty());
     let metrics = Arc::new(MetricsRegistry::new());
+    let connections = Arc::new(crate::metrics::ConnectionRegistry::new());
+    crate::metrics::spawn_gc(Arc::clone(&connections));
 
     let mut svc_state = ServiceState::new(tun_name.clone());
     svc_state.wintun = wintun;
@@ -255,6 +257,7 @@ pub async fn run_service_logic(
         dns_map,
         chains,
         metrics,
+        connections,
         config: Arc::clone(&tun_cfg),
     });
 

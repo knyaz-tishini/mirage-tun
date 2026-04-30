@@ -67,6 +67,7 @@ pub struct AppState {
     pub dns_map: Arc<crate::dns_map::DnsMap>,
     pub chains: Arc<ChainRegistry>,
     pub metrics: Arc<MetricsRegistry>,
+    pub connections: Arc<crate::metrics::ConnectionRegistry>,
     pub config: Arc<TunConfig>,
 }
 
@@ -85,6 +86,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/chains/list", get(get_chains_list))
         .route("/chains/update", post(post_chains_update))
         .route("/metrics", get(get_metrics))
+        .route("/connections", get(get_connections))
         .with_state(state)
 }
 
@@ -251,6 +253,7 @@ pub async fn activate_tun_inner(
         native_dns,
         process_resolver,
         Arc::clone(&state.metrics),
+        Arc::clone(&state.connections),
         &state.config,
     )
     .await?;
@@ -503,6 +506,12 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     let rule_hits = state.metrics.rule_hits();
     let snapshot = state.metrics.snapshot(&rule_hits);
     Json(serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null))
+}
+
+/// `GET /connections` — list of active TCP destinations grouped by chain.
+/// Used by the launcher to render the live routing tree.
+async fn get_connections(State(state): State<Arc<AppState>>) -> Json<Vec<crate::metrics::ConnSnapshot>> {
+    Json(state.connections.snapshot())
 }
 
 fn map_err(e: TunError) -> (StatusCode, Json<ErrorBody>) {

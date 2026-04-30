@@ -97,7 +97,7 @@
         }
       ],
       "handshake": "ephemeral",
-      "reply": "raw",
+      "reply": "onion",
       "protocol": "Mirage",
       "priority": 0,
       "shaping": "none",
@@ -133,7 +133,7 @@
         }
       ],
       "handshake": "telescopic",
-      "reply": "raw",
+      "reply": "onion",
       "protocol": "Mirage",
       "priority": 0,
       "shaping": "none",

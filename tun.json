@@ -11,7 +11,9 @@
   "policy": {
     "rules": [
       {"type": "dest_app_dir", "dir": "E:\\MU\\", "action": "bypass"},
-      {"type": "dest_domain", "domain": ".ru", "action": "bypass"}
+      {"type": "dest_domain", "domain": ".ru", "action": "bypass"},
+      {"type": "dest_domain", "domain": ".рф", "action": "bypass"},
+      {"type": "dest_domain", "domain": ".xn--p1ai", "action": "bypass"}
     ],
     "default_action": "mirage"
   }
