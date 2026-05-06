@@ -14,6 +14,7 @@ use mirage_tun_core::traits::{TunDevice, private::Sealed};
 mod macos_impl {
     use super::*;
     use std::os::unix::io::{FromRawFd, IntoRawFd};
+    use tracing::debug;
 
     pub const PF_SYSTEM: libc::c_int = 32;
     pub const SYSPROTO_CONTROL: libc::c_int = 2;

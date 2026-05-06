@@ -8,7 +8,8 @@
 ///   5. Sets up routing (0/1 + 128/1 trick).
 ///   6. Configures DNS.
 ///   7. Spawns TUN read loop that feeds packets into the UDP channel.
-///   8. Returns `StackHandle<MacosKernelTcpAcceptor, MacosKernelUdpSocket>`.
+///   8. Spawns memory guard and route monitor.
+///   9. Returns `StackHandle<MacosKernelTcpAcceptor, MacosKernelUdpSocket>`.
 ///
 /// The macOS kernel handles TCP natively — no smoltcp required.
 use crate::{
@@ -17,7 +18,9 @@ use crate::{
     firewall::MacosFirewall,
     kernel_tcp::MacosKernelTcpAcceptor,
     kernel_udp::MacosKernelUdpSocket,
+    route_monitor::spawn_route_monitor,
     routing::MacosRouting,
+    runtime_guard::{MemoryGuard, MemoryGuardConfig},
     tun_device::MacosTunDevice,
 };
 use async_trait::async_trait;
@@ -27,6 +30,7 @@ use mirage_tun_core::{
     traits::{PlatformDns, PlatformFirewall, PlatformRouting, TunDevice, TunStack, StackHandle, private::Sealed},
 };
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -65,11 +69,14 @@ impl TunStack for MacosTunStack {
         }
 
         // 4. Add bypass routes for relay addresses and set default route
-        let mut routing = MacosRouting::new();
-        for relay in &cfg.relay_addrs {
-            routing.add_bypass_host(*relay).await?;
+        let routing = Arc::new(Mutex::new(MacosRouting::new()));
+        {
+            let mut r = routing.lock().await;
+            for relay in &cfg.relay_addrs {
+                r.add_bypass_host(*relay).await?;
+            }
+            r.set_default_route(&tun_name).await?;
         }
-        routing.set_default_route(&tun_name).await?;
 
         // 5. Set DNS
         let mut dns = MacosDns::new();
@@ -97,6 +104,7 @@ impl TunStack for MacosTunStack {
         // TCP packets are handled by the kernel — no further action needed for TCP.
         let read_metrics = Arc::clone(&metrics);
         let read_cancel = cancel.clone();
+        let routing_teardown = Arc::clone(&routing);
         tokio::spawn(async move {
             let mut buf = Vec::with_capacity(1504);
             loop {
@@ -128,8 +136,11 @@ impl TunStack for MacosTunStack {
             }
 
             // Teardown on loop exit
-            if let Err(e) = routing.restore_routes().await {
-                error!("restore routes failed: {}", e);
+            {
+                let mut r = routing_teardown.lock().await;
+                if let Err(e) = r.restore_routes().await {
+                    error!("restore routes failed: {}", e);
+                }
             }
             if let Err(e) = dns.revert_dns().await {
                 error!("revert DNS failed: {}", e);
@@ -161,6 +172,15 @@ impl TunStack for MacosTunStack {
                 }
             }
         });
+
+        // Memory guard — exits process on fatal RSS pressure so sentinel can respawn.
+        let _memory_guard = MemoryGuard::spawn(MemoryGuardConfig::default(), Box::new(|| {
+            tracing::error!("memory guard fatal — exiting");
+            std::process::exit(1);
+        }));
+
+        // Route monitor — re-applies /1 routes if they drift (e.g. after sleep/wake).
+        spawn_route_monitor(tun_name, Arc::clone(&routing), cancel.clone());
 
         Ok(StackHandle {
             tcp: tcp_acceptor,
