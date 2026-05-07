@@ -65,8 +65,12 @@ pub fn spawn_route_monitor(
 }
 
 async fn check_default_route(expected_iface: &str) -> Result<bool, String> {
+    // Probe with a public IP that falls under our 0.0.0.0/1 override.
+    // `route get 0.0.0.0` always resolves to the system /0 default and would
+    // give a false-positive drift on every tick.  8.8.8.8 picks the most
+    // specific /1 route — must point at our utun.
     let out = tokio::process::Command::new("route")
-        .args(["-n", "get", "0.0.0.0"])
+        .args(["-n", "get", "8.8.8.8"])
         .output()
         .await
         .map_err(|e| e.to_string())?;

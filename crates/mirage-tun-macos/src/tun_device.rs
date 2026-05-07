@@ -250,9 +250,14 @@ mod macos_impl {
         use tokio::process::Command;
 
         let addr = addr_cidr.split('/').next().unwrap_or(addr_cidr);
+        // P2P utun: derive a distinct peer IP so the kernel accepts a /0 route
+        // through it.  WireGuard / Tailscale do the same — local x.x.x.2,
+        // peer x.x.x.1.  Same-IP P2P (`utun3 10.7.0.2 10.7.0.2`) blocks
+        // `route add 0.0.0.0/0 <peer>` with "Network is unreachable".
+        let peer = derive_peer(addr);
 
         let out = Command::new("ifconfig")
-            .args([iface, addr, addr, "mtu", &mtu.to_string(), "up"])
+            .args([iface, addr, &peer, "mtu", &mtu.to_string(), "up"])
             .output()
             .await
             .map_err(MacosTunError::Io)?;
@@ -263,8 +268,19 @@ mod macos_impl {
             return Err(MacosTunError::Ifconfig(stderr));
         }
 
-        debug!("configured {} addr={} mtu={}", iface, addr, mtu);
+        debug!("configured {} addr={} peer={} mtu={}", iface, addr, peer, mtu);
         Ok(())
+    }
+
+    fn derive_peer(local: &str) -> String {
+        let parts: Vec<&str> = local.split('.').collect();
+        if parts.len() == 4 {
+            if let Ok(last) = parts[3].parse::<u8>() {
+                let peer_last = if last == 1 { 2 } else { 1 };
+                return format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], peer_last);
+            }
+        }
+        local.to_string()
     }
 }
 

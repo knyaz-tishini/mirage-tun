@@ -19,6 +19,9 @@ pub struct MacosRouting {
     bypassed_hosts: Vec<IpAddr>,
     /// TUN interface name (set when `set_default_route` is called).
     tun_name: Option<String>,
+    /// TUN peer IP (gateway to use for default route).  WireGuard convention:
+    /// local x.x.x.2 ↔ peer x.x.x.1.
+    tun_peer: Option<IpAddr>,
 }
 
 impl MacosRouting {
@@ -27,7 +30,13 @@ impl MacosRouting {
             original_gateway: None,
             bypassed_hosts: Vec::new(),
             tun_name: None,
+            tun_peer: None,
         }
+    }
+
+    /// Set the TUN peer IP — must be called before `set_default_route`.
+    pub fn set_tun_peer(&mut self, peer: IpAddr) {
+        self.tun_peer = Some(peer);
     }
 }
 
@@ -44,24 +53,30 @@ impl PlatformRouting for MacosRouting {
     type Error = MacosTunError;
 
     async fn set_default_route(&mut self, tun_name: &str) -> Result<(), Self::Error> {
-        // 1. Save original gateway
         let gw = get_default_gateway().await?;
         info!("original gateway: {}", gw);
         self.original_gateway = Some(gw);
         self.tun_name = Some(tun_name.to_string());
 
-        // 2. Add bypass routes for already-registered relay addresses using the
-        //    original gateway (must happen before we override the default route).
+        // Bypass routes for relay addresses through the original gateway —
+        // must be installed BEFORE we add the /1 overrides, otherwise our
+        // own SOCKS5 traffic to the relay hops would loop back into the TUN.
         for relay in self.bypassed_hosts.clone() {
             add_host_route(relay, gw).await?;
         }
 
-        // 3. Override default route with two /1 routes through TUN
-        //    (0.0.0.0/1 + 128.0.0.0/1 are more specific than /0 default).
-        run_route(&["add", "-net", "0.0.0.0/1", "-interface", tun_name]).await?;
-        run_route(&["add", "-net", "128.0.0.0/1", "-interface", tun_name]).await?;
+        // 0.0.0.0/1 + 128.0.0.0/1 trick — two /1 nets are more specific than
+        // the system default /0, so we override without deleting the original
+        // (which keeps the relay bypass reachable).  macOS `route` accepts
+        // `-interface utun3` for /1 nets but rejects it for /0; either way
+        // we never touch the system default route directly.
+        let peer = self.tun_peer.ok_or_else(|| MacosTunError::GatewayParse(
+            "tun_peer must be set before set_default_route on macOS".into()
+        ))?;
+        run_route(&["add", "-net", "0.0.0.0/1", &peer.to_string()]).await?;
+        run_route(&["add", "-net", "128.0.0.0/1", &peer.to_string()]).await?;
 
-        info!("default route via {} (0/1 + 128/1 trick)", tun_name);
+        info!("default route via {} peer={} (0/1 + 128/1 trick)", tun_name, peer);
         Ok(())
     }
 
@@ -73,11 +88,12 @@ impl PlatformRouting for MacosRouting {
 
         // Delete /1 override routes
         for net in &["0.0.0.0/1", "128.0.0.0/1"] {
-            match run_route(&["delete", "-net", net, "-interface", &tun_name]).await {
+            match run_route(&["delete", "-net", net]).await {
                 Ok(()) => {}
                 Err(e) => warn!("delete route {} failed: {}", net, e),
             }
         }
+        let _ = tun_name; // keep variable for the outer match; restore complete
 
         // Remove bypass host routes
         if let Some(gw) = self.original_gateway {
