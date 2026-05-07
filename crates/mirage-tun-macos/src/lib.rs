@@ -4,6 +4,7 @@
 //! Uses the native macOS utun kernel control socket for the TUN device and
 //! mirage-tcpip-stack (smoltcp) for userspace TCP/UDP demultiplexing.
 
+pub mod api;
 pub mod dns;
 pub mod dns_route;
 pub mod error;

@@ -1,10 +1,11 @@
 use clap::Parser;
 use mirage_tun_core::policy::{PolicyConfigRequest, PolicyDecision};
 use mirage_tun_core::stack_config::{ChainDnsConfig, ChainEntry, StackConfig};
-use mirage_tun_macos::MacosTunStack;
+use mirage_tun_macos::{api, MacosTunStack};
 use mirage_tun_core::traits::TunStack;
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -48,6 +49,8 @@ struct BinConfig {
     socks5_concurrency: usize,
     #[serde(default)]
     per_chain_tun: bool,
+    #[serde(default = "default_api_bind")]
+    api_bind: String,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +65,7 @@ struct BinChainDnsConfig {
     servers: Vec<IpAddr>,
 }
 
+fn default_api_bind() -> String { "127.0.0.1:19485".to_string() }
 fn default_mtu() -> u16 { 1500 }
 fn default_true() -> bool { true }
 fn default_dns_upstream() -> SocketAddr { "8.8.8.8:53".parse().expect("static addr") }
@@ -137,6 +141,7 @@ fn main() {
             std::process::exit(1);
         });
 
+        let api_bind_str = bin_cfg.api_bind.clone();
         let cfg: StackConfig = bin_cfg.into();
 
         let cancel = CancellationToken::new();
@@ -169,7 +174,14 @@ fn main() {
         }
 
         match MacosTunStack::start(cfg, cancel.clone()).await {
-            Ok(_handle) => {
+            Ok(handle) => {
+                let api_bind: SocketAddr = api_bind_str.parse().unwrap_or_else(|e| {
+                    tracing::error!(val = %api_bind_str, err = %e, "invalid api_bind — using default");
+                    "127.0.0.1:19485".parse().expect("hardcoded fallback is valid")
+                });
+                let metrics_clone = Arc::clone(&handle.metrics);
+                tokio::spawn(api::serve(api_bind, metrics_clone, cancel.child_token()));
+
                 cancel.cancelled().await;
                 tracing::info!("cancelled — exiting");
             }
