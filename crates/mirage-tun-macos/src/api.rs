@@ -6,15 +6,16 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use mirage_tun_core::metrics::StackMetrics;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::metrics::MetricsRegistry;
+
 struct AppState {
-    metrics: Arc<StackMetrics>,
+    metrics: Arc<MetricsRegistry>,
 }
 
-pub async fn serve(bind: SocketAddr, metrics: Arc<StackMetrics>, cancel: CancellationToken) {
+pub async fn serve(bind: SocketAddr, metrics: Arc<MetricsRegistry>, cancel: CancellationToken) {
     let state = Arc::new(AppState { metrics });
     let router = Router::new()
         .route("/health", get(get_health))

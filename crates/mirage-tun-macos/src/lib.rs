@@ -11,6 +11,7 @@ pub mod error;
 pub mod firewall;
 pub mod kernel_tcp;
 pub mod kernel_udp;
+pub mod metrics;
 pub mod route_monitor;
 pub mod routing;
 pub mod runtime_guard;

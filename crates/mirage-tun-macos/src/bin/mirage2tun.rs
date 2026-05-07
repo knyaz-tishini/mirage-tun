@@ -2,10 +2,8 @@ use clap::Parser;
 use mirage_tun_core::policy::{PolicyConfigRequest, PolicyDecision};
 use mirage_tun_core::stack_config::{ChainDnsConfig, ChainEntry, StackConfig};
 use mirage_tun_macos::{api, MacosTunStack};
-use mirage_tun_core::traits::TunStack;
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -173,14 +171,13 @@ fn main() {
             });
         }
 
-        match MacosTunStack::start(cfg, cancel.clone()).await {
-            Ok(handle) => {
+        match MacosTunStack::start_with_metrics(cfg, cancel.clone()).await {
+            Ok((_handle, chain_metrics)) => {
                 let api_bind: SocketAddr = api_bind_str.parse().unwrap_or_else(|e| {
                     tracing::error!(val = %api_bind_str, err = %e, "invalid api_bind — using default");
                     "127.0.0.1:19485".parse().expect("hardcoded fallback is valid")
                 });
-                let metrics_clone = Arc::clone(&handle.metrics);
-                tokio::spawn(api::serve(api_bind, metrics_clone, cancel.child_token()));
+                tokio::spawn(api::serve(api_bind, chain_metrics, cancel.child_token()));
 
                 cancel.cancelled().await;
                 tracing::info!("cancelled — exiting");

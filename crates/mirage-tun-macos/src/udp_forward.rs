@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use mirage_tcpip_stack::udp::UdpMsg;
 use tracing::{debug, warn};
+
+use crate::metrics::ChainMetrics;
 
 const UDP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -24,6 +27,7 @@ pub async fn udp_proxy_forward(
     resp_tx: mpsc::UnboundedSender<UdpMsg>,
     sessions: UdpProxySessionMap,
     socks5_addr: SocketAddr,
+    chain_metrics: Arc<ChainMetrics>,
 ) {
     {
         let map = sessions.lock().await;
@@ -39,14 +43,19 @@ pub async fn udp_proxy_forward(
         map.insert((src_addr, dst_addr), UdpSocks5Session { fwd_tx: fwd_tx.clone() });
     }
     let _ = fwd_tx.try_send(payload);
+    chain_metrics.connections.fetch_add(1, Ordering::Relaxed);
 
     let sessions2 = sessions.clone();
     tokio::spawn(async move {
-        if let Err(e) = udp_proxy_session_task(
+        match udp_proxy_session_task(
             src_addr, dst_addr, socks5_addr,
-            fwd_rx, resp_tx,
+            fwd_rx, resp_tx, Arc::clone(&chain_metrics),
         ).await {
-            debug!("UDP proxy session {src_addr}→{dst_addr} ended: {e}");
+            Ok(()) => {}
+            Err(e) => {
+                debug!("UDP proxy session {src_addr}→{dst_addr} ended: {e}");
+                chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
         sessions2.lock().await.remove(&(src_addr, dst_addr));
     });
@@ -58,6 +67,7 @@ async fn udp_proxy_session_task(
     socks5_addr: SocketAddr,
     mut fwd_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: mpsc::UnboundedSender<UdpMsg>,
+    chain_metrics: Arc<ChainMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_tcp_keepalive, relay_addr) = socks5_udp_associate(socks5_addr).await?;
 
@@ -72,11 +82,13 @@ async fn udp_proxy_session_task(
             msg = tokio::time::timeout(UDP_IDLE_TIMEOUT, fwd_rx.recv()) => {
                 match msg {
                     Ok(Some(data)) => {
+                        let payload_len = data.len() as u64;
                         let framed = build_socks5_udp_request(dst_addr, &data);
                         if let Err(e) = sock.send_to(&framed, relay_addr).await {
                             warn!("UDP proxy: send to relay failed: {e}");
                             break;
                         }
+                        chain_metrics.bytes_tx.fetch_add(payload_len, Ordering::Relaxed);
                     }
                     Ok(None) | Err(_) => break,
                 }
@@ -94,7 +106,9 @@ async fn udp_proxy_session_task(
                                 let payload_start = 3 + header_len;
                                 if payload_start <= n {
                                     let payload = data[payload_start..n].to_vec();
+                                    let payload_len = payload.len() as u64;
                                     let _ = resp_tx.send((payload, real_src, src_addr));
+                                    chain_metrics.bytes_rx.fetch_add(payload_len, Ordering::Relaxed);
                                 }
                             }
                             Err(e) => {

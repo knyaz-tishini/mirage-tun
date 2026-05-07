@@ -10,6 +10,7 @@ use crate::{
     dns_route::dns_via_socks5,
     error::MacosTunError,
     firewall::MacosFirewall,
+    metrics::MetricsRegistry,
     route_monitor::spawn_route_monitor,
     routing::MacosRouting,
     runtime_guard::{MemoryGuard, MemoryGuardConfig},
@@ -24,7 +25,7 @@ use mirage_tun_core::{
     metrics::StackMetrics,
     stack_config::StackConfig,
     traits::{
-        private::Sealed, PlatformDns, PlatformFirewall, PlatformRouting, StackHandle, TunDevice,
+        private::Sealed, PlatformDns, PlatformFirewall, PlatformRouting, StackHandle,
         TunStack,
     },
 };
@@ -38,17 +39,13 @@ pub struct MacosTunStack;
 
 impl Sealed for MacosTunStack {}
 
-#[async_trait]
-impl TunStack for MacosTunStack {
-    type Device = MacosTunDevice;
-    type Tcp = SmoltcpTcpAcceptor;
-    type Udp = SmoltcpUdpSocket;
-    type Error = MacosTunError;
-
-    async fn start(
+impl MacosTunStack {
+    /// Start the stack and return both the `StackHandle` (for trait compat) and
+    /// the per-chain `MetricsRegistry` (for the API server).
+    pub async fn start_with_metrics(
         cfg: StackConfig,
         cancel: CancellationToken,
-    ) -> Result<StackHandle<Self::Tcp, Self::Udp>, Self::Error> {
+    ) -> Result<(StackHandle<SmoltcpTcpAcceptor, SmoltcpUdpSocket>, Arc<MetricsRegistry>), MacosTunError> {
         if cfg.chains.len() > 1 {
             warn!(
                 "MacosTunStack: {} chains configured — only first chain used for TCP forwarding",
@@ -56,11 +53,13 @@ impl TunStack for MacosTunStack {
             );
         }
 
-        let socks5_addr = cfg
+        let chain_entry = cfg
             .chains
             .first()
-            .map(|c| c.socks5_addr)
             .ok_or_else(|| MacosTunError::Other("no chains configured".to_string()))?;
+
+        let socks5_addr = chain_entry.socks5_addr;
+        let chain_name = chain_entry.name.clone();
 
         // Build per-chain DNS upstream map: chain_name → first server IP as SocketAddr :53.
         // Falls back to cfg.dns_upstream when chain has no entry.
@@ -170,7 +169,15 @@ impl TunStack for MacosTunStack {
 
         let (mut stack_sink, mut stack_stream) = stack.split();
 
-        let metrics = Arc::new(StackMetrics::default());
+        // Per-chain metrics registry — returned to the caller for the API server.
+        let chain_metrics_registry = Arc::new(MetricsRegistry::new());
+        // Pre-register the single chain so it appears in /metrics even before
+        // any connection is made.
+        chain_metrics_registry.get_or_create(&chain_name);
+
+        // Flat StackMetrics kept for StackHandle trait compat (unused by mac api).
+        let flat_metrics = Arc::new(StackMetrics::default());
+
         let device = Arc::new(device);
         let device_writer = Arc::clone(&device);
 
@@ -240,8 +247,10 @@ impl TunStack for MacosTunStack {
 
         // 10. TCP accept loop: smoltcp TcpListener → SOCKS5 forward
         let tcp_cancel = cancel.clone();
+        let tcp_metrics = Arc::clone(&chain_metrics_registry);
+        let tcp_chain_name = chain_name.clone();
         tokio::spawn(async move {
-            tcp_accept_loop(tcp_listener, socks5_addr, tcp_cancel).await;
+            tcp_accept_loop(tcp_listener, socks5_addr, tcp_cancel, tcp_chain_name, tcp_metrics).await;
         });
 
         // 11. UDP forward loop: smoltcp UdpSocket → SOCKS5 UDP ASSOCIATE → chain
@@ -263,6 +272,8 @@ impl TunStack for MacosTunStack {
         // All other UDP → SOCKS5 UDP ASSOCIATE.
         let udp_sessions: UdpProxySessionMap = Arc::new(Mutex::new(HashMap::new()));
         let udp_cancel = cancel.clone();
+        let udp_metrics = Arc::clone(&chain_metrics_registry);
+        let udp_chain_name = chain_name.clone();
         tokio::spawn(async move {
             let mut udp_read = udp_read;
             loop {
@@ -296,6 +307,7 @@ impl TunStack for MacosTunStack {
                                     }
                                 });
                             } else {
+                                let chain_m = udp_metrics.get_or_create(&udp_chain_name);
                                 udp_proxy_forward(
                                     payload,
                                     src_addr,
@@ -303,6 +315,7 @@ impl TunStack for MacosTunStack {
                                     resp_tx.clone(),
                                     udp_sessions.clone(),
                                     socks5_addr,
+                                    chain_m,
                                 ).await;
                             }
                         }
@@ -328,7 +341,23 @@ impl TunStack for MacosTunStack {
         // TCP forwarding is self-contained in tcp_accept_loop; expose noop for StackHandle.
         let tcp = SmoltcpTcpAcceptor::noop();
 
-        Ok(StackHandle { tcp, udp, metrics })
+        Ok((StackHandle { tcp, udp, metrics: flat_metrics }, chain_metrics_registry))
+    }
+}
+
+#[async_trait]
+impl TunStack for MacosTunStack {
+    type Device = MacosTunDevice;
+    type Tcp = SmoltcpTcpAcceptor;
+    type Udp = SmoltcpUdpSocket;
+    type Error = MacosTunError;
+
+    async fn start(
+        cfg: StackConfig,
+        cancel: CancellationToken,
+    ) -> Result<StackHandle<Self::Tcp, Self::Udp>, Self::Error> {
+        let (handle, _chain_metrics) = Self::start_with_metrics(cfg, cancel).await?;
+        Ok(handle)
     }
 }
 
@@ -338,6 +367,8 @@ async fn tcp_accept_loop(
     mut listener: mirage_tcpip_stack::TcpListener,
     socks5_addr: SocketAddr,
     cancel: CancellationToken,
+    chain_name: String,
+    metrics: Arc<MetricsRegistry>,
 ) {
     loop {
         tokio::select! {
@@ -346,7 +377,9 @@ async fn tcp_accept_loop(
             conn = listener.next() => match conn {
                 None => break,
                 Some((stream, _local, remote)) => {
-                    tokio::spawn(forward_tcp(stream, remote, socks5_addr));
+                    metrics.record_connection(&chain_name);
+                    let chain_m = metrics.get_or_create(&chain_name);
+                    tokio::spawn(forward_tcp(stream, remote, socks5_addr, chain_m));
                 }
             }
         }
@@ -361,13 +394,16 @@ async fn forward_tcp(
     mut stream: mirage_tcpip_stack::TcpStream,
     target: SocketAddr,
     socks5_addr: SocketAddr,
+    chain_metrics: Arc<crate::metrics::ChainMetrics>,
 ) {
+    use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut socks = match tokio::net::TcpStream::connect(socks5_addr).await {
         Ok(s) => s,
         Err(e) => {
             warn!("SOCKS5 connect to {} failed: {}", socks5_addr, e);
+            chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
     };
@@ -375,16 +411,19 @@ async fn forward_tcp(
     // Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
     if let Err(e) = socks.write_all(&[0x05, 0x01, 0x00]).await {
         warn!("SOCKS5 greeting write failed: {e}");
+        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
     let mut resp = [0u8; 2];
     if let Err(e) = socks.read_exact(&mut resp).await {
         warn!("SOCKS5 greeting read failed: {e}");
+        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
     if resp[0] != 0x05 || resp[1] != 0x00 {
         warn!("SOCKS5 auth method rejected: {:?}", resp);
+        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -392,6 +431,7 @@ async fn forward_tcp(
     let req = build_socks5_connect(target);
     if let Err(e) = socks.write_all(&req).await {
         warn!("SOCKS5 CONNECT write failed: {e}");
+        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -399,10 +439,12 @@ async fn forward_tcp(
     let mut hdr = [0u8; 4];
     if let Err(e) = socks.read_exact(&mut hdr).await {
         warn!("SOCKS5 CONNECT response read failed: {e}");
+        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
     if hdr[1] != 0x00 {
         warn!("SOCKS5 CONNECT failed, reply code: 0x{:02x}", hdr[1]);
+        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
     // Drain bound address from response
@@ -412,24 +454,33 @@ async fn forward_tcp(
         0x03 => {
             let mut len = [0u8; 1];
             if socks.read_exact(&mut len).await.is_err() {
+                chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             len[0] as usize + 2
         }
         _ => {
             warn!("SOCKS5 unknown atyp: 0x{:02x}", hdr[3]);
+            chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
     };
     let mut tail = vec![0u8; skip];
     if let Err(e) = socks.read_exact(&mut tail).await {
         warn!("SOCKS5 bound addr read failed: {e}");
+        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
     match tokio::io::copy_bidirectional(&mut stream, &mut socks).await {
-        Ok(_) => {}
-        Err(e) => warn!("TCP forward {target} error: {e}"),
+        Ok((tx, rx)) => {
+            chain_metrics.bytes_tx.fetch_add(tx, Ordering::Relaxed);
+            chain_metrics.bytes_rx.fetch_add(rx, Ordering::Relaxed);
+        }
+        Err(e) => {
+            warn!("TCP forward {target} error: {e}");
+            chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
