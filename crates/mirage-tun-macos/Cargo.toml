@@ -9,6 +9,7 @@ path = "src/bin/mirage2tun.rs"
 
 [dependencies]
 mirage-tun-core = { path = "../mirage-tun-core" }
+mirage-tcpip-stack = { path = "../mirage-tcpip-stack" }
 tokio = { version = "1", features = ["net", "io-util", "process", "sync", "rt", "rt-multi-thread", "macros", "fs", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
@@ -22,3 +23,4 @@ serde_json = "1"
 sysinfo = "0.32"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+futures = "0.3"

@@ -1,41 +1,34 @@
-/// macOS TUN stack entry point.
+/// macOS TUN stack — userspace TCP via mirage-tcpip-stack (smoltcp).
 ///
-/// `MacosTunStack::start()`:
-///   1. Opens utun device.
-///   2. Configures address via `ifconfig`.
-///   3. Adds bypass host routes for relay addresses.
-///   4. Sets up pf firewall (kill-switch + TCP rdr rule).
-///   5. Sets up routing (0/1 + 128/1 trick).
-///   6. Configures DNS.
-///   7. Spawns TUN read loop that feeds packets into the UDP channel.
-///   8. Spawns memory guard and route monitor.
-///   9. Returns `StackHandle<MacosKernelTcpAcceptor, MacosKernelUdpSocket>`.
-///
-/// The macOS kernel handles TCP natively — no smoltcp required.
+/// Architecture:
+///   utun fd → read loop → smoltcp Stack (Sink) → TcpListener / UdpSocket
+///   TcpListener → per-conn forward task → SOCKS5 → chain exit
+///   smoltcp Stack (Stream) → write loop → utun fd
 use crate::{
     dns::MacosDns,
     error::MacosTunError,
     firewall::MacosFirewall,
-    kernel_tcp::MacosKernelTcpAcceptor,
-    kernel_udp::MacosKernelUdpSocket,
     route_monitor::spawn_route_monitor,
     routing::MacosRouting,
     runtime_guard::{MemoryGuard, MemoryGuardConfig},
+    smoltcp_acceptor::{SmoltcpTcpAcceptor, SmoltcpUdpSocket},
     tun_device::MacosTunDevice,
 };
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
+use mirage_tcpip_stack::StackBuilder;
 use mirage_tun_core::{
     metrics::StackMetrics,
     stack_config::StackConfig,
-    traits::{PlatformDns, PlatformFirewall, PlatformRouting, TunDevice, TunStack, StackHandle, private::Sealed},
+    traits::{
+        private::Sealed, PlatformDns, PlatformFirewall, PlatformRouting, StackHandle, TunDevice,
+        TunStack,
+    },
 };
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
-
-/// Default TCP intercept port. pf redirects TUN TCP traffic here.
-const DEFAULT_INTERCEPT_PORT: u16 = 7891;
+use tracing::{error, info, warn};
 
 /// macOS TUN stack. Implements `TunStack` from mirage-tun-core.
 pub struct MacosTunStack;
@@ -45,40 +38,62 @@ impl Sealed for MacosTunStack {}
 #[async_trait]
 impl TunStack for MacosTunStack {
     type Device = MacosTunDevice;
-    type Tcp = MacosKernelTcpAcceptor;
-    type Udp = MacosKernelUdpSocket;
+    type Tcp = SmoltcpTcpAcceptor;
+    type Udp = SmoltcpUdpSocket;
     type Error = MacosTunError;
 
     async fn start(
         cfg: StackConfig,
         cancel: CancellationToken,
     ) -> Result<StackHandle<Self::Tcp, Self::Udp>, Self::Error> {
-        // 1. Open utun device (unit=0 → auto-assign)
+        if cfg.chains.len() > 1 {
+            warn!(
+                "MacosTunStack: {} chains configured — only first chain used for TCP forwarding",
+                cfg.chains.len()
+            );
+        }
+
+        let socks5_addr = cfg
+            .chains
+            .first()
+            .map(|c| c.socks5_addr)
+            .ok_or_else(|| MacosTunError::Other("no chains configured".to_string()))?;
+
+        // 1. Open utun device
         let mut device = MacosTunDevice::open(0)?;
 
         // 2. Configure address and MTU
         device.configure(&cfg.tun_addr, cfg.mtu).await?;
 
         let tun_name = device.interface_name().to_string();
-        info!("utun interface: {} addr={} mtu={}", tun_name, cfg.tun_addr, cfg.mtu);
+        info!(
+            "utun interface: {} addr={} mtu={}",
+            tun_name, cfg.tun_addr, cfg.mtu
+        );
 
-        // 3. Set up firewall (pf kill-switch + TCP rdr)
+        // 3. Set up firewall (kill-switch only — no rdr)
         let mut firewall = MacosFirewall::new();
         if cfg.kill_switch {
             firewall.activate(&cfg.relay_addrs, &tun_name, &[53])?;
         }
 
-        // 4. Add bypass routes for relay addresses and set default route
+        // 4. Add bypass routes for relay addresses
         let routing = Arc::new(Mutex::new(MacosRouting::new()));
         {
             let mut r = routing.lock().await;
+            let local_addr = cfg.tun_addr.split('/').next().unwrap_or(&cfg.tun_addr);
+            let peer_addr = derive_peer_ip(local_addr);
+            if let Ok(p) = peer_addr.parse::<std::net::IpAddr>() {
+                r.set_tun_peer(p);
+            }
             for relay in &cfg.relay_addrs {
                 r.add_bypass_host(*relay).await?;
             }
+            // 5. Set default route AFTER stack read loop is about to start
             r.set_default_route(&tun_name).await?;
         }
 
-        // 5. Set DNS
+        // 6. Set DNS
         let mut dns = MacosDns::new();
         if !cfg.chain_dns.is_empty() {
             let servers: Vec<std::net::IpAddr> = cfg
@@ -89,26 +104,43 @@ impl TunStack for MacosTunStack {
             dns.set_dns(&tun_name, &servers).await?;
         }
 
-        // 6. Bind TCP intercept listener
-        let tcp_acceptor = MacosKernelTcpAcceptor::bind(DEFAULT_INTERCEPT_PORT).await?;
+        // 7. Build smoltcp stack
+        let relay_set: Arc<std::collections::HashSet<std::net::IpAddr>> =
+            Arc::new(cfg.relay_addrs.iter().copied().collect());
+        let relay_set2 = relay_set.clone();
 
-        // 7. Create UDP socket pair + spawn TUN read loop
-        let (udp_socket, udp_tx, mut reply_rx) = MacosKernelUdpSocket::new();
+        let (stack, runner, udp_socket_opt, tcp_listener_opt) = StackBuilder::default()
+            .enable_tcp(true)
+            .enable_udp(true)
+            .enable_icmp(false)
+            .mtu(cfg.mtu as usize)
+            .add_ip_filter_fn(move |_src, dst| !relay_set2.contains(dst))
+            .build()
+            .map_err(|e| MacosTunError::Other(format!("smoltcp build: {e}")))?;
+
+        let tcp_listener = tcp_listener_opt
+            .ok_or_else(|| MacosTunError::Other("TCP listener not returned".to_string()))?;
+        let udp_socket = udp_socket_opt
+            .ok_or_else(|| MacosTunError::Other("UDP socket not returned".to_string()))?;
+
+        if let Some(r) = runner {
+            tokio::spawn(r);
+        }
+
+        let (mut stack_sink, mut stack_stream) = stack.split();
+
         let metrics = Arc::new(StackMetrics::default());
-
-        // Wrap device in Arc so the read and write loops can share it.
         let device = Arc::new(device);
         let device_writer = Arc::clone(&device);
 
-        // TUN read loop: receives raw IP packets from utun, dispatches to UDP channel.
-        // TCP packets are handled by the kernel — no further action needed for TCP.
-        let read_metrics = Arc::clone(&metrics);
+        // 8. Read loop: utun fd → smoltcp stack
         let read_cancel = cancel.clone();
         let routing_teardown = Arc::clone(&routing);
         tokio::spawn(async move {
             let mut buf = Vec::with_capacity(1504);
             loop {
                 tokio::select! {
+                    biased;
                     _ = read_cancel.cancelled() => {
                         info!("TUN read loop cancelled");
                         break;
@@ -116,14 +148,11 @@ impl TunStack for MacosTunStack {
                     result = device.read_packet(&mut buf) => {
                         match result {
                             Ok(n) if n > 0 => {
-                                let bytes_rx = &read_metrics.bytes_rx;
-                                bytes_rx.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-
-                                // Dispatch UDP (protocol=17) to the UDP channel.
-                                // TCP (protocol=6) is handled natively by the kernel.
-                                if buf.len() >= 10 && buf[9] == 17 {
-                                    let _ = udp_tx.send(buf.clone()).await;
+                                let pkt = buf.clone();
+                                if let Err(e) = stack_sink.feed(pkt).await {
+                                    warn!("stack sink error: {e}");
                                 }
+                                let _ = stack_sink.flush().await;
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -135,7 +164,6 @@ impl TunStack for MacosTunStack {
                 }
             }
 
-            // Teardown on loop exit
             {
                 let mut r = routing_teardown.lock().await;
                 if let Err(e) = r.restore_routes().await {
@@ -148,44 +176,187 @@ impl TunStack for MacosTunStack {
             if let Err(e) = firewall.deactivate() {
                 error!("firewall deactivate failed: {}", e);
             }
-            // device is dropped here (last Arc ref) — OwnedFd closes the utun fd.
         });
 
-        // Reply write loop: injects crafted UDP reply packets back into the utun fd.
-        // `device_writer` is the second Arc clone — safe to use concurrently with the
-        // read loop because `write_packet` takes `&self` (no exclusive borrow).
+        // 9. Write loop: smoltcp stack → utun fd
         let write_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = write_cancel.cancelled() => break,
-                    pkt = reply_rx.recv() => {
-                        match pkt {
-                            None => break,
-                            Some(p) => {
-                                if let Err(e) = device_writer.write_packet(&p).await {
-                                    error!("TUN write error: {}", e);
-                                }
+                    pkt = stack_stream.next() => match pkt {
+                        Some(Ok(pkt)) => {
+                            if let Err(e) = device_writer.write_packet(&pkt).await {
+                                error!("TUN write error: {}", e);
                             }
                         }
+                        _ => break,
                     }
                 }
             }
         });
 
-        // Memory guard — exits process on fatal RSS pressure so sentinel can respawn.
-        let _memory_guard = MemoryGuard::spawn(MemoryGuardConfig::default(), Box::new(|| {
-            tracing::error!("memory guard fatal — exiting");
-            std::process::exit(1);
-        }));
+        // 10. TCP accept loop: smoltcp TcpListener → SOCKS5 forward
+        let tcp_cancel = cancel.clone();
+        tokio::spawn(async move {
+            tcp_accept_loop(tcp_listener, socks5_addr, tcp_cancel).await;
+        });
 
-        // Route monitor — re-applies /1 routes if they drift (e.g. after sleep/wake).
+        // 11. Memory guard + route monitor
+        let _memory_guard = MemoryGuard::spawn(
+            MemoryGuardConfig::default(),
+            Box::new(|| {
+                tracing::error!("memory guard fatal — exiting");
+                std::process::exit(1);
+            }),
+        );
+
         spawn_route_monitor(tun_name, Arc::clone(&routing), cancel.clone());
 
-        Ok(StackHandle {
-            tcp: tcp_acceptor,
-            udp: udp_socket,
-            metrics,
-        })
+        // UDP: wrap smoltcp UdpSocket in the SmoltcpUdpSocket adapter
+        let udp = SmoltcpUdpSocket::new(udp_socket);
+
+        // TCP: wrap smoltcp TcpListener (already spawned accept loop above).
+        // The SmoltcpTcpAcceptor exposes a channel that the accept loop above
+        // is NOT using — instead we handle forwarding directly in tcp_accept_loop.
+        // For the StackHandle we expose a no-op acceptor since forwarding is
+        // self-contained.  The consumer (bin/mirage2tun.rs) only needs the
+        // handle to exist; actual TCP forwarding happens in the spawned task.
+        let tcp = SmoltcpTcpAcceptor::noop();
+
+        Ok(StackHandle { tcp, udp, metrics })
     }
+}
+
+// ── SOCKS5 TCP forward ────────────────────────────────────────────────────────
+
+async fn tcp_accept_loop(
+    mut listener: mirage_tcpip_stack::TcpListener,
+    socks5_addr: SocketAddr,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            conn = listener.next() => match conn {
+                None => break,
+                Some((stream, _local, remote)) => {
+                    tokio::spawn(forward_tcp(stream, remote, socks5_addr));
+                }
+            }
+        }
+    }
+}
+
+/// Open a SOCKS5 connection to `socks5_addr`, CONNECT to `target`, then
+/// bidirectionally pipe `stream` to the SOCKS5 channel.
+///
+/// SOCKS5 no-auth CONNECT per RFC 1928.
+async fn forward_tcp(
+    mut stream: mirage_tcpip_stack::TcpStream,
+    target: SocketAddr,
+    socks5_addr: SocketAddr,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut socks = match tokio::net::TcpStream::connect(socks5_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("SOCKS5 connect to {} failed: {}", socks5_addr, e);
+            return;
+        }
+    };
+
+    // Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
+    if let Err(e) = socks.write_all(&[0x05, 0x01, 0x00]).await {
+        warn!("SOCKS5 greeting write failed: {e}");
+        return;
+    }
+
+    let mut resp = [0u8; 2];
+    if let Err(e) = socks.read_exact(&mut resp).await {
+        warn!("SOCKS5 greeting read failed: {e}");
+        return;
+    }
+    if resp[0] != 0x05 || resp[1] != 0x00 {
+        warn!("SOCKS5 auth method rejected: {:?}", resp);
+        return;
+    }
+
+    // CONNECT request
+    let req = build_socks5_connect(target);
+    if let Err(e) = socks.write_all(&req).await {
+        warn!("SOCKS5 CONNECT write failed: {e}");
+        return;
+    }
+
+    // Response: VER RSP RSV ATYP ... (min 10 bytes for IPv4)
+    let mut hdr = [0u8; 4];
+    if let Err(e) = socks.read_exact(&mut hdr).await {
+        warn!("SOCKS5 CONNECT response read failed: {e}");
+        return;
+    }
+    if hdr[1] != 0x00 {
+        warn!("SOCKS5 CONNECT failed, reply code: 0x{:02x}", hdr[1]);
+        return;
+    }
+    // Drain bound address from response
+    let skip = match hdr[3] {
+        0x01 => 4 + 2,          // IPv4 + port
+        0x04 => 16 + 2,         // IPv6 + port
+        0x03 => {
+            let mut len = [0u8; 1];
+            if socks.read_exact(&mut len).await.is_err() {
+                return;
+            }
+            len[0] as usize + 2
+        }
+        _ => {
+            warn!("SOCKS5 unknown atyp: 0x{:02x}", hdr[3]);
+            return;
+        }
+    };
+    let mut tail = vec![0u8; skip];
+    if let Err(e) = socks.read_exact(&mut tail).await {
+        warn!("SOCKS5 bound addr read failed: {e}");
+        return;
+    }
+
+    match tokio::io::copy_bidirectional(&mut stream, &mut socks).await {
+        Ok(_) => {}
+        Err(e) => warn!("TCP forward {target} error: {e}"),
+    }
+}
+
+fn build_socks5_connect(target: SocketAddr) -> Vec<u8> {
+    let mut req = Vec::with_capacity(10);
+    req.push(0x05); // VER
+    req.push(0x01); // CMD = CONNECT
+    req.push(0x00); // RSV
+    match target {
+        SocketAddr::V4(v4) => {
+            req.push(0x01); // ATYP = IPv4
+            req.extend_from_slice(&v4.ip().octets());
+            req.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            req.push(0x04); // ATYP = IPv6
+            req.extend_from_slice(&v6.ip().octets());
+            req.extend_from_slice(&v6.port().to_be_bytes());
+        }
+    }
+    req
+}
+
+fn derive_peer_ip(local: &str) -> String {
+    let parts: Vec<&str> = local.split('.').collect();
+    if parts.len() == 4 {
+        if let Ok(last) = parts[3].parse::<u8>() {
+            let peer_last = if last == 1 { 2 } else { 1 };
+            return format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], peer_last);
+        }
+    }
+    local.to_string()
 }
