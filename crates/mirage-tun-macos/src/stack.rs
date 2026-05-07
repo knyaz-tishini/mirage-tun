@@ -7,6 +7,7 @@
 ///   smoltcp Stack (Stream) → write loop → utun fd
 use crate::{
     dns::MacosDns,
+    dns_route::dns_via_socks5,
     error::MacosTunError,
     firewall::MacosFirewall,
     route_monitor::spawn_route_monitor,
@@ -27,7 +28,7 @@ use mirage_tun_core::{
         TunStack,
     },
 };
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::Arc};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -61,26 +62,47 @@ impl TunStack for MacosTunStack {
             .map(|c| c.socks5_addr)
             .ok_or_else(|| MacosTunError::Other("no chains configured".to_string()))?;
 
+        // Build per-chain DNS upstream map: chain_name → first server IP as SocketAddr :53.
+        // Falls back to cfg.dns_upstream when chain has no entry.
+        let chain_dns_map: HashMap<String, SocketAddr> = cfg
+            .chain_dns
+            .iter()
+            .filter_map(|c| {
+                c.servers.first().map(|ip| {
+                    let sa = match ip {
+                        IpAddr::V4(v4) => SocketAddr::from((*v4, 53)),
+                        IpAddr::V6(v6) => SocketAddr::from((*v6, 53)),
+                    };
+                    (c.chain_name.clone(), sa)
+                })
+            })
+            .collect();
+        let global_dns_upstream = cfg.dns_upstream;
+        // For the single-chain macOS stack, pick the first chain's DNS upstream.
+        let dns_upstream_for_chain: SocketAddr = cfg
+            .chains
+            .first()
+            .and_then(|c| chain_dns_map.get(&c.name).copied())
+            .unwrap_or(global_dns_upstream);
+
         // 1. Open utun device
-        let mut device = MacosTunDevice::open(0)?;
-
-        // 2. Configure IPv4 address and MTU
-        device.configure(&cfg.tun_addr, cfg.mtu).await?;
-
+        let device = MacosTunDevice::open(0)?;
         let tun_name = device.interface_name().to_string();
-        info!(
-            "utun interface: {} addr={} mtu={}",
-            tun_name, cfg.tun_addr, cfg.mtu
-        );
 
-        // Optionally configure IPv6 address on the same interface
-        if let Some(ref v6_cidr) = cfg.tun_addr_v6 {
-            if let Err(e) = configure_interface_with_v6(&tun_name, &cfg.tun_addr, Some(v6_cidr.as_str()), cfg.mtu).await {
-                warn!("IPv6 interface configuration failed (non-fatal): {e}");
-            } else {
-                info!("utun inet6 addr={}", v6_cidr);
-            }
-        }
+        // 2. Configure IPv4 (and optional IPv6) on the same interface in one
+        //    ifconfig pass — calling configure() then configure_interface_with_v6()
+        //    runs ifconfig twice on the v4 args and clobbers the P2P peer.
+        configure_interface_with_v6(
+            &tun_name,
+            &cfg.tun_addr,
+            cfg.tun_addr_v6.as_deref(),
+            cfg.mtu,
+        )
+        .await?;
+        info!(
+            "utun interface: {} addr={} v6={:?} mtu={}",
+            tun_name, cfg.tun_addr, cfg.tun_addr_v6, cfg.mtu
+        );
 
         // 3. Set up firewall (kill-switch only — no rdr)
         let mut firewall = MacosFirewall::new();
@@ -236,7 +258,9 @@ impl TunStack for MacosTunStack {
             }
         });
 
-        // Reader half: receive from smoltcp, dispatch per-flow SOCKS5 sessions
+        // Reader half: receive from smoltcp, dispatch per-flow SOCKS5 sessions.
+        // Port 53 → DNS-via-SOCKS5 TCP CONNECT (intercept before UDP ASSOCIATE).
+        // All other UDP → SOCKS5 UDP ASSOCIATE.
         let udp_sessions: UdpProxySessionMap = Arc::new(Mutex::new(HashMap::new()));
         let udp_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -248,14 +272,39 @@ impl TunStack for MacosTunStack {
                     item = futures::StreamExt::next(&mut udp_read) => match item {
                         None => break,
                         Some((payload, src_addr, dst_addr)) => {
-                            udp_proxy_forward(
-                                payload,
-                                src_addr,
-                                dst_addr,
-                                resp_tx.clone(),
-                                udp_sessions.clone(),
-                                socks5_addr,
-                            ).await;
+                            if dst_addr.port() == 53 {
+                                // DNS intercept: TCP CONNECT through chain SOCKS5
+                                // to the configured per-chain (or global) upstream.
+                                // dst_addr.ip() from the guest is ignored — we always
+                                // query dns_upstream_for_chain, matching Windows semantics
+                                // where chain DNS overrides whatever the app asked.
+                                let tx = resp_tx.clone();
+                                let q = payload.clone();
+                                let socks5 = socks5_addr;
+                                let upstream = dns_upstream_for_chain;
+                                tokio::spawn(async move {
+                                    match dns_via_socks5(&q, socks5, upstream).await {
+                                        Ok(response) => {
+                                            // src/dst swap: reply from resolver back to guest.
+                                            let _ = tx.send((response, dst_addr, src_addr));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "DNS via SOCKS5 {upstream} failed: {e}"
+                                            );
+                                        }
+                                    }
+                                });
+                            } else {
+                                udp_proxy_forward(
+                                    payload,
+                                    src_addr,
+                                    dst_addr,
+                                    resp_tx.clone(),
+                                    udp_sessions.clone(),
+                                    socks5_addr,
+                                ).await;
+                            }
                         }
                     }
                 }

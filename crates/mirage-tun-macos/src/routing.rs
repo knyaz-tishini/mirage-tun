@@ -91,12 +91,11 @@ impl PlatformRouting for MacosRouting {
         info!("IPv4 default route via {} peer={} (0/1 + 128/1 trick)", tun_name, peer);
 
         // ── IPv6 (best-effort) ────────────────────────────────────────────────
+        // Save host's original IPv6 gateway if any (for bypass + restore).
         match get_default_gateway_v6().await {
             Ok(gw6) => {
                 info!("original IPv6 gateway: {}", gw6);
                 self.original_v6_gateway = Some(gw6);
-
-                // Bypass host routes for v6 relay addrs
                 for relay in self.bypassed_hosts.clone() {
                     if relay.is_ipv6() {
                         if let Err(e) = add_host_route_v6(relay, gw6).await {
@@ -104,25 +103,28 @@ impl PlatformRouting for MacosRouting {
                         }
                     }
                 }
-
-                if let Some(peer6) = self.tun_peer_v6 {
-                    let peer6_str = peer6.to_string();
-                    let r1 = run_route(&["add", "-inet6", "-net", "::/1", &peer6_str]).await;
-                    let r2 = run_route(&["add", "-inet6", "-net", "8000::/1", &peer6_str]).await;
-                    match (r1, r2) {
-                        (Ok(_), Ok(_)) => {
-                            self.v6_default_set = true;
-                            info!("IPv6 default route via {} peer={} (::/1 + 8000::/1)", tun_name, peer6);
-                        }
-                        (Err(e), _) | (_, Err(e)) => warn!("IPv6 default route failed (non-fatal): {}", e),
-                    }
-                } else {
-                    info!("no tun_peer_v6 configured; skipping IPv6 default route override");
-                }
             }
             Err(e) => {
-                info!("no IPv6 default gateway detected ({}); v6 routing not overridden", e);
+                info!("no native IPv6 default gateway ({}); v6 traffic will only flow through tun", e);
             }
+        }
+
+        // Install ::/1 + 8000::/1 via tun even when host has no native v6 —
+        // exit node may have v6 and clients should reach v6 destinations
+        // through the tunnel regardless of local-network capability.
+        if let Some(peer6) = self.tun_peer_v6 {
+            let peer6_str = peer6.to_string();
+            let r1 = run_route(&["add", "-inet6", "-net", "::/1", &peer6_str]).await;
+            let r2 = run_route(&["add", "-inet6", "-net", "8000::/1", &peer6_str]).await;
+            match (r1, r2) {
+                (Ok(_), Ok(_)) => {
+                    self.v6_default_set = true;
+                    info!("IPv6 default route via {} peer={} (::/1 + 8000::/1)", tun_name, peer6);
+                }
+                (Err(e), _) | (_, Err(e)) => warn!("IPv6 default route failed (non-fatal): {}", e),
+            }
+        } else {
+            info!("no tun_peer_v6 configured; skipping IPv6 default route override");
         }
 
         Ok(())

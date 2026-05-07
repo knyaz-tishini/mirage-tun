@@ -88,12 +88,12 @@ fn build_pf_rules(relay_addrs: &[IpAddr], tun_name: &str, exempt_ports: &[u16]) 
     lines.push("set skip on lo0".to_string());
     lines.push(String::new());
 
-    lines.push("block drop all".to_string());
-    lines.push(format!("block drop out inet6 on egress all"));
+    // PF rule order: pass quick first wins, then block-all default catches the rest.
+    lines.push(format!("pass quick on {tun_name} inet all keep state"));
+    lines.push(format!("pass quick on {tun_name} inet6 all keep state"));
     lines.push(String::new());
-
-    lines.push(format!("pass on {tun_name} inet all keep state"));
-    lines.push(format!("pass on {tun_name} inet6 all keep state"));
+    lines.push("block drop all".to_string());
+    lines.push("block drop out inet6 from any to any".to_string());
     lines.push(String::new());
 
     for relay in relay_addrs {

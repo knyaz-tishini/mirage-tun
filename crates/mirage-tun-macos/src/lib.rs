@@ -5,6 +5,7 @@
 //! mirage-tcpip-stack (smoltcp) for userspace TCP/UDP demultiplexing.
 
 pub mod dns;
+pub mod dns_route;
 pub mod error;
 pub mod firewall;
 pub mod kernel_tcp;

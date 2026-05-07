@@ -24,6 +24,8 @@ struct Cli {
 #[derive(Deserialize)]
 struct BinConfig {
     tun_addr: String,
+    #[serde(default)]
+    tun_addr_v6: Option<String>,
     #[serde(default = "default_mtu")]
     mtu: u16,
     #[serde(default)]
@@ -71,7 +73,7 @@ impl From<BinConfig> for StackConfig {
     fn from(b: BinConfig) -> Self {
         StackConfig {
             tun_addr: b.tun_addr,
-            tun_addr_v6: None,
+            tun_addr_v6: b.tun_addr_v6,
             mtu: b.mtu,
             chains: b.chains.into_iter().map(|c| ChainEntry { name: c.name, socks5_addr: c.socks5_addr }).collect(),
             policy: PolicyConfigRequest {
