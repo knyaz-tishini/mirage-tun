@@ -9,6 +9,10 @@ pub struct TunConfig {
     pub tun_name: String,
     #[serde(default = "default_tun_addr")]
     pub tun_addr: String,
+    /// Optional IPv6 address for the TUN interface (e.g. "fd00:7::2/64").
+    /// None = v4-only (backward-compat default).
+    #[serde(default)]
+    pub tun_addr_v6: Option<String>,
     #[serde(default = "default_dns_upstream")]
     pub dns_upstream: SocketAddr,
     #[serde(default = "default_dns_cache_ttl_secs")]
@@ -90,6 +94,7 @@ impl Default for TunConfig {
             api_bind: default_api_bind(),
             tun_name: default_tun_name(),
             tun_addr: default_tun_addr(),
+            tun_addr_v6: None,
             dns_upstream: default_dns_upstream(),
             dns_cache_ttl_secs: default_dns_cache_ttl_secs(),
             dns_cache_max: default_dns_cache_max(),

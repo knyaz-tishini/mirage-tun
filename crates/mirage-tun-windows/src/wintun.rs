@@ -201,13 +201,14 @@ pub struct WintunHandle {
 }
 
 impl WintunHandle {
-    pub async fn create(tun_name: &str, tun_addr: &str, mtu: u16) -> Result<Self> {
+    pub async fn create(tun_name: &str, tun_addr: &str, tun_addr_v6: Option<&str>, mtu: u16) -> Result<Self> {
         let name = tun_name.to_owned();
         let addr = tun_addr.to_owned();
-        let shared = tokio::task::spawn_blocking(move || create_wintun_shared(&name, &addr, mtu))
+        let addr_v6 = tun_addr_v6.map(str::to_owned);
+        let shared = tokio::task::spawn_blocking(move || create_wintun_shared(&name, &addr, addr_v6.as_deref(), mtu))
             .await
             .map_err(|e| TunError::Wintun(format!("spawn_blocking panicked: {e}")))??;
-        info!(name = tun_name, addr = tun_addr, mtu, "WintunHandle created");
+        info!(name = tun_name, addr = tun_addr, ?tun_addr_v6, mtu, "WintunHandle created");
         Ok(Self { shared: Arc::new(shared) })
     }
 
@@ -252,6 +253,7 @@ impl WintunDevice {
 fn create_wintun_shared(
     tun_name: &str,
     tun_addr: &str,
+    tun_addr_v6: Option<&str>,
     mtu: u16,
 ) -> Result<WintunShared> {
     // Dynamically load wintun.dll.
@@ -315,8 +317,15 @@ fn create_wintun_shared(
 
     let adapter = WintunAdapter(adapter_ptr);
 
-    // Assign IP address via netsh before starting the session.
+    // Assign IPv4 address via netsh before starting the session.
     assign_ip_address(tun_name, tun_addr, mtu)?;
+
+    // Optionally assign IPv6 address.
+    if let Some(v6) = tun_addr_v6 {
+        if let Err(e) = assign_ip6_address(tun_name, v6) {
+            warn!("failed to assign IPv6 address {v6} to {tun_name} (non-fatal): {e}");
+        }
+    }
 
     // Wait for the adapter to stabilize.
     wait_interface_ready(tun_name);
@@ -432,6 +441,24 @@ fn prefix_to_netmask(prefix_len: u8) -> String {
     };
     let [a, b, c, d] = bits.to_be_bytes();
     format!("{a}.{b}.{c}.{d}")
+}
+
+fn assign_ip6_address(tun_name: &str, tun_addr_v6: &str) -> Result<()> {
+    // tun_addr_v6 is "fd00:7::2/64" — split into addr + prefix.
+    let (addr_str, prefix_str) = tun_addr_v6
+        .split_once('/')
+        .ok_or_else(|| TunError::Wintun(format!(
+            "tun_addr_v6 '{}' is not in CIDR notation",
+            tun_addr_v6
+        )))?;
+
+    run_netsh(&[
+        "interface", "ipv6", "add", "address",
+        tun_name, &format!("{addr_str}/{prefix_str}"),
+    ])?;
+
+    info!(name = tun_name, addr = tun_addr_v6, "IPv6 address assigned");
+    Ok(())
 }
 
 fn run_netsh(args: &[&str]) -> Result<()> {

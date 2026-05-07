@@ -224,7 +224,7 @@ pub async fn run_service_logic(
     cleanup_stale_routes(&tun_name).await;
     crate::proxy::clear_system_proxy().await;
 
-    let wintun = match WintunHandle::create(&tun_name, &tun_addr, TUN_MTU).await {
+    let wintun = match WintunHandle::create(&tun_name, &tun_addr, tun_cfg.tun_addr_v6.as_deref(), TUN_MTU).await {
         Ok(w) => {
             info!("Wintun adapter '{tun_name}' ready");
             Some(w)

@@ -6,6 +6,9 @@ use crate::policy::PolicyConfigRequest;
 pub struct StackConfig {
     /// Tunnel interface address + prefix (e.g. "10.0.85.1/24").
     pub tun_addr: String,
+    /// Optional IPv6 address for the TUN interface (e.g. "fd00:7::2/64").
+    /// None = v4-only TUN (backward-compat default).
+    pub tun_addr_v6: Option<String>,
     pub mtu: u16,
     /// Chain registry: name → SOCKS5 addr.
     pub chains: Vec<ChainEntry>,
@@ -15,7 +18,7 @@ pub struct StackConfig {
     pub chain_dns: Vec<ChainDnsConfig>,
     /// Kill-switch: block non-tunnel traffic.
     pub kill_switch: bool,
-    /// Relay/server addresses that must never route through TUN.
+    /// Relay/server addresses that must never route through TUN (v4 and v6).
     pub relay_addrs: Vec<IpAddr>,
     /// Per-chain DNS upstream for the DoT/DoH proxy inside the stack.
     pub dns_upstream: SocketAddr,

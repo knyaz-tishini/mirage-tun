@@ -50,9 +50,14 @@ impl TunStack for WindowsTunStack {
         cancel: CancellationToken,
     ) -> Result<StackHandle<WintunTcpAcceptor, WintunUdpSocket>, mirage_tun_core::error::TunError> {
         // ── Step 1: Create and configure Wintun adapter ──────────────────────
-        let handle = WintunHandle::create("mirage0", &cfg.tun_addr, cfg.mtu)
-            .await
-            .map_err(win_err)?;
+        let handle = WintunHandle::create(
+            "mirage0",
+            &cfg.tun_addr,
+            cfg.tun_addr_v6.as_deref(),
+            cfg.mtu,
+        )
+        .await
+        .map_err(win_err)?;
         let device = WintunDevice::new(&handle);
         let (wintun_rx, wintun_tx) = device.take_channels();
 

@@ -71,6 +71,7 @@ impl From<BinConfig> for StackConfig {
     fn from(b: BinConfig) -> Self {
         StackConfig {
             tun_addr: b.tun_addr,
+            tun_addr_v6: None,
             mtu: b.mtu,
             chains: b.chains.into_iter().map(|c| ChainEntry { name: c.name, socks5_addr: c.socks5_addr }).collect(),
             policy: PolicyConfigRequest {

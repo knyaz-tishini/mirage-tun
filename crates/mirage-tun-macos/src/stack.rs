@@ -13,7 +13,7 @@ use crate::{
     routing::MacosRouting,
     runtime_guard::{MemoryGuard, MemoryGuardConfig},
     smoltcp_acceptor::{SmoltcpTcpAcceptor, SmoltcpUdpSocket},
-    tun_device::MacosTunDevice,
+    tun_device::{MacosTunDevice, configure_interface_with_v6},
     udp_forward::{UdpProxySessionMap, udp_proxy_forward},
 };
 use async_trait::async_trait;
@@ -64,7 +64,7 @@ impl TunStack for MacosTunStack {
         // 1. Open utun device
         let mut device = MacosTunDevice::open(0)?;
 
-        // 2. Configure address and MTU
+        // 2. Configure IPv4 address and MTU
         device.configure(&cfg.tun_addr, cfg.mtu).await?;
 
         let tun_name = device.interface_name().to_string();
@@ -72,6 +72,15 @@ impl TunStack for MacosTunStack {
             "utun interface: {} addr={} mtu={}",
             tun_name, cfg.tun_addr, cfg.mtu
         );
+
+        // Optionally configure IPv6 address on the same interface
+        if let Some(ref v6_cidr) = cfg.tun_addr_v6 {
+            if let Err(e) = configure_interface_with_v6(&tun_name, &cfg.tun_addr, Some(v6_cidr.as_str()), cfg.mtu).await {
+                warn!("IPv6 interface configuration failed (non-fatal): {e}");
+            } else {
+                info!("utun inet6 addr={}", v6_cidr);
+            }
+        }
 
         // 3. Set up firewall (kill-switch only — no rdr)
         let mut firewall = MacosFirewall::new();
@@ -87,6 +96,14 @@ impl TunStack for MacosTunStack {
             let peer_addr = derive_peer_ip(local_addr);
             if let Ok(p) = peer_addr.parse::<std::net::IpAddr>() {
                 r.set_tun_peer(p);
+            }
+            // Set the v6 "peer" — for utun on macOS the TUN addr itself is used
+            // as the nexthop for the ::/1 + 8000::/1 half-default routes.
+            if let Some(ref v6_cidr) = cfg.tun_addr_v6 {
+                let v6_addr_str = v6_cidr.split('/').next().unwrap_or(v6_cidr);
+                if let Ok(v6_addr) = v6_addr_str.parse::<std::net::IpAddr>() {
+                    r.set_tun_peer_v6(v6_addr);
+                }
             }
             for relay in &cfg.relay_addrs {
                 r.add_bypass_host(*relay).await?;

@@ -247,6 +247,15 @@ mod macos_impl {
         addr_cidr: &str,
         mtu: u16,
     ) -> Result<(), MacosTunError> {
+        configure_interface_with_v6(iface, addr_cidr, None, mtu).await
+    }
+
+    pub async fn configure_interface_with_v6(
+        iface: &str,
+        addr_cidr: &str,
+        addr_cidr_v6: Option<&str>,
+        mtu: u16,
+    ) -> Result<(), MacosTunError> {
         use tokio::process::Command;
 
         let addr = addr_cidr.split('/').next().unwrap_or(addr_cidr);
@@ -269,6 +278,26 @@ mod macos_impl {
         }
 
         debug!("configured {} addr={} peer={} mtu={}", iface, addr, peer, mtu);
+
+        // Optionally assign IPv6 address
+        if let Some(v6_cidr) = addr_cidr_v6 {
+            let v6_addr = v6_cidr.split('/').next().unwrap_or(v6_cidr);
+            let prefix_len = v6_cidr.split('/').nth(1).unwrap_or("64");
+
+            let out6 = Command::new("ifconfig")
+                .args([iface, "inet6", v6_addr, "prefixlen", prefix_len])
+                .output()
+                .await
+                .map_err(MacosTunError::Io)?;
+
+            if !out6.status.success() {
+                let stderr = String::from_utf8_lossy(&out6.stderr).to_string();
+                tracing::warn!("ifconfig inet6 failed (non-fatal): {}", stderr);
+            } else {
+                debug!("configured {} inet6 addr={} prefixlen={}", iface, v6_addr, prefix_len);
+            }
+        }
+
         Ok(())
     }
 
@@ -332,6 +361,17 @@ mod stub_impl {
             Ok(())
         }
     }
+
+    pub async fn configure_interface_with_v6(
+        _iface: &str,
+        _addr_cidr: &str,
+        _addr_cidr_v6: Option<&str>,
+        _mtu: u16,
+    ) -> Result<(), MacosTunError> {
+        Err(MacosTunError::Other(
+            "configure_interface_with_v6 not available on this platform".to_string(),
+        ))
+    }
 }
 
 // ── Re-export the correct implementation ──────────────────────────────────────
@@ -340,6 +380,10 @@ mod stub_impl {
 pub use macos_impl::MacosTunDevice;
 #[cfg(target_os = "macos")]
 pub(crate) use macos_impl::configure_interface;
+#[cfg(target_os = "macos")]
+pub(crate) use macos_impl::configure_interface_with_v6;
 
 #[cfg(not(target_os = "macos"))]
 pub use stub_impl::MacosTunDevice;
+#[cfg(not(target_os = "macos"))]
+pub(crate) use stub_impl::configure_interface_with_v6;

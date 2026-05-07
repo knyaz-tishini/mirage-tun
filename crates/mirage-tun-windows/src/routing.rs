@@ -1,12 +1,16 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use tracing::{debug, info, warn};
 use crate::error::{Result, TunError};
 
 pub struct Routing {
     original_gateway: Option<String>,
     original_interface_idx: Option<u32>,
+    original_v6_gateway: Option<String>,
+    original_v6_interface_idx: Option<u32>,
     bypass_routes: Vec<String>,
+    bypass_v6_routes: Vec<String>,
     tun_default_set: bool,
+    tun_v6_default_set: bool,
     tun_name: String,
 }
 
@@ -15,8 +19,12 @@ impl Routing {
         Self {
             original_gateway: None,
             original_interface_idx: None,
+            original_v6_gateway: None,
+            original_v6_interface_idx: None,
             bypass_routes: Vec::new(),
+            bypass_v6_routes: Vec::new(),
             tun_default_set: false,
+            tun_v6_default_set: false,
             tun_name: tun_name.into(),
         }
     }
@@ -30,18 +38,30 @@ impl Routing {
     }
 
     pub async fn set_default_route(&mut self) -> Result<()> {
-        if let Some((gw, idx)) = read_default_gateway().await {
+        // IPv4
+        if let Some((gw, idx)) = read_default_gateway_v4().await {
             self.original_interface_idx = Some(idx);
             self.original_gateway = Some(gw);
         }
         info!(
             gateway = ?self.original_gateway,
             if_idx = ?self.original_interface_idx,
-            "Routing: saved original default gateway (will be used for bypass routes)"
+            "Routing: saved original IPv4 default gateway"
         );
         if self.original_gateway.is_none() {
-            warn!("Routing: could not detect original gateway — bypass routes will NOT work");
+            warn!("Routing: could not detect original IPv4 gateway — bypass routes will NOT work");
         }
+
+        // IPv6
+        if let Some((gw6, idx6)) = read_default_gateway_v6().await {
+            self.original_v6_interface_idx = Some(idx6);
+            self.original_v6_gateway = Some(gw6);
+        }
+        info!(
+            v6_gateway = ?self.original_v6_gateway,
+            v6_if_idx = ?self.original_v6_interface_idx,
+            "Routing: saved original IPv6 default gateway"
+        );
 
         let tun_name = self.tun_name.clone();
 
@@ -51,11 +71,12 @@ impl Routing {
             &tun_name,
             "metric=1",
         ]).await {
-            warn!("failed to set interface metric (non-fatal): {e}");
+            warn!("failed to set IPv4 interface metric (non-fatal): {e}");
         }
 
         let iface = format!("interface={tun_name}");
-        // Run both half-route additions in parallel
+
+        // IPv4 half-routes
         let args0 = ["interface", "ipv4", "add", "route", "0.0.0.0/1", iface.as_str(), "metric=1", "store=active"];
         let args1 = ["interface", "ipv4", "add", "route", "128.0.0.0/1", iface.as_str(), "metric=1", "store=active"];
         tokio::try_join!(
@@ -63,18 +84,44 @@ impl Routing {
             run_netsh_route(&args1)
         )?;
         self.tun_default_set = true;
-        info!(tun_name, "Routing: default route set via TUN (metric=1+1=2)");
+        info!(tun_name, "Routing: IPv4 default route set via TUN");
+
+        // IPv6 half-routes (best-effort — no error if v6 not available)
+        if self.original_v6_gateway.is_some() || self.original_v6_interface_idx.is_some() {
+            let args2 = ["interface", "ipv6", "add", "route", "::/1", iface.as_str(), "metric=1", "store=active"];
+            let args3 = ["interface", "ipv6", "add", "route", "8000::/1", iface.as_str(), "metric=1", "store=active"];
+            match tokio::try_join!(run_netsh_route(&args2), run_netsh_route(&args3)) {
+                Ok(_) => {
+                    self.tun_v6_default_set = true;
+                    info!(tun_name, "Routing: IPv6 default route set via TUN");
+                }
+                Err(e) => warn!("Routing: IPv6 default route failed (non-fatal): {e}"),
+            }
+        }
+
         Ok(())
     }
 
     pub fn restore_routes_sync(&mut self) {
+        // Remove IPv4 bypass host routes
         for addr in self.bypass_routes.drain(..) {
             let _ = std::process::Command::new("route")
                 .args(["delete", &addr, "mask", "255.255.255.255"])
                 .output();
         }
+
+        // Remove IPv6 bypass host routes
+        let name = &self.tun_name;
+        for addr in self.bypass_v6_routes.drain(..) {
+            let _ = std::process::Command::new("netsh")
+                .args(["interface", "ipv6", "delete", "route",
+                       &format!("{addr}/128"),
+                       &format!("interface={name}"),
+                       "store=active"])
+                .output();
+        }
+
         if self.tun_default_set {
-            let name = &self.tun_name;
             let _ = std::process::Command::new("netsh")
                 .args(["interface", "ipv4", "delete", "route", "0.0.0.0/1",
                        &format!("interface={name}"), "store=active"])
@@ -85,10 +132,30 @@ impl Routing {
                 .output();
             self.tun_default_set = false;
         }
+
+        if self.tun_v6_default_set {
+            let _ = std::process::Command::new("netsh")
+                .args(["interface", "ipv6", "delete", "route", "::/1",
+                       &format!("interface={name}"), "store=active"])
+                .output();
+            let _ = std::process::Command::new("netsh")
+                .args(["interface", "ipv6", "delete", "route", "8000::/1",
+                       &format!("interface={name}"), "store=active"])
+                .output();
+            self.tun_v6_default_set = false;
+        }
+
         info!("Routing: routes restored (sync)");
     }
 
     pub async fn add_bypass(&mut self, addr: IpAddr) -> Result<()> {
+        match addr {
+            IpAddr::V4(_) => self.add_bypass_v4(addr).await,
+            IpAddr::V6(_) => self.add_bypass_v6(addr).await,
+        }
+    }
+
+    async fn add_bypass_v4(&mut self, addr: IpAddr) -> Result<()> {
         let addr_str = addr.to_string();
         let prefix = format!("{addr_str}/32");
         let if_idx = self.original_interface_idx.unwrap_or(0);
@@ -97,13 +164,11 @@ impl Routing {
             %addr,
             gateway = ?self.original_gateway,
             if_idx,
-            "Routing: adding bypass route for relay addr"
+            "Routing: adding IPv4 bypass route for relay addr"
         );
 
         if let Some(ref gw) = self.original_gateway.clone() {
             if if_idx > 0 {
-                // Prefer netsh with explicit interface index — more reliable on modern Windows
-                // than route.exe which can pick a different interface when TUN is active.
                 let if_idx_str = if_idx.to_string();
                 let result = run_netsh_route(&[
                     "interface", "ipv4", "add", "route",
@@ -114,31 +179,68 @@ impl Routing {
                     "store=active",
                 ]).await;
                 match &result {
-                    Ok(()) => info!(%addr, gateway = %gw, if_idx, "Routing: bypass route added via netsh"),
+                    Ok(()) => info!(%addr, gateway = %gw, if_idx, "Routing: IPv4 bypass route added via netsh"),
                     Err(e) => {
-                        warn!(%addr, gateway = %gw, if_idx, "Routing: netsh bypass failed ({e}), falling back to route.exe");
+                        warn!(%addr, gateway = %gw, if_idx, "Routing: netsh IPv4 bypass failed ({e}), falling back to route.exe");
                         let idx_str = if_idx.to_string();
                         run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1", "IF", &idx_str]).await?;
-                        info!(%addr, gateway = %gw, if_idx, "Routing: bypass route added via route.exe fallback");
+                        info!(%addr, gateway = %gw, if_idx, "Routing: IPv4 bypass route added via route.exe fallback");
                     }
                 }
             } else {
-                // No interface index — fall back to route.exe with just gateway
                 warn!(%addr, gateway = %gw, "Routing: no interface index, using route.exe without IF");
                 run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1"]).await?;
-                info!(%addr, gateway = %gw, "Routing: bypass route added via route.exe (no IF)");
+                info!(%addr, gateway = %gw, "Routing: IPv4 bypass route added via route.exe (no IF)");
             }
         } else {
-            warn!(%addr, "Routing: no original gateway saved; bypass route NOT added — relay traffic will go through TUN");
+            warn!(%addr, "Routing: no original IPv4 gateway saved; bypass route NOT added");
         }
         self.bypass_routes.push(addr_str);
+        Ok(())
+    }
+
+    async fn add_bypass_v6(&mut self, addr: IpAddr) -> Result<()> {
+        let addr_str = addr.to_string();
+        let prefix = format!("{addr_str}/128");
+        let if_idx = self.original_v6_interface_idx.unwrap_or(0);
+
+        info!(
+            %addr,
+            v6_gateway = ?self.original_v6_gateway,
+            if_idx,
+            "Routing: adding IPv6 bypass route for relay addr"
+        );
+
+        if let Some(ref gw) = self.original_v6_gateway.clone() {
+            if if_idx > 0 {
+                let if_idx_str = if_idx.to_string();
+                match run_netsh_route(&[
+                    "interface", "ipv6", "add", "route",
+                    &prefix,
+                    &format!("interface={if_idx_str}"),
+                    &format!("nexthop={gw}"),
+                    "metric=1",
+                    "store=active",
+                ]).await {
+                    Ok(()) => info!(%addr, gateway = %gw, if_idx, "Routing: IPv6 bypass route added"),
+                    Err(e) => warn!(%addr, "Routing: IPv6 bypass route failed: {e}"),
+                }
+            } else {
+                warn!(%addr, "Routing: no IPv6 interface index");
+            }
+        } else {
+            warn!(%addr, "Routing: no original IPv6 gateway; IPv6 bypass NOT added — relay may loop through TUN");
+        }
+        self.bypass_v6_routes.push(addr_str);
         Ok(())
     }
 }
 
 impl Drop for Routing {
     fn drop(&mut self) {
-        if self.tun_default_set || !self.bypass_routes.is_empty() {
+        if self.tun_default_set || self.tun_v6_default_set
+            || !self.bypass_routes.is_empty() || !self.bypass_v6_routes.is_empty()
+        {
             self.restore_routes_sync();
         }
     }
@@ -148,9 +250,13 @@ pub async fn cleanup_stale_routes(tun_name: &str) {
     let iface = format!("interface={tun_name}");
     let args0 = ["interface", "ipv4", "delete", "route", "0.0.0.0/1", iface.as_str(), "store=active"];
     let args1 = ["interface", "ipv4", "delete", "route", "128.0.0.0/1", iface.as_str(), "store=active"];
-    let (_, _) = tokio::join!(
+    let args2 = ["interface", "ipv6", "delete", "route", "::/1", iface.as_str(), "store=active"];
+    let args3 = ["interface", "ipv6", "delete", "route", "8000::/1", iface.as_str(), "store=active"];
+    let (_, _, _, _) = tokio::join!(
         run_netsh_route(&args0),
-        run_netsh_route(&args1)
+        run_netsh_route(&args1),
+        run_netsh_route(&args2),
+        run_netsh_route(&args3),
     );
     debug!("Routing: stale route cleanup done");
 }
@@ -187,15 +293,13 @@ async fn run_netsh_route(args: &[&str]) -> Result<()> {
     Err(TunError::Routing(format!("netsh command failed ({label}): {stdout}{stderr}")))
 }
 
-/// Returns (gateway_ip, interface_index) via Win32 GetIpForwardTable2.
-/// Finds the lowest-metric IPv4 default route (0.0.0.0/0).
-/// Instant — no subprocess, no netsh.
-async fn read_default_gateway() -> Option<(String, u32)> {
-    read_default_gateway_win32()
+/// Returns (gateway_ip, interface_index) for the lowest-metric IPv4 default route.
+async fn read_default_gateway_v4() -> Option<(String, u32)> {
+    read_default_gateway_v4_win32()
 }
 
 #[cfg(windows)]
-fn read_default_gateway_win32() -> Option<(String, u32)> {
+fn read_default_gateway_v4_win32() -> Option<(String, u32)> {
     use std::net::Ipv4Addr;
     use windows_sys::Win32::Foundation::NO_ERROR;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -207,7 +311,7 @@ fn read_default_gateway_win32() -> Option<(String, u32)> {
         let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
         let ret = GetIpForwardTable2(AF_INET, &mut table_ptr);
         if ret != NO_ERROR {
-            warn!("GetIpForwardTable2 failed: {ret}");
+            warn!("GetIpForwardTable2(AF_INET) failed: {ret}");
             return None;
         }
 
@@ -242,6 +346,65 @@ fn read_default_gateway_win32() -> Option<(String, u32)> {
 }
 
 #[cfg(not(windows))]
-fn read_default_gateway_win32() -> Option<(String, u32)> {
+fn read_default_gateway_v4_win32() -> Option<(String, u32)> {
+    None
+}
+
+/// Returns (gateway_ip, interface_index) for the lowest-metric IPv6 default route.
+async fn read_default_gateway_v6() -> Option<(String, u32)> {
+    read_default_gateway_v6_win32()
+}
+
+#[cfg(windows)]
+fn read_default_gateway_v6_win32() -> Option<(String, u32)> {
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET6;
+
+    unsafe {
+        let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        let ret = GetIpForwardTable2(AF_INET6, &mut table_ptr);
+        if ret != NO_ERROR {
+            warn!("GetIpForwardTable2(AF_INET6) failed: {ret}");
+            return None;
+        }
+
+        let table = &*table_ptr;
+        let num = table.NumEntries as usize;
+        let rows_ptr = table.Table.as_ptr();
+
+        let mut best: Option<(String, u32)> = None;
+        let mut best_metric: u32 = u32::MAX;
+
+        for i in 0..num {
+            let row: &MIB_IPFORWARD_ROW2 = &*rows_ptr.add(i);
+
+            let family = row.DestinationPrefix.Prefix.si_family;
+            let prefix_len = row.DestinationPrefix.PrefixLength;
+
+            if family == AF_INET6 && prefix_len == 0 {
+                let metric = row.Metric;
+                if metric < best_metric {
+                    best_metric = metric;
+                    let sin6 = row.NextHop.Ipv6;
+                    let ip = Ipv6Addr::from(sin6.sin6_addr.u.Byte);
+                    // Skip unspecified (all-zeros) gateway — link-local routes use InterfaceIndex only
+                    if ip == Ipv6Addr::UNSPECIFIED {
+                        continue;
+                    }
+                    best = Some((ip.to_string(), row.InterfaceIndex));
+                }
+            }
+        }
+
+        FreeMibTable(table_ptr as *const _);
+        best
+    }
+}
+
+#[cfg(not(windows))]
+fn read_default_gateway_v6_win32() -> Option<(String, u32)> {
     None
 }

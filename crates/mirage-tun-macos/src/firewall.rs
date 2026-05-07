@@ -89,15 +89,21 @@ fn build_pf_rules(relay_addrs: &[IpAddr], tun_name: &str, exempt_ports: &[u16]) 
     lines.push(String::new());
 
     lines.push("block drop all".to_string());
-    lines.push("block drop out inet6 all".to_string());
+    lines.push(format!("block drop out inet6 on egress all"));
     lines.push(String::new());
 
-    lines.push(format!("pass on {tun_name} all keep state"));
+    lines.push(format!("pass on {tun_name} inet all keep state"));
+    lines.push(format!("pass on {tun_name} inet6 all keep state"));
     lines.push(String::new());
 
     for relay in relay_addrs {
-        lines.push(format!("pass out proto {{tcp, udp}} to {relay} keep state"));
-        lines.push(format!("pass in proto {{tcp, udp}} from {relay} keep state"));
+        if relay.is_ipv6() {
+            lines.push(format!("pass out inet6 proto {{tcp, udp}} to {relay} keep state"));
+            lines.push(format!("pass in inet6 proto {{tcp, udp}} from {relay} keep state"));
+        } else {
+            lines.push(format!("pass out proto {{tcp, udp}} to {relay} keep state"));
+            lines.push(format!("pass in proto {{tcp, udp}} from {relay} keep state"));
+        }
     }
     lines.push(String::new());
 
@@ -126,9 +132,19 @@ mod tests {
         let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         let rules = build_pf_rules(&[relay], "utun3", &[53]);
         assert!(rules.contains("block drop all"));
-        assert!(rules.contains("pass on utun3 all"));
+        assert!(rules.contains("block drop out inet6 on egress all"));
+        assert!(rules.contains("pass on utun3 inet all"));
+        assert!(rules.contains("pass on utun3 inet6 all"));
         assert!(rules.contains("1.2.3.4"));
         assert!(rules.contains("53"));
+    }
+
+    #[test]
+    fn pf_rules_v6_relay() {
+        use std::net::Ipv6Addr;
+        let relay_v6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let rules = build_pf_rules(&[relay_v6], "utun3", &[]);
+        assert!(rules.contains("inet6 proto {tcp, udp} to 2001:db8::1"));
     }
 
     #[test]
