@@ -35,21 +35,30 @@ impl traits::TcpAcceptor for SmoltcpTcpAcceptor {
 // ── SmoltcpUdpSocket ──────────────────────────────────────────────────────────
 
 pub struct SmoltcpUdpSocket {
-    read: ReadHalf,
-    write: WriteHalf,
+    read: Option<ReadHalf>,
+    write: Option<WriteHalf>,
 }
 
 impl SmoltcpUdpSocket {
     pub fn new(inner: mirage_tcpip_stack::UdpSocket) -> Self {
         let (read, write) = inner.split();
-        Self { read, write }
+        Self { read: Some(read), write: Some(write) }
+    }
+
+    /// Returns a placeholder that never yields — used when the UDP socket is
+    /// consumed by a self-contained forward loop spawned in stack.rs.
+    pub fn noop() -> Self {
+        Self { read: None, write: None }
     }
 }
 
 #[async_trait]
 impl traits::UdpSocket for SmoltcpUdpSocket {
     async fn recv(&mut self) -> Option<(Vec<u8>, SocketAddr, SocketAddr)> {
-        self.read.next().await
+        match self.read.as_mut() {
+            Some(r) => r.next().await,
+            None => std::future::pending().await,
+        }
     }
 
     async fn send(
@@ -58,9 +67,9 @@ impl traits::UdpSocket for SmoltcpUdpSocket {
         src: SocketAddr,
         dst: SocketAddr,
     ) -> Result<(), TunError> {
-        self.write
-            .send((payload, src, dst))
-            .await
-            .map_err(TunError::Io)
+        match self.write.as_mut() {
+            Some(w) => w.send((payload, src, dst)).await.map_err(TunError::Io),
+            None => Ok(()),
+        }
     }
 }

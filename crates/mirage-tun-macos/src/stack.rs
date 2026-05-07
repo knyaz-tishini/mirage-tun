@@ -3,6 +3,7 @@
 /// Architecture:
 ///   utun fd → read loop → smoltcp Stack (Sink) → TcpListener / UdpSocket
 ///   TcpListener → per-conn forward task → SOCKS5 → chain exit
+///   UdpSocket → udp_forward loop → SOCKS5 UDP ASSOCIATE → chain exit
 ///   smoltcp Stack (Stream) → write loop → utun fd
 use crate::{
     dns::MacosDns,
@@ -13,10 +14,11 @@ use crate::{
     runtime_guard::{MemoryGuard, MemoryGuardConfig},
     smoltcp_acceptor::{SmoltcpTcpAcceptor, SmoltcpUdpSocket},
     tun_device::MacosTunDevice,
+    udp_forward::{UdpProxySessionMap, udp_proxy_forward},
 };
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use mirage_tcpip_stack::StackBuilder;
+use mirage_tcpip_stack::{udp::UdpMsg, StackBuilder};
 use mirage_tun_core::{
     metrics::StackMetrics,
     stack_config::StackConfig,
@@ -25,8 +27,8 @@ use mirage_tun_core::{
         TunStack,
     },
 };
-use std::{net::SocketAddr, sync::Arc};
-use tokio::sync::Mutex;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -203,7 +205,47 @@ impl TunStack for MacosTunStack {
             tcp_accept_loop(tcp_listener, socks5_addr, tcp_cancel).await;
         });
 
-        // 11. Memory guard + route monitor
+        // 11. UDP forward loop: smoltcp UdpSocket → SOCKS5 UDP ASSOCIATE → chain
+        let (udp_read, mut udp_write) = udp_socket.split();
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<UdpMsg>();
+
+        // Writer half: inject SOCKS5 replies back into the smoltcp stack
+        tokio::spawn(async move {
+            while let Some(msg) = resp_rx.recv().await {
+                if let Err(e) = udp_write.send(msg).await {
+                    warn!("UDP forward: write into stack failed: {e}");
+                    break;
+                }
+            }
+        });
+
+        // Reader half: receive from smoltcp, dispatch per-flow SOCKS5 sessions
+        let udp_sessions: UdpProxySessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let udp_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut udp_read = udp_read;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = udp_cancel.cancelled() => break,
+                    item = futures::StreamExt::next(&mut udp_read) => match item {
+                        None => break,
+                        Some((payload, src_addr, dst_addr)) => {
+                            udp_proxy_forward(
+                                payload,
+                                src_addr,
+                                dst_addr,
+                                resp_tx.clone(),
+                                udp_sessions.clone(),
+                                socks5_addr,
+                            ).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        // 12. Memory guard + route monitor
         let _memory_guard = MemoryGuard::spawn(
             MemoryGuardConfig::default(),
             Box::new(|| {
@@ -214,15 +256,10 @@ impl TunStack for MacosTunStack {
 
         spawn_route_monitor(tun_name, Arc::clone(&routing), cancel.clone());
 
-        // UDP: wrap smoltcp UdpSocket in the SmoltcpUdpSocket adapter
-        let udp = SmoltcpUdpSocket::new(udp_socket);
+        // UDP socket consumed by forward loop above; expose noop for StackHandle.
+        let udp = SmoltcpUdpSocket::noop();
 
-        // TCP: wrap smoltcp TcpListener (already spawned accept loop above).
-        // The SmoltcpTcpAcceptor exposes a channel that the accept loop above
-        // is NOT using — instead we handle forwarding directly in tcp_accept_loop.
-        // For the StackHandle we expose a no-op acceptor since forwarding is
-        // self-contained.  The consumer (bin/mirage2tun.rs) only needs the
-        // handle to exist; actual TCP forwarding happens in the spawned task.
+        // TCP forwarding is self-contained in tcp_accept_loop; expose noop for StackHandle.
         let tcp = SmoltcpTcpAcceptor::noop();
 
         Ok(StackHandle { tcp, udp, metrics })

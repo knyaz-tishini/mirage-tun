@@ -15,5 +15,6 @@ pub mod runtime_guard;
 pub mod smoltcp_acceptor;
 pub mod stack;
 pub mod tun_device;
+pub mod udp_forward;
 
 pub use stack::MacosTunStack;
