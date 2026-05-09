@@ -2,6 +2,28 @@
 
 Windows Service — Wintun адаптер, split tunnel, multi-chain routing, app-based bypass, policy engine, DNS (over TCP via SOCKS5), WFP kill-switch, системный прокси. Работает в связке с mirage2web client.
 
+## Sentry / probe LM auto-bypass (May 2026)
+
+`MonitorLink` теперь читает `peer_lm_urls` из `ConfigResponse` и на каждый push шлёт host-list во внутренний watch channel. `spawn_peer_lm_bypass_watcher` резолвит каждый host (или парсит как IP literal), и аддитивно прописывает host-route bypass через `routing::add_runtime_bypass`, используя сохранённые в `ServiceState` `original_gateway` + `if_index`. Это означает: любой sentry/probe LM endpoint (главный мониторинг, peer-LM mesh) автоматически обходит TUN — management traffic не зацикливается. Список **не убавляется** на лету (мirror existing `relay_addrs` semantics); чтобы выкинуть устаревший bypass — рестарт сервиса.
+
+### Bypassed IPs after first ConfigResponse arrives (current 9-LM mesh)
+
+После первого `ConfigResponse` от любого LM мирage-tun-windows резолвит и добавляет host-routes для **всех** перечисленных ниже адресов, в дополнение к `relay_addrs` из `tun.json`. Источник: `peer_lm_urls` строится монитором из `peer_registry.list().await` + `monitor.config.toml#public_url`.
+
+| Domain (`peer_lm_urls`) | Resolved IP | Role |
+|-------------------------|-------------|------|
+| `lm-nl.zen-geldmaschine.net` | 45.12.212.226 | LM `lm-nl-1` |
+| `lm-nl-2.zen-geldmaschine.net` | 151.243.173.104 | LM `lm-nl-2` |
+| `lm-tr-1.zen-geldmaschine.net` | 103.231.75.166 | LM `lm-tr-1` |
+| `lm-tr-2.zen-geldmaschine.net` | 82.26.94.247 | LM `lm-tr-2` |
+| `lm-tr-3.zen-geldmaschine.net` | 103.231.75.144 | LM `lm-tr-3` |
+| `lm-ru.zen-geldmaschine.net` | 193.187.94.74 | LM `lm-ru` |
+| `lm-ru-1.zen-geldmaschine.net` | 91.218.245.247 | LM `lm-ru-1` |
+| `lm-ch-1.zen-geldmaschine.net` | 45.59.119.139 | LM `lm-ch-1` |
+| `lm-kz-1.zen-geldmaschine.net` | 91.212.166.95 | LM `lm-kz-1` |
+
+Плюс — все IP из `relay_addrs` секции `tun.json` (текущие L1/L2 endpoint'ы, через которые ходят SOCKS5-цепочки). Все маршруты ставятся через сохранённый `original_gateway` с метрикой выше дефолтной TUN-маршрута, так что LM/peer-mesh трафик проходит мимо `mirage0` и не зацикливается на самой себе.
+
 ## Место в L0 stack
 
 `mirage2tun` — низкоуровневый перехватчик пакетов. Часть **L0 stack клиента** вместе с `mirage-l0-sentinel` и `mirage-client-cli` (см. `mirage2app/CLAUDE.md`).

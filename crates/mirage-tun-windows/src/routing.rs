@@ -246,6 +246,92 @@ impl Drop for Routing {
     }
 }
 
+/// Stateless host-route bypass — used by the peer-LM watcher to additively
+/// extend the bypass set without owning a `Routing` instance.  Mirrors
+/// `Routing::add_bypass_*` but uses the gateway / interface_index passed by
+/// the caller (`ServiceState`).
+///
+/// `gateway` may be `None`, in which case a route.exe fallback (no IF) is
+/// attempted; if the OS is unable to resolve a gateway, the call returns Ok
+/// without doing anything (matches existing v4 fallback behaviour).
+pub async fn add_runtime_bypass(
+    addr: IpAddr,
+    gateway: Option<&str>,
+    if_index: u32,
+) -> Result<()> {
+    match addr {
+        IpAddr::V4(_) => add_runtime_bypass_v4(addr, gateway, if_index).await,
+        IpAddr::V6(_) => add_runtime_bypass_v6(addr, gateway, if_index).await,
+    }
+}
+
+async fn add_runtime_bypass_v4(addr: IpAddr, gateway: Option<&str>, if_index: u32) -> Result<()> {
+    let addr_str = addr.to_string();
+    let prefix = format!("{addr_str}/32");
+    info!(%addr, gateway, if_index, "Routing(runtime): adding IPv4 bypass route");
+
+    let Some(gw) = gateway else {
+        warn!(%addr, "Routing(runtime): no IPv4 gateway; bypass NOT added");
+        return Ok(());
+    };
+
+    if if_index > 0 {
+        let if_idx_str = if_index.to_string();
+        let result = run_netsh_route(&[
+            "interface", "ipv4", "add", "route",
+            &prefix,
+            &format!("interface={if_idx_str}"),
+            &format!("nexthop={gw}"),
+            "metric=1",
+            "store=active",
+        ])
+        .await;
+        match &result {
+            Ok(()) => info!(%addr, gateway = %gw, if_index, "Routing(runtime): IPv4 bypass added via netsh"),
+            Err(e) => {
+                warn!(%addr, gateway = %gw, if_index, "Routing(runtime): netsh failed ({e}), falling back to route.exe");
+                run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1", "IF", &if_idx_str]).await?;
+                info!(%addr, gateway = %gw, "Routing(runtime): IPv4 bypass added via route.exe fallback");
+            }
+        }
+    } else {
+        run_route(&["add", &addr_str, "mask", "255.255.255.255", gw, "METRIC", "1"]).await?;
+        info!(%addr, gateway = %gw, "Routing(runtime): IPv4 bypass added via route.exe (no IF)");
+    }
+    Ok(())
+}
+
+async fn add_runtime_bypass_v6(addr: IpAddr, gateway: Option<&str>, if_index: u32) -> Result<()> {
+    let addr_str = addr.to_string();
+    let prefix = format!("{addr_str}/128");
+    info!(%addr, gateway, if_index, "Routing(runtime): adding IPv6 bypass route");
+
+    let Some(gw) = gateway else {
+        warn!(%addr, "Routing(runtime): no IPv6 gateway; bypass NOT added");
+        return Ok(());
+    };
+
+    if if_index > 0 {
+        let if_idx_str = if_index.to_string();
+        match run_netsh_route(&[
+            "interface", "ipv6", "add", "route",
+            &prefix,
+            &format!("interface={if_idx_str}"),
+            &format!("nexthop={gw}"),
+            "metric=1",
+            "store=active",
+        ])
+        .await
+        {
+            Ok(()) => info!(%addr, gateway = %gw, if_index, "Routing(runtime): IPv6 bypass added"),
+            Err(e) => warn!(%addr, "Routing(runtime): IPv6 bypass failed: {e}"),
+        }
+    } else {
+        warn!(%addr, "Routing(runtime): no IPv6 interface index; skipping");
+    }
+    Ok(())
+}
+
 pub async fn cleanup_stale_routes(tun_name: &str) {
     let iface = format!("interface={tun_name}");
     let args0 = ["interface", "ipv4", "delete", "route", "0.0.0.0/1", iface.as_str(), "store=active"];

@@ -268,8 +268,13 @@ pub async fn run_service_logic(
             monitor_url,
             tun_cfg.monitor_api_key.clone(),
         );
+        // Subscribe to peer LM hosts BEFORE spawning so we don't miss the
+        // first push (`watch::Sender::send` only stores the latest value;
+        // late subscribers see it on the first `changed().await`).
+        let peer_lm_rx = link.subscribe_peer_lm_hosts();
         link.spawn();
         crate::monitor_link::spawn_chain_watcher(chain_rx, Arc::clone(&app_state.chains));
+        crate::monitor_link::spawn_peer_lm_bypass_watcher(peer_lm_rx, Arc::clone(&svc_state));
     }
 
     let router = crate::api::build_router(Arc::clone(&app_state));

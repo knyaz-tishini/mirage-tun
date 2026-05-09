@@ -13,7 +13,7 @@
 //! available in mirage2tun's separate Cargo workspace.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +36,11 @@ struct ConfigResponse {
     chains: Vec<WireChain>,
     #[serde(default = "default_poll_interval")]
     monitor_poll_interval_secs: u64,
+    /// Dynamic monitor URL list pushed by the LM (peers + this LM's public URL).
+    /// Sentry/probe LM endpoints in this list are auto-bypassed by the TUN
+    /// adapter so management traffic never re-enters the tunnel.
+    #[serde(default)]
+    peer_lm_urls: Vec<String>,
 }
 
 fn default_poll_interval() -> u64 {
@@ -133,6 +138,10 @@ pub struct MonitorLink {
     poll_interval_secs: AtomicU64,
     /// Sends `Some(map)` every time a new config is received.
     chain_tx: watch::Sender<Option<HashMap<String, ChainEntry>>>,
+    /// Sends the latest `peer_lm_urls` host list so the TUN can keep its
+    /// bypass route table additive with every config push.  Hosts may be
+    /// either parseable IP literals or DNS names (caller resolves).
+    peer_lm_tx: watch::Sender<Vec<String>>,
 }
 
 impl MonitorLink {
@@ -142,6 +151,7 @@ impl MonitorLink {
         monitor_api_key: Option<String>,
     ) -> (Arc<Self>, watch::Receiver<Option<HashMap<String, ChainEntry>>>) {
         let (chain_tx, chain_rx) = watch::channel(None);
+        let (peer_lm_tx, _peer_lm_rx) = watch::channel(Vec::new());
 
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -157,9 +167,17 @@ impl MonitorLink {
             config_version: AtomicU64::new(0),
             poll_interval_secs: AtomicU64::new(30),
             chain_tx,
+            peer_lm_tx,
         });
 
         (link, chain_rx)
+    }
+
+    /// Subscribe to the host list extracted from `peer_lm_urls` on every
+    /// config push.  Hosts may be IP literals or DNS names — consumers
+    /// resolve and feed them into the routing bypass list.
+    pub fn subscribe_peer_lm_hosts(&self) -> watch::Receiver<Vec<String>> {
+        self.peer_lm_tx.subscribe()
     }
 
     /// Spawn the background loop.
@@ -266,6 +284,17 @@ impl MonitorLink {
         self.config_version.store(cfg.version, Ordering::Relaxed);
         self.poll_interval_secs
             .store(cfg.monitor_poll_interval_secs, Ordering::Relaxed);
+
+        // Extract the host portion of every peer LM URL and forward to the
+        // routing bypass watcher.  We include the (probably already-known)
+        // self URL on purpose — last-writer-wins on the routing side, and
+        // an extra duplicate is harmless.
+        let peer_hosts: Vec<String> = cfg
+            .peer_lm_urls
+            .iter()
+            .filter_map(|u| extract_host(u))
+            .collect();
+        let _ = self.peer_lm_tx.send(peer_hosts);
 
         let map: HashMap<String, ChainEntry> = cfg
             .chains
@@ -423,4 +452,96 @@ fn http_to_ws_url(url: &str) -> String {
     } else {
         url.to_owned()
     }
+}
+
+/// Extract the host part of a URL like `http://1.2.3.4:19410` →
+/// `"1.2.3.4"`, or `https://lm.example.com:19443` → `"lm.example.com"`.
+/// Bracketed IPv6 hosts (`[::1]`) are returned without the brackets.
+/// Returns `None` for unparseable input.
+fn extract_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let after_host = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let after_userinfo = after_host.rsplit_once('@').map_or(after_host, |(_, r)| r);
+    let host = if let Some(rest) = after_userinfo.strip_prefix('[') {
+        rest.split_once(']').map(|(h, _)| h)?.to_owned()
+    } else {
+        after_userinfo
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(after_userinfo)
+            .to_owned()
+    };
+    if host.is_empty() { None } else { Some(host) }
+}
+
+/// Spawn a background task that watches `peer_lm_rx` for host-list updates,
+/// resolves them to IPs (DNS lookup per name), and asks `routing` to add a
+/// bypass route for any IP not already present in `routing`'s bypass set.
+///
+/// The list is **additive** — we never remove a previously added bypass,
+/// matching the existing `relay_addrs` behaviour.  Restart the service if
+/// you need to drop a stale bypass.
+pub fn spawn_peer_lm_bypass_watcher(
+    mut peer_lm_rx: watch::Receiver<Vec<String>>,
+    service: Arc<tokio::sync::Mutex<crate::state::ServiceState>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while peer_lm_rx.changed().await.is_ok() {
+            let hosts = peer_lm_rx.borrow().clone();
+            if hosts.is_empty() {
+                continue;
+            }
+            let mut new_ips: Vec<IpAddr> = Vec::new();
+            for h in &hosts {
+                if let Ok(ip) = h.parse::<IpAddr>() {
+                    new_ips.push(ip);
+                    continue;
+                }
+                // DNS resolve via the OS resolver (blocking, but cheap).
+                let host = h.clone();
+                match tokio::task::spawn_blocking(move || {
+                    use std::net::ToSocketAddrs;
+                    (host.as_str(), 0u16)
+                        .to_socket_addrs()
+                        .map(|it| it.map(|sa| sa.ip()).collect::<Vec<_>>())
+                })
+                .await
+                {
+                    Ok(Ok(ips)) => new_ips.extend(ips),
+                    Ok(Err(e)) => warn!(host = %h, "peer_lm bypass: resolve failed: {e}"),
+                    Err(e) => warn!("peer_lm bypass: resolver task join failed: {e}"),
+                }
+            }
+            if new_ips.is_empty() {
+                continue;
+            }
+
+            let mut s = service.lock().await;
+            // Skip if TUN isn't active yet — the next config push will retry.
+            if s.tun_phase != crate::state::TunPhase::TunActive {
+                continue;
+            }
+            let gateway = s.original_gateway.clone();
+            let if_index = s.if_index;
+            // Filter out IPs already in the bypass set so we don't re-run
+            // netsh for each duplicate.
+            let mut added = 0_usize;
+            for ip in new_ips {
+                if s.bypass_addrs.iter().any(|existing| *existing == ip) {
+                    continue;
+                }
+                if let Err(e) =
+                    crate::routing::add_runtime_bypass(ip, gateway.as_deref(), if_index).await
+                {
+                    warn!(%ip, "peer_lm bypass: add failed: {e}");
+                    continue;
+                }
+                s.bypass_addrs.push(ip);
+                added += 1;
+            }
+            if added > 0 {
+                info!("peer_lm bypass: added {added} new bypass route(s)");
+            }
+        }
+    })
 }
