@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use mirage_tcpip_stack::{udp::UdpMsg, StackBuilder};
 use mirage_tun_core::{
+    chains::{ChainConfig, ChainRegistry},
     metrics::StackMetrics,
     stack_config::StackConfig,
     traits::{
@@ -40,12 +41,13 @@ pub struct MacosTunStack;
 impl Sealed for MacosTunStack {}
 
 impl MacosTunStack {
-    /// Start the stack and return both the `StackHandle` (for trait compat) and
-    /// the per-chain `MetricsRegistry` (for the API server).
+    /// Start the stack and return the `StackHandle` (for trait compat), the
+    /// per-chain `MetricsRegistry`, and the hot-reloadable `ChainRegistry`
+    /// (both for the API server).
     pub async fn start_with_metrics(
         cfg: StackConfig,
         cancel: CancellationToken,
-    ) -> Result<(StackHandle<SmoltcpTcpAcceptor, SmoltcpUdpSocket>, Arc<MetricsRegistry>), MacosTunError> {
+    ) -> Result<(StackHandle<SmoltcpTcpAcceptor, SmoltcpUdpSocket>, Arc<MetricsRegistry>, Arc<ChainRegistry>), MacosTunError> {
         if cfg.chains.len() > 1 {
             warn!(
                 "MacosTunStack: {} chains configured — only first chain used for TCP forwarding",
@@ -60,6 +62,20 @@ impl MacosTunStack {
 
         let socks5_addr = chain_entry.socks5_addr;
         let chain_name = chain_entry.name.clone();
+
+        // Build ChainRegistry seeded from config — exposed via /chains/list and
+        // updated at runtime via /chains/update.
+        let chain_registry: Arc<ChainRegistry> = Arc::new(ChainRegistry::new(
+            cfg.chains
+                .iter()
+                .map(|c| ChainConfig {
+                    name: c.name.clone(),
+                    socks5_addr: c.socks5_addr.to_string(),
+                    protocol: Default::default(),
+                    dns_upstream: None,
+                })
+                .collect(),
+        ));
 
         // Build per-chain DNS upstream map: chain_name → first server IP as SocketAddr :53.
         // Falls back to cfg.dns_upstream when chain has no entry.
@@ -341,7 +357,7 @@ impl MacosTunStack {
         // TCP forwarding is self-contained in tcp_accept_loop; expose noop for StackHandle.
         let tcp = SmoltcpTcpAcceptor::noop();
 
-        Ok((StackHandle { tcp, udp, metrics: flat_metrics }, chain_metrics_registry))
+        Ok((StackHandle { tcp, udp, metrics: flat_metrics }, chain_metrics_registry, chain_registry))
     }
 }
 
@@ -356,7 +372,7 @@ impl TunStack for MacosTunStack {
         cfg: StackConfig,
         cancel: CancellationToken,
     ) -> Result<StackHandle<Self::Tcp, Self::Udp>, Self::Error> {
-        let (handle, _chain_metrics) = Self::start_with_metrics(cfg, cancel).await?;
+        let (handle, _chain_metrics, _chain_registry) = Self::start_with_metrics(cfg, cancel).await?;
         Ok(handle)
     }
 }
