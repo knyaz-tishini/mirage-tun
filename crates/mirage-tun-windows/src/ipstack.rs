@@ -17,7 +17,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::chains::{ChainEntry, ChainMap, ChainRegistry};
+use crate::chains::{ChainEntry, ChainMap, ChainRegistry, TunRouter};
 use crate::config::TunConfig;
 use crate::dns_map::DnsMap;
 use crate::error::{Result, TunError};
@@ -346,28 +346,36 @@ async fn tcp_accept_loop(
                             });
                         }
                         PolicyDecision::Chain(chain_name) => {
-                            // Snapshot the live registry at connection time — always current.
-                            let chain_snap: Arc<ChainMap> = chain_registry.snapshot().await;
-                            let socks5_addr = match chain_snap.get(&chain_name).map(|e| e.socks5_addr) {
-                                Some(addr) => addr,
-                                None => {
-                                    if let Some(addr) = chain_snap.get("default").map(|e| e.socks5_addr)
-                                        .or_else(|| chain_snap.values().next().map(|e| e.socks5_addr))
-                                    {
-                                        warn!("TCP {dst}: chain '{chain_name}' not found, falling back");
-                                        addr
-                                    } else {
-                                        warn!("TCP {dst}: no chains available — dropping");
-                                        continue;
-                                    }
-                                }
+                            // Build TunRouter from current registry snapshot.
+                            // TunRouter::pick() returns chains ordered by priority:
+                            // preferred chain first, others as failover, "default" last.
+                            let tun_router = TunRouter::from_registry(&chain_registry).await;
+                            let five_tuple_hash = {
+                                use std::hash::{Hash, Hasher};
+                                let mut h = std::collections::hash_map::DefaultHasher::new();
+                                local_addr.hash(&mut h);
+                                dst.hash(&mut h);
+                                h.finish()
                             };
+                            let candidates = tun_router.pick(Some(&chain_name), five_tuple_hash);
+                            if candidates.is_empty() {
+                                warn!("TCP {dst}: no chains available — dropping");
+                                continue;
+                            }
+
+                            // Use the primary (index 0) chain for this connection.
+                            // Additional candidates are fallbacks for future connections
+                            // via round-robin; per-connection failover over SOCKS5 would
+                            // require retrying which is deferred to Wave 3.
+                            let (primary_chain_id, socks5_addr) = candidates.into_iter().next()
+                                .expect("candidates non-empty checked above");
+
                             let sem = socks5_semaphore.clone();
                             let metrics2 = metrics.clone();
-                            metrics2.record_connection(&chain_name);
+                            metrics2.record_connection(&primary_chain_id);
                             let conns = connections.clone();
-                            conns.record_open(&chain_name, dst, domain_hint.clone());
-                            let chain_for_task = chain_name.clone();
+                            conns.record_open(&primary_chain_id, dst, domain_hint.clone());
+                            let chain_for_task = primary_chain_id.clone();
                             let ac = active_conns.clone();
                             ac.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
