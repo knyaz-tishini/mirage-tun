@@ -17,6 +17,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use mirage_core::dns::dns_forward_via_socks5;
+use mirage_dns::topology_stub::DnsRoutingHint;
+
 use crate::chains::{ChainEntry, ChainMap, ChainRegistry, TunRouter};
 use crate::config::TunConfig;
 use crate::dns_map::DnsMap;
@@ -787,13 +790,21 @@ async fn udp_dns_loop(
                     // Use per-chain DNS upstream if configured; fall back to global.
                     let chain_dns = chain_entry.dns_upstream.unwrap_or(dns_upstream);
                     let socks5_addr = chain_entry.socks5_addr;
+                    let chain_id_tag = chain_entry.chain_id.clone();
+
+                    // Log chain-tagged dispatch intent (observability).
+                    DnsRoutingHint {
+                        chain_id: Some(chain_id_tag.clone()),
+                        name: domain.clone().unwrap_or_default(),
+                    }
+                    .log_intent();
 
                     tokio::spawn(async move {
                         let _permit = match sem.acquire().await {
                             Ok(p) => p,
                             Err(_) => return,
                         };
-                        match dns_via_socks5_inner(&payload, socks5_addr, if_index, chain_dns).await {
+                        match dns_forward_via_socks5(&payload, socks5_addr, chain_dns).await {
                             Ok(response) => {
                                 if let Some(ref dom) = domain {
                                     let ips = extract_dns_ips(&response);
@@ -808,7 +819,7 @@ async fn udp_dns_loop(
                                 let _ = tx.send((response, dst_addr, src_addr));
                             }
                             Err(e) => {
-                                warn!("IpStackRunner: DNS via SOCKS5 failed: {e}");
+                                warn!(chain_id = %chain_id_tag, "IpStackRunner: DNS via SOCKS5 failed: {e}");
                             }
                         }
                     });
@@ -966,53 +977,6 @@ async fn dns_via_native(
     .await??;
     buf.truncate(n);
     Ok(buf)
-}
-
-pub(crate) async fn dns_via_socks5_inner(
-    query: &[u8],
-    socks5_addr: SocketAddr,
-    if_index: u32,
-    dns_upstream: SocketAddr,
-) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut last_err = None;
-    for attempt in 0..2u8 {
-        match dns_tcp_query(query, socks5_addr, if_index, dns_upstream).await {
-            Ok(resp) => return Ok(resp),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap())
-}
-
-async fn dns_tcp_query(
-    query: &[u8],
-    socks5_addr: SocketAddr,
-    if_index: u32,
-    dns_upstream: SocketAddr,
-) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stream = socks5_connect(socks5_addr, dns_upstream, if_index).await?;
-
-    // DNS-over-TCP: 2-byte big-endian length prefix
-    let len = query.len() as u16;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(query).await?;
-    stream.flush().await?;
-
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let resp_len = u16::from_be_bytes(len_buf) as usize;
-    if resp_len > 65535 {
-        return Err("DNS response too large".into());
-    }
-
-    let mut response = vec![0u8; resp_len];
-    stream.read_exact(&mut response).await?;
-    Ok(response)
 }
 
 // ── TCP bypass (direct via native interface) ──────────────────────────────────
@@ -1201,8 +1165,10 @@ async fn socks5_connect(
 
 // ── DNS warmup ────────────────────────────────────────────────────────────────
 
-pub(crate) async fn dns_warmup(socks5_addr: SocketAddr, if_index: u32, dns_upstream: SocketAddr) {
-    // Minimal A query for example.com — just to warm up the DNS-over-TCP SOCKS5 path
+pub(crate) async fn dns_warmup(socks5_addr: SocketAddr, _if_index: u32, dns_upstream: SocketAddr) {
+    // Minimal A query for example.com — just to warm up the DNS-over-TCP SOCKS5 path.
+    // Uses dns_forward_via_socks5 (shared mirage-core helper) instead of the old
+    // TUN-local dns_via_socks5_inner so the two paths stay consistent.
     let query: &[u8] = &[
         0x00, 0x01, // txn id
         0x01, 0x00, // standard query, recursion desired
@@ -1214,7 +1180,7 @@ pub(crate) async fn dns_warmup(socks5_addr: SocketAddr, if_index: u32, dns_upstr
         0x00, 0x01, // QTYPE A
         0x00, 0x01, // QCLASS IN
     ];
-    match dns_via_socks5_inner(query, socks5_addr, if_index, dns_upstream).await {
+    match dns_forward_via_socks5(query, socks5_addr, dns_upstream).await {
         Ok(_) => info!("DNS warmup: success"),
         Err(e) => tracing::warn!("DNS warmup: failed: {e}"),
     }

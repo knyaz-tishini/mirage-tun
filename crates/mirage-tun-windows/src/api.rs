@@ -236,7 +236,7 @@ pub async fn activate_tun_inner(
     let new_map: ChainMap = chain_configs.iter().filter_map(|c| {
         let socks5_addr = c.socks5_addr.parse::<SocketAddr>().ok()?;
         let dns_upstream = c.dns_upstream.as_ref().and_then(|d| d.parse::<SocketAddr>().ok());
-        Some((c.name.clone(), ChainEntry { socks5_addr, dns_upstream }))
+        Some((c.name.clone(), ChainEntry { chain_id: c.name.clone(), socks5_addr, dns_upstream }))
     }).collect();
     state.chains.update(new_map).await;
 
@@ -468,7 +468,7 @@ async fn post_chains_update(
             .map_err(|e| warn!("chains/update: invalid addr '{}' for '{}': {e}", c.socks5_addr, c.name))
             .ok()?;
         let dns_upstream = c.dns_upstream.as_ref().and_then(|d| d.parse::<SocketAddr>().ok());
-        Some((c.name.clone(), ChainEntry { socks5_addr, dns_upstream }))
+        Some((c.name.clone(), ChainEntry { chain_id: c.name.clone(), socks5_addr, dns_upstream }))
     }).collect();
 
     let count = new_map.len();

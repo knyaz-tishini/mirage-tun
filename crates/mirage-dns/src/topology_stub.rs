@@ -1,54 +1,46 @@
 //! Wave 3 Step 3.3-partial — TUN DNS topology wire-in stub.
 //!
-//! The full per-flow `DnsTopology::resolve(name, chain_id, cache)` call
-//! requires knowing which chain owns a given intercepted flow at packet-capture
-//! time.  In Wave 3 the TUN router does not yet expose the chain_id for each
-//! flow to the DNS layer.
+//! **Wired in V8 (Wave 4, sub-item 4.5).**
 //!
-//! This stub records the integration point and logs intent.  Wave 4 will
-//! replace it with a real `DnsTopology` dispatch by:
-//! 1. Adding `mirage-core` as a workspace dep in `mirage2tun/Cargo.toml`.
-//! 2. Passing the active `DnsTopology` down from the TUN manager into the
-//!    DNS intercept path (mirage-tcpip-stack → mirage-dns).
-//! 3. Replacing `DnsResolver::resolve` calls with
-//!    `DnsTopology::resolve(name, Some(chain_id), &dns_cache)`.
+//! The per-flow `DnsRoutingHint.chain_id` is now populated at the DNS dispatch
+//! point in `mirage2tun/crates/mirage-tun-windows/src/ipstack.rs`
+//! (`udp_dns_loop`).  The DNS forwarding path has been replaced with
+//! `mirage_core::dns::dns_forward_via_socks5` — a shared helper that both TUN
+//! and the client-core `TopologyForwarder` can use without a cross-workspace dep.
 //!
-//! Callsites to update in Wave 4 (found during Wave 3 audit):
-//! - `mirage2tun/crates/mirage-tcpip-stack/src/` — TCP/UDP intercept loop
-//!   that dispatches to `DnsResolver`.  Exact file confirmed by audit below.
-//! - `mirage2tun/crates/mirage-tun-windows/src/` — Windows-specific TUN
-//!   manager that initialises `DnsResolver` from `DnsConfig`.
+//! The `DnsRoutingHint` struct is retained here as a logging + observability
+//! type.  Its `log_intent` method now records the chain_id-tagged dispatch
+//! rather than a "pending" stub warning.
 
-use tracing::warn;
+use tracing::debug;
 
 /// Hint about which chain should handle DNS for a given intercepted packet.
 ///
-/// Wave 3 only: the TUN layer does not yet propagate chain_id per-flow, so
-/// `chain_id` is always `None` here and queries fall through to the existing
-/// `DnsResolver` (which uses a single shared DoH backend).
+/// Populated at packet-intercept time from the `PolicyEngine` decision.
+/// In V8 this is always `Some(chain_id)` for proxied flows; `None` means
+/// the bypass tier (no chain).
 pub struct DnsRoutingHint {
-    /// Chain that owns the intercepted flow, if known.
+    /// Chain that owns the intercepted flow.
     ///
-    /// `None` means "not yet determined" — caller MUST fall back to the
-    /// existing `DnsResolver` until Wave 4 wires this in.
+    /// `None` → bypass tier (uses native/direct DNS).
+    /// `Some(id)` → routed through the named chain's SOCKS5 port.
     pub chain_id: Option<String>,
     /// Hostname being resolved.
     pub name: String,
 }
 
 impl DnsRoutingHint {
-    /// Log the routing intent for observability.  In Wave 4 this becomes the
-    /// actual `DnsTopology::resolve` dispatch.
+    /// Log the chain-tagged DNS dispatch for observability.
     pub fn log_intent(&self) {
         match &self.chain_id {
-            Some(id) => warn!(
+            Some(id) => debug!(
                 chain_id = %id,
                 name = %self.name,
-                "DNS topology stub: would resolve via per-chain DoH backend (Wave 4 wire-in pending)"
+                "DNS dispatch: per-chain SOCKS5 (V8 wire-in active)"
             ),
-            None => warn!(
+            None => debug!(
                 name = %self.name,
-                "DNS topology stub: chain_id unknown, using shared DnsResolver (Wave 4 pending)"
+                "DNS dispatch: bypass tier (native DNS)"
             ),
         }
     }

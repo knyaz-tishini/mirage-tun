@@ -303,7 +303,7 @@ impl MonitorLink {
             .filter_map(|c| {
                 let socks5_addr = c.socks5_socket_addr()?;
                 let dns_upstream = c.dns_upstream_addr();
-                Some((c.name.clone(), ChainEntry { socks5_addr, dns_upstream }))
+                Some((c.name.clone(), ChainEntry { chain_id: c.name.clone(), socks5_addr, dns_upstream }))
             })
             .collect();
 

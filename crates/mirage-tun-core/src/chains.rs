@@ -33,6 +33,11 @@ pub struct ChainConfig {
 /// Resolved entry for a single chain.
 #[derive(Debug, Clone)]
 pub struct ChainEntry {
+    /// Chain name/ID — mirrors `ChainConfig::name`.
+    ///
+    /// Injected at the DNS dispatch point (ipstack `udp_dns_loop`) so the
+    /// `DnsRoutingHint` can tag which chain owns each intercepted DNS query.
+    pub chain_id: String,
     pub socks5_addr: SocketAddr,
     /// Per-chain DNS upstream. None means use the global fallback.
     pub dns_upstream: Option<SocketAddr>,
@@ -72,7 +77,7 @@ impl ChainRegistry {
                         }).ok()
                     });
                     ordered.push(cfg.name.clone());
-                    map.insert(cfg.name, ChainEntry { socks5_addr, dns_upstream });
+                    map.insert(cfg.name.clone(), ChainEntry { chain_id: cfg.name, socks5_addr, dns_upstream });
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -149,7 +154,7 @@ impl ChainRegistry {
                         d.parse::<SocketAddr>().ok()
                     });
                     ordered.push(cfg.name.clone());
-                    map.insert(cfg.name, ChainEntry { socks5_addr, dns_upstream });
+                    map.insert(cfg.name.clone(), ChainEntry { chain_id: cfg.name, socks5_addr, dns_upstream });
                 }
                 Err(_) => {}
             }
