@@ -125,11 +125,11 @@ fn build_pf_rules(
 
     for relay in relay_addrs {
         if relay.is_ipv6() {
-            lines.push(format!("pass quick out inet6 proto {{tcp, udp}} to {relay} keep state"));
-            lines.push(format!("pass quick in inet6 proto {{tcp, udp}} from {relay} keep state"));
+            lines.push(format!("pass out quick inet6 proto {{tcp, udp}} to {relay} keep state"));
+            lines.push(format!("pass in quick inet6 proto {{tcp, udp}} from {relay} keep state"));
         } else {
-            lines.push(format!("pass quick out proto {{tcp, udp}} to {relay} keep state"));
-            lines.push(format!("pass quick in proto {{tcp, udp}} from {relay} keep state"));
+            lines.push(format!("pass out quick proto {{tcp, udp}} to {relay} keep state"));
+            lines.push(format!("pass in quick proto {{tcp, udp}} from {relay} keep state"));
         }
     }
     lines.push(String::new());
@@ -145,9 +145,9 @@ fn build_pf_rules(
             .map(|ip| ip.is_ipv6())
             .unwrap_or(false);
         if is_v6 {
-            lines.push(format!("pass quick out inet6 proto {{tcp, udp}} to {cidr} keep state"));
+            lines.push(format!("pass out quick inet6 proto {{tcp, udp}} to {cidr} keep state"));
         } else {
-            lines.push(format!("pass quick out proto {{tcp, udp}} to {cidr} keep state"));
+            lines.push(format!("pass out quick proto {{tcp, udp}} to {cidr} keep state"));
         }
     }
     if !bypass_nets.is_empty() {
@@ -159,13 +159,13 @@ fn build_pf_rules(
     // DHCP, mDNS/ND, and ANY OTHER tun cluster's local traffic alive. RFC1918 +
     // link-local + multicast egress the real NIC unconditionally; the floor
     // below only drops escaped PUBLIC-internet wire traffic.
-    lines.push("pass quick out to 10.0.0.0/8 keep state".to_string());
-    lines.push("pass quick out to 172.16.0.0/12 keep state".to_string());
-    lines.push("pass quick out to 192.168.0.0/16 keep state".to_string());
-    lines.push("pass quick out to 169.254.0.0/16 keep state".to_string());
-    lines.push("pass quick out to 224.0.0.0/4 keep state".to_string());
-    lines.push("pass quick out inet6 to fe80::/10 keep state".to_string());
-    lines.push("pass quick out inet6 to ff00::/8 keep state".to_string());
+    lines.push("pass out quick to 10.0.0.0/8 keep state".to_string());
+    lines.push("pass out quick to 172.16.0.0/12 keep state".to_string());
+    lines.push("pass out quick to 192.168.0.0/16 keep state".to_string());
+    lines.push("pass out quick to 169.254.0.0/16 keep state".to_string());
+    lines.push("pass out quick to 224.0.0.0/4 keep state".to_string());
+    lines.push("pass out quick inet6 to fe80::/10 keep state".to_string());
+    lines.push("pass out quick inet6 to ff00::/8 keep state".to_string());
     lines.push(String::new());
 
     lines.push(
@@ -176,7 +176,7 @@ fn build_pf_rules(
         let ports: Vec<String> = exempt_ports.iter().map(|p| p.to_string()).collect();
         let ports_str = ports.join(", ");
         lines.push(format!(
-            "pass quick out proto {{tcp, udp}} to any port {{{ports_str}}} keep state"
+            "pass out quick proto {{tcp, udp}} to any port {{{ports_str}}} keep state"
         ));
     }
     lines.push(String::new());
@@ -214,10 +214,10 @@ mod tests {
         // Exemptions must be `pass quick` so they win over the floor.
         assert!(rules.contains("pass quick on utun3 inet all"));
         assert!(rules.contains("pass quick on utun3 inet6 all"));
-        assert!(rules.contains("pass quick out proto {tcp, udp} to 1.2.3.4 keep state")); // relay
-        assert!(rules.contains("pass quick out to 192.168.0.0/16 keep state"));            // LAN/control
-        assert!(rules.contains("pass quick out to 10.0.0.0/8 keep state"));
-        assert!(rules.contains("pass quick out inet6 to fe80::/10 keep state"));           // v6 ND
+        assert!(rules.contains("pass out quick proto {tcp, udp} to 1.2.3.4 keep state")); // relay
+        assert!(rules.contains("pass out quick to 192.168.0.0/16 keep state"));            // LAN/control
+        assert!(rules.contains("pass out quick to 10.0.0.0/8 keep state"));
+        assert!(rules.contains("pass out quick inet6 to fe80::/10 keep state"));           // v6 ND
         assert!(rules.contains("53")); // exempt port
         // lo0 skipped so loopback (control IPC) is never touched.
         assert!(rules.contains("set skip on lo0"));
@@ -244,8 +244,8 @@ mod tests {
         let bypass = vec!["1.0.0.1/32".to_string(), "2001:db8::/32".to_string()];
         let rules = build_pf_rules(&[relay], "utun3", &[53], &bypass);
         // v4 bypass passes out (quick, above the floor); v6 bypass uses inet6.
-        assert!(rules.contains("pass quick out proto {tcp, udp} to 1.0.0.1/32 keep state"));
-        assert!(rules.contains("pass quick out inet6 proto {tcp, udp} to 2001:db8::/32 keep state"));
+        assert!(rules.contains("pass out quick proto {tcp, udp} to 1.0.0.1/32 keep state"));
+        assert!(rules.contains("pass out quick inet6 proto {tcp, udp} to 2001:db8::/32 keep state"));
         // Floor present, but bypass exemptions sit above it (quick) — never severed.
         assert!(rules.contains("block drop out inet all"));
         assert!(!rules.contains("block drop all"));
