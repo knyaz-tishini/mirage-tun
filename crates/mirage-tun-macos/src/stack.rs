@@ -146,14 +146,15 @@ impl MacosTunStack {
             tun_name, cfg.tun_addr, cfg.tun_addr_v6, cfg.mtu
         );
 
-        // 3. Set up firewall (kill-switch only — no rdr)
+        // 3. Set up firewall — bypass-safe pf posture is ALWAYS on.
+        // No global block, no kill-switch toggle. The posture only passes the tun +
+        // relays + bypass plane + DHCP/53; selective fail-closed for dead wires is
+        // enforced at the accept loop (routing layer), not pf.
         let mut firewall = MacosFirewall::new();
-        if cfg.kill_switch {
-            // Bypass-plane CIDRs get `pass out` rules so the kill-switch doesn't
-            // drop them (they egress the real NIC via their original-gw routes).
-            firewall.set_bypass_nets(bypass_cidr_strings.clone());
-            firewall.activate(&cfg.relay_addrs, &tun_name, &[53])?;
-        }
+        // Bypass-plane CIDRs get `pass out` rules so they egress the real NIC
+        // via their original-gw routes (plane-pure: wire flows still go through tun).
+        firewall.set_bypass_nets(bypass_cidr_strings.clone());
+        firewall.activate(&cfg.relay_addrs, &tun_name, &[53])?;
 
         // 4. Add bypass routes for relay addresses
         let routing = Arc::new(Mutex::new(MacosRouting::new()));

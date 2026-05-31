@@ -1,7 +1,10 @@
-/// macOS pf-based kill-switch firewall.
+/// macOS pf firewall — bypass-safe posture (no global block).
 ///
 /// Rules are loaded into the `mirage` pf anchor to avoid interfering with
 /// system rules in `/etc/pf.conf`. The anchor is flushed on deactivation.
+/// Selective fail-closed is enforced at the `tcp_accept_loop` routing layer,
+/// not here. pf's role: allow relay egress + bypass plane; tun traffic passes
+/// through smoltcp.
 ///
 /// TCP is handled by mirage-tcpip-stack (smoltcp) — no rdr rule needed.
 use crate::error::MacosTunError;
@@ -26,8 +29,8 @@ impl MacosFirewall {
     }
 
     /// Seed bypass-plane CIDRs (e.g. "1.0.0.1/32") — call before `activate` so
-    /// the kill-switch lets the operator's "байпас канал" egress directly while
-    /// every other non-tunnel flow stays blocked. Plane-purity at the pf layer.
+    /// the bypass plane gets unconditional `pass out` rules. These CIDRs egress the
+    /// real NIC directly; all other non-relay traffic routes into the tun.
     pub fn set_bypass_nets(&mut self, nets: Vec<String>) {
         self.bypass_nets = nets;
     }
@@ -98,17 +101,15 @@ fn build_pf_rules(
     lines.push(format!(
         "# Mirage VPN pf anchor — loaded into anchor \"{ANCHOR}\""
     ));
+    // Bypass-safe posture — NO global block (the kill-switch is selective,
+    // enforced at the accept loop). Bypass + relay pass rules are unconditional.
     lines.push(String::new());
 
     lines.push("set skip on lo0".to_string());
     lines.push(String::new());
 
-    // PF rule order: pass quick first wins, then block-all default catches the rest.
     lines.push(format!("pass quick on {tun_name} inet all keep state"));
     lines.push(format!("pass quick on {tun_name} inet6 all keep state"));
-    lines.push(String::new());
-    lines.push("block drop all".to_string());
-    lines.push("block drop out inet6 from any to any".to_string());
     lines.push(String::new());
 
     for relay in relay_addrs {
@@ -123,9 +124,8 @@ fn build_pf_rules(
     lines.push(String::new());
 
     // Bypass-PLANE pass rules — these CIDRs egress the real NIC directly (their
-    // routes go via the original gateway, set up in routing.rs). Without these
-    // the kill-switch `block drop all` would drop the bypass traffic. Plane-pure:
-    // wire flows still go through the tun; only configured bypass CIDRs pass out.
+    // routes go via the original gateway, set up in routing.rs). Unconditional:
+    // bypass flows bypass the proxy entirely; wire flows still go through the tun.
     for cidr in bypass_nets {
         let is_v6 = cidr
             .split('/')
@@ -164,12 +164,15 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
-    fn pf_rules_contain_block_all() {
+    fn pf_rules_have_no_global_block() {
         let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         let rules = build_pf_rules(&[relay], "utun3", &[53], &[]);
-        assert!(rules.contains("block drop all"));
+        // No global kill-switch block — selective fail-closed is at the accept loop.
+        assert!(!rules.contains("block drop all"));
+        assert!(!rules.contains("block drop out inet6"));
+        // But the essential pass rules must still be present.
         assert!(rules.contains("pass quick on utun3 inet all"));
-        assert!(rules.contains("pass on utun3 inet6 all"));
+        assert!(rules.contains("pass quick on utun3 inet6 all"));
         assert!(rules.contains("1.2.3.4"));
         assert!(rules.contains("53"));
     }
@@ -197,7 +200,7 @@ mod tests {
         // v4 bypass passes out; v6 bypass uses inet6.
         assert!(rules.contains("pass out proto {tcp, udp} to 1.0.0.1/32 keep state"));
         assert!(rules.contains("pass out inet6 proto {tcp, udp} to 2001:db8::/32 keep state"));
-        // Kill-switch still present — plane-purity: everything else blocked.
-        assert!(rules.contains("block drop all"));
+        // No global block — bypass-safe posture; fail-closed is at the accept loop.
+        assert!(!rules.contains("block drop all"));
     }
 }

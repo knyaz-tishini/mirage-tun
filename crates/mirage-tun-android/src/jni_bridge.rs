@@ -84,8 +84,9 @@ mod android {
         chains: Vec<ChainConfigDto>,
         #[serde(default)]
         policy: Option<PolicyConfigRequest>,
-        #[serde(default)]
-        kill_switch: bool,
+        // kill_switch removed from StackConfig (selective now); field kept for config compat, ignored.
+        #[serde(default, rename = "kill_switch")]
+        _kill_switch_compat: Option<bool>,
         #[serde(default)]
         relay_addrs: Vec<std::net::IpAddr>,
         #[serde(default = "default_dns_upstream")]
@@ -123,7 +124,7 @@ mod android {
                 .iter()
                 .filter_map(|c| {
                     match c.socks5_addr.parse::<SocketAddr>() {
-                        Ok(addr) => Some(ChainEntry { name: c.name.clone(), socks5_addr: addr }),
+                        Ok(addr) => Some(ChainEntry { name: c.name.clone(), socks5_addr: addr, group: None }),
                         Err(e) => {
                             warn!("start: invalid socks5_addr '{}' for chain '{}': {e}", c.socks5_addr, c.name);
                             None
@@ -143,7 +144,6 @@ mod android {
                 chains,
                 policy,
                 chain_dns: vec![],
-                kill_switch: self.kill_switch,
                 relay_addrs: self.relay_addrs,
                 dns_upstream: self.dns_upstream,
                 dns_cache_ttl_secs: self.dns_cache_ttl_secs,

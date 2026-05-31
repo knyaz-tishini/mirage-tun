@@ -283,8 +283,9 @@ struct FfiStackConfig {
     dns_concurrency: usize,
     #[serde(default = "default_concurrency")]
     socks5_concurrency: usize,
-    #[serde(default)]
-    kill_switch: bool,
+    // kill_switch removed from StackConfig (selective now); field kept for config compat, ignored.
+    #[serde(default, rename = "kill_switch")]
+    _kill_switch_compat: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -324,7 +325,7 @@ fn parse_ffi_config(json: &[u8]) -> Result<StackConfig, IosTunError> {
             c.socks5_addr
                 .parse()
                 .ok()
-                .map(|addr| ChainEntry { name: c.name, socks5_addr: addr })
+                .map(|addr| ChainEntry { name: c.name, socks5_addr: addr, group: None })
         })
         .collect();
 
@@ -342,7 +343,6 @@ fn parse_ffi_config(json: &[u8]) -> Result<StackConfig, IosTunError> {
             default_action: mirage_tun_core::policy::PolicyDecision::default_chain(),
         },
         chain_dns: Vec::<ChainDnsConfig>::new(),
-        kill_switch: raw.kill_switch,
         relay_addrs: Vec::new(),
         dns_upstream,
         dns_cache_ttl_secs: raw.dns_cache_ttl_secs,
@@ -367,7 +367,7 @@ fn parse_chains_json(json: &[u8]) -> Result<Vec<ChainEntry>, serde_json::Error> 
             c.socks5_addr
                 .parse()
                 .ok()
-                .map(|addr| ChainEntry { name: c.name, socks5_addr: addr })
+                .map(|addr| ChainEntry { name: c.name, socks5_addr: addr, group: None })
         })
         .collect())
 }

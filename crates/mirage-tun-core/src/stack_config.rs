@@ -16,8 +16,6 @@ pub struct StackConfig {
     pub policy: PolicyConfigRequest,
     /// DNS override pushed to chain N. None = use system DNS.
     pub chain_dns: Vec<ChainDnsConfig>,
-    /// Kill-switch: block non-tunnel traffic.
-    pub kill_switch: bool,
     /// Relay/server addresses that must never route through TUN (v4 and v6).
     pub relay_addrs: Vec<IpAddr>,
     /// Per-chain DNS upstream for the DoT/DoH proxy inside the stack.

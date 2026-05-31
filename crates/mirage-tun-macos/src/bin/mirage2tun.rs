@@ -31,8 +31,10 @@ struct BinConfig {
     chains: Vec<BinChainEntry>,
     #[serde(default)]
     chain_dns: Vec<BinChainDnsConfig>,
-    #[serde(default = "default_true")]
-    kill_switch: bool,
+    /// DEPRECATED — the global kill-switch bool is gone (the kill-switch is now
+    /// selective, enforced at the accept loop). Absorbed for config compat; ignored.
+    #[serde(default, rename = "kill_switch")]
+    _kill_switch_compat: Option<bool>,
     #[serde(default)]
     relay_addrs: Vec<IpAddr>,
     #[serde(default = "default_dns_upstream")]
@@ -64,6 +66,9 @@ struct BinConfig {
 struct BinChainEntry {
     name: String,
     socks5_addr: SocketAddr,
+    /// Optional failover group — forwarded to `ChainEntry::group`.
+    #[serde(default)]
+    group: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -84,12 +89,16 @@ fn build_policy(base: Option<PolicyConfigRequest>, bypass: &BypassShortcut) -> P
         req.rules.push(PolicyRule::DestCidr {
             cidr: cidr.clone(),
             action: PolicyDecision::Bypass,
+            failure_policy: Default::default(),
+            wire_class: Default::default(),
         });
     }
     for domain in &bypass.domains {
         req.rules.push(PolicyRule::DestDomain {
             domain: domain.clone(),
             action: PolicyDecision::Bypass,
+            failure_policy: Default::default(),
+            wire_class: Default::default(),
         });
     }
     req
@@ -103,7 +112,6 @@ struct BinChainDnsConfig {
 
 fn default_api_bind() -> String { "127.0.0.1:19485".to_string() }
 fn default_mtu() -> u16 { 1280 } // onion+AEAD+camo headroom; 1500 = PMTUD blackhole on the onion handshake
-fn default_true() -> bool { true }
 fn default_dns_upstream() -> SocketAddr { "8.8.8.8:53".parse().expect("static addr") }
 fn default_ttl() -> u64 { 300 }
 fn default_cache_max() -> usize { 4096 }
@@ -115,10 +123,9 @@ impl From<BinConfig> for StackConfig {
             tun_addr: b.tun_addr,
             tun_addr_v6: b.tun_addr_v6,
             mtu: b.mtu,
-            chains: b.chains.into_iter().map(|c| ChainEntry { name: c.name, socks5_addr: c.socks5_addr }).collect(),
+            chains: b.chains.into_iter().map(|c| ChainEntry { name: c.name, socks5_addr: c.socks5_addr, group: c.group }).collect(),
             policy: build_policy(b.policy, &b.bypass),
             chain_dns: b.chain_dns.into_iter().map(|d| ChainDnsConfig { chain_name: d.chain_name, servers: d.servers }).collect(),
-            kill_switch: b.kill_switch,
             relay_addrs: b.relay_addrs,
             dns_upstream: b.dns_upstream,
             dns_cache_ttl_secs: b.dns_cache_ttl_secs,
