@@ -150,6 +150,18 @@ impl MacosTunStack {
         };
         let wire_groups_arc = Arc::new(wire_group_map);
 
+        // 0. Floor-FIRST (Windows-WFP parity). Load the leak-floor BEFORE opening
+        //    the utun device, so a failure during utun open / ifconfig (e.g.
+        //    transient utun contention on rapid restart) fails CLOSED — wire egress
+        //    blocked, bypass plane + control link alive — instead of leaking the
+        //    real NIC. The floor is reloaded WITH the tun exemption at step 3 once
+        //    the device exists. MacosFirewall/Routing have no Drop, so an early
+        //    `?`-return leaves this floor in place (fail-closed, self-heals on the
+        //    next start which replaces the anchor).
+        let mut firewall = MacosFirewall::new();
+        firewall.set_bypass_nets(bypass_cidr_strings.clone());
+        firewall.activate_prefloor(&cfg.relay_addrs, &[53])?;
+
         // 1. Open utun device
         let device = MacosTunDevice::open(0)?;
         let tun_name = device.interface_name().to_string();
@@ -169,14 +181,10 @@ impl MacosTunStack {
             tun_name, cfg.tun_addr, cfg.tun_addr_v6, cfg.mtu
         );
 
-        // 3. Set up firewall — bypass-safe pf posture is ALWAYS on.
-        // No global block, no kill-switch toggle. The posture only passes the tun +
-        // relays + bypass plane + DHCP/53; selective fail-closed for dead wires is
-        // enforced at the accept loop (routing layer), not pf.
-        let mut firewall = MacosFirewall::new();
-        // Bypass-plane CIDRs get `pass out` rules so they egress the real NIC
-        // via their original-gw routes (plane-pure: wire flows still go through tun).
-        firewall.set_bypass_nets(bypass_cidr_strings.clone());
+        // 3. Reload the floor WITH the tun-interface exemption now that the device
+        //    exists (pfctl -f replaces the step-0 pre-floor in the same `mirage`
+        //    anchor). The leak-floor blocks any wire egress that escapes the tun;
+        //    bypass plane + relays + LAN/control + lo are `pass quick` exempt.
         firewall.activate(&cfg.relay_addrs, &tun_name, &[53])?;
 
         // 4. Add bypass routes for relay addresses

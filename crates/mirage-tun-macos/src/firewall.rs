@@ -45,6 +45,28 @@ impl MacosFirewall {
     pub fn set_bypass_nets(&mut self, nets: Vec<String>) {
         self.bypass_nets = nets;
     }
+
+    /// Load the leak-floor WITHOUT the tun-interface exemption — the floor-first
+    /// PRE-floor brought up BEFORE the utun device exists (Windows-WFP parity).
+    /// Wire egress is already blocked here; bypass plane + relays + LAN/control +
+    /// loopback stay alive, so a failure during utun open / ifconfig fails CLOSED
+    /// (no real-NIC leak) and the bootstrap path survives. `activate` reloads the
+    /// same anchor WITH the tun exemption once the device is up. Call
+    /// `set_bypass_nets` before this.
+    pub fn activate_prefloor(
+        &mut self,
+        relay_addrs: &[IpAddr],
+        exempt_ports: &[u16],
+    ) -> Result<(), MacosTunError> {
+        let conf = build_pf_rules(relay_addrs, "", exempt_ports, &self.bypass_nets);
+        debug!("pf pre-floor rules:\n{}", conf);
+        std::fs::write(PF_CONF_PATH, &conf).map_err(MacosTunError::Io)?;
+        run_pfctl_sync(&["-a", ANCHOR, "-f", PF_CONF_PATH])?;
+        let _ = run_pfctl_sync(&["-e"]); // ok if already enabled
+        self.active = true;
+        info!("pf pre-floor activated (anchor: {}) — fail-closed before utun up", ANCHOR);
+        Ok(())
+    }
 }
 
 impl Default for MacosFirewall {
@@ -119,9 +141,13 @@ fn build_pf_rules(
     lines.push("set skip on lo0".to_string());
     lines.push(String::new());
 
-    lines.push(format!("pass quick on {tun_name} inet all keep state"));
-    lines.push(format!("pass quick on {tun_name} inet6 all keep state"));
-    lines.push(String::new());
+    // The tun-interface exemption is skipped when tun_name is empty (the
+    // floor-first PRE-floor loaded before the utun device exists).
+    if !tun_name.is_empty() {
+        lines.push(format!("pass quick on {tun_name} inet all keep state"));
+        lines.push(format!("pass quick on {tun_name} inet6 all keep state"));
+        lines.push(String::new());
+    }
 
     for relay in relay_addrs {
         if relay.is_ipv6() {
