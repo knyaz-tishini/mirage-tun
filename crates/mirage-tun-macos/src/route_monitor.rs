@@ -65,12 +65,22 @@ pub fn spawn_route_monitor(
 }
 
 async fn check_default_route(expected_iface: &str) -> Result<bool, String> {
-    // Probe with a public IP that falls under our 0.0.0.0/1 override.
-    // `route get 0.0.0.0` always resolves to the system /0 default and would
-    // give a false-positive drift on every tick.  8.8.8.8 picks the most
-    // specific /1 route — must point at our utun.
-    let out = tokio::process::Command::new("route")
-        .args(["-n", "get", "8.8.8.8"])
+    // STRUCTURAL check: confirm the `0/1` override route exists with Netif == our
+    // utun, by reading the routing TABLE directly (`netstat -rn -f inet`).
+    //
+    // We must NOT probe a concrete address with `route get <ip>` — every relay
+    // node IP gets a more-specific bypass HOST route via the real NIC, and so can
+    // the configured `dns_upstream` (e.g. a stale `8.8.8.8 → en0 UGHS`). Probing
+    // any such IP returns en0 and reports a FALSE drift on every tick, which after
+    // 5 ticks `process::exit`s a perfectly healthy tunnel (the bug that capped
+    // every Mac tun run at ~50s — confirmed 2026-05-31: `route get 8.8.8.8` = en0
+    // while `route get 1.1.1.1` = utun5 and `0/1 → 10.255.0.1 utun5` was installed).
+    //
+    // Checking the `0/1` route's Netif is immune to per-host bypass routes: it asks
+    // "is my default-via-tun override still installed?" — exactly what self-heal
+    // needs — rather than "does this one address resolve to the tun?".
+    let out = tokio::process::Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
         .output()
         .await
         .map_err(|e| e.to_string())?;
@@ -81,11 +91,17 @@ async fn check_default_route(expected_iface: &str) -> Result<bool, String> {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
-        let trimmed = line.trim();
-        if let Some(iface) = trimmed.strip_prefix("interface:") {
-            return Ok(iface.trim() == expected_iface);
+        // macOS columns: Destination Gateway Flags Netif [Expire].
+        // The 0.0.0.0/1 override is abbreviated "0/1" by netstat.
+        let mut cols = line.split_whitespace();
+        let dest = cols.next().unwrap_or("");
+        if dest == "0/1" || dest == "0.0.0.0/1" {
+            // Netif is the 4th column (index 3): skip Gateway + Flags.
+            let netif = cols.nth(2).unwrap_or("");
+            return Ok(netif == expected_iface);
         }
     }
 
+    // No 0/1 route at all → the override is genuinely gone → real drift.
     Ok(false)
 }
