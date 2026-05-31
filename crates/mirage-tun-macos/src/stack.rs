@@ -287,11 +287,14 @@ impl MacosTunStack {
         // Port 53 → DNS-via-SOCKS5 TCP CONNECT (intercept before UDP ASSOCIATE).
         // All other UDP → SOCKS5 UDP ASSOCIATE.
         let udp_sessions: UdpProxySessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let dns_fc = Arc::new(mirage_dns::ForwardCache::new(4096));
         let udp_cancel = cancel.clone();
         let udp_metrics = Arc::clone(&chain_metrics_registry);
         let udp_chain_name = chain_name.clone();
+        let dns_fc_outer = dns_fc.clone();
         tokio::spawn(async move {
             let mut udp_read = udp_read;
+            let dns_fc = dns_fc_outer;
             loop {
                 tokio::select! {
                     biased;
@@ -300,8 +303,9 @@ impl MacosTunStack {
                         None => break,
                         Some((payload, src_addr, dst_addr)) => {
                             if dst_addr.port() == 53 {
-                                // DNS intercept: TCP CONNECT through chain SOCKS5
-                                // to the configured per-chain (or global) upstream.
+                                // DNS intercept: cache + singleflight dedup, then
+                                // TCP CONNECT through chain SOCKS5 to the configured
+                                // per-chain (or global) upstream.
                                 // dst_addr.ip() from the guest is ignored — we always
                                 // query dns_upstream_for_chain, matching Windows semantics
                                 // where chain DNS overrides whatever the app asked.
@@ -309,16 +313,18 @@ impl MacosTunStack {
                                 let q = payload.clone();
                                 let socks5 = socks5_addr;
                                 let upstream = dns_upstream_for_chain;
+                                let fc = dns_fc.clone();
+                                let q2 = q.clone();
                                 tokio::spawn(async move {
-                                    match dns_via_socks5(&q, socks5, upstream).await {
+                                    let res = fc.resolve(&q, move || async move {
+                                        dns_via_socks5(&q2, socks5, upstream).await
+                                    }).await;
+                                    match res {
                                         Ok(response) => {
-                                            // src/dst swap: reply from resolver back to guest.
                                             let _ = tx.send((response, dst_addr, src_addr));
                                         }
                                         Err(e) => {
-                                            tracing::warn!(
-                                                "DNS via SOCKS5 {upstream} failed: {e}"
-                                            );
+                                            tracing::warn!("DNS resolve via SOCKS5 {upstream} failed: {e}");
                                         }
                                     }
                                 });

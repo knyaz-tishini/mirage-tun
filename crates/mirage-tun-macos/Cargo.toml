@@ -10,6 +10,7 @@ path = "src/bin/mirage2tun.rs"
 [dependencies]
 mirage-tun-core = { path = "../mirage-tun-core" }
 mirage-tcpip-stack = { path = "../mirage-tcpip-stack" }
+mirage-dns = { path = "../mirage-dns" }
 tokio = { version = "1", features = ["net", "io-util", "process", "sync", "rt", "rt-multi-thread", "macros", "fs", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
