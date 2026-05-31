@@ -48,13 +48,9 @@ impl MacosTunStack {
         cfg: StackConfig,
         cancel: CancellationToken,
     ) -> Result<(StackHandle<SmoltcpTcpAcceptor, SmoltcpUdpSocket>, Arc<MetricsRegistry>, Arc<ChainRegistry>), MacosTunError> {
-        if cfg.chains.len() > 1 {
-            warn!(
-                "MacosTunStack: {} chains configured — only first chain used for TCP forwarding",
-                cfg.chains.len()
-            );
-        }
-
+        // Phase 2b: multiple chains are now routed per-flow by policy (TCP path).
+        // The first chain remains the default (used when no policy rule matches,
+        // and for the DNS/UDP paths until those gain per-flow routing too).
         let chain_entry = cfg
             .chains
             .first()
@@ -113,6 +109,22 @@ impl MacosTunStack {
         let bypass_v6: Vec<(u128, u128)> = compiled_policy.bypass_cidrs_v6();
         if !bypass_cidr_strings.is_empty() {
             info!(bypass_cidrs = ?bypass_cidr_strings, "Phase 2a: bypass-plane CIDRs configured");
+        }
+
+        // Phase 2b — per-flow WIRE selection. The policy decides which wire (chain)
+        // a flow uses; `chain_socks_map` maps the chosen chain name → its SOCKS5
+        // addr. With a single chain + the default Chain("default") action the
+        // lookup misses → fallback to the first chain (byte-identical to today).
+        // Bypass dsts never reach the TCP accept loop (ip_filter excludes them).
+        let chain_socks_map: HashMap<String, SocketAddr> = cfg
+            .chains
+            .iter()
+            .map(|c| (c.name.clone(), c.socks5_addr))
+            .collect();
+        let policy_arc = Arc::new(compiled_policy);
+        let chain_socks_arc = Arc::new(chain_socks_map);
+        if cfg.chains.len() > 1 {
+            info!(wires = cfg.chains.len(), "Phase 2b: multi-wire routing (policy → chain)");
         }
 
         // 1. Open utun device
@@ -303,12 +315,23 @@ impl MacosTunStack {
             }
         });
 
-        // 10. TCP accept loop: smoltcp TcpListener → SOCKS5 forward
+        // 10. TCP accept loop: smoltcp TcpListener → policy → per-wire SOCKS5 forward
         let tcp_cancel = cancel.clone();
         let tcp_metrics = Arc::clone(&chain_metrics_registry);
-        let tcp_chain_name = chain_name.clone();
+        let tcp_default_chain = chain_name.clone();
+        let tcp_policy = Arc::clone(&policy_arc);
+        let tcp_chain_socks = Arc::clone(&chain_socks_arc);
         tokio::spawn(async move {
-            tcp_accept_loop(tcp_listener, socks5_addr, tcp_cancel, tcp_chain_name, tcp_metrics).await;
+            tcp_accept_loop(
+                tcp_listener,
+                tcp_policy,
+                tcp_chain_socks,
+                socks5_addr,
+                tcp_default_chain,
+                tcp_cancel,
+                tcp_metrics,
+            )
+            .await;
         });
 
         // 11. UDP forward loop: smoltcp UdpSocket → SOCKS5 UDP ASSOCIATE → chain
@@ -429,11 +452,14 @@ impl TunStack for MacosTunStack {
 
 async fn tcp_accept_loop(
     mut listener: mirage_tcpip_stack::TcpListener,
-    socks5_addr: SocketAddr,
+    policy: Arc<mirage_tun_core::policy::CompiledPolicy>,
+    chain_socks: Arc<HashMap<String, SocketAddr>>,
+    default_socks: SocketAddr,
+    default_chain: String,
     cancel: CancellationToken,
-    chain_name: String,
     metrics: Arc<MetricsRegistry>,
 ) {
+    use mirage_tun_core::policy::PolicyDecision;
     loop {
         tokio::select! {
             biased;
@@ -441,6 +467,22 @@ async fn tcp_accept_loop(
             conn = listener.next() => match conn {
                 None => break,
                 Some((stream, _local, remote)) => {
+                    // Phase 2b: pick the wire (chain) for this flow by policy.
+                    // Bypass dsts never arrive here (ip_filter excludes them); a
+                    // Bypass verdict or an unknown chain name falls back to the
+                    // default chain (single-wire behaviour preserved).
+                    let (chain_name, socks5_addr) = match policy.decide(
+                        remote.ip(),
+                        remote.port(),
+                        None,
+                        None,
+                    ) {
+                        PolicyDecision::Chain(name) => match chain_socks.get(&name) {
+                            Some(s) => (name, *s),
+                            None => (default_chain.clone(), default_socks),
+                        },
+                        PolicyDecision::Bypass => (default_chain.clone(), default_socks),
+                    };
                     metrics.record_connection(&chain_name);
                     let chain_m = metrics.get_or_create(&chain_name);
                     tokio::spawn(forward_tcp(stream, remote, socks5_addr, chain_m));
