@@ -312,6 +312,37 @@ impl CompiledPolicy {
             .map(|(addr, mask, _, _)| (*addr, *mask))
             .collect()
     }
+
+    /// Raw CIDR strings (as written in the rules) of every `DestCidr` rule whose
+    /// action is `Bypass`. Used by the platform routing layer to install
+    /// `route add -net <cidr> <gw>` so bypass-plane traffic egresses the real NIC
+    /// instead of the TUN — the macOS/Win parity for the operator's "байпас канал".
+    /// Domains are NOT included (can't be pre-routed without resolution).
+    pub fn bypass_cidr_strings(&self) -> Vec<String> {
+        self.rules
+            .iter()
+            .filter_map(|r| match r {
+                PolicyRule::DestCidr { cidr, action } if *action == PolicyDecision::Bypass => {
+                    Some(cidr.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Domains (as written) of every `DestDomain` rule whose action is `Bypass`.
+    /// The DNS path uses these to resolve+egress direct for bypass-plane domains.
+    pub fn bypass_domains(&self) -> Vec<String> {
+        self.rules
+            .iter()
+            .filter_map(|r| match r {
+                PolicyRule::DestDomain { domain, action } if *action == PolicyDecision::Bypass => {
+                    Some(domain.to_lowercase())
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 fn normalize_app_path(p: &str) -> String {

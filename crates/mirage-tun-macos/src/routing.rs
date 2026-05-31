@@ -19,6 +19,12 @@ pub struct MacosRouting {
     original_v6_gateway: Option<IpAddr>,
     /// Relay (VPN server) addresses added as bypass host routes (v4 + v6).
     bypassed_hosts: Vec<IpAddr>,
+    /// Bypass-PLANE CIDRs (e.g. "1.0.0.1/32", "10.0.0.0/8") routed via the
+    /// original gateway so the operator's "байпас канал" egresses the real NIC
+    /// instead of the TUN. Installed as `route add -net <cidr> <gw>` before the
+    /// /1 default-via-tun overrides. Distinct from `bypassed_hosts` (exact relay
+    /// IPs) — these are operator-configured network ranges from Bypass policy rules.
+    bypassed_nets: Vec<String>,
     /// TUN interface name (set when `set_default_route` is called).
     tun_name: Option<String>,
     /// TUN IPv4 peer IP (gateway to use for IPv4 default route).
@@ -35,6 +41,7 @@ impl MacosRouting {
             original_gateway: None,
             original_v6_gateway: None,
             bypassed_hosts: Vec::new(),
+            bypassed_nets: Vec::new(),
             tun_name: None,
             tun_peer: None,
             tun_peer_v6: None,
@@ -45,6 +52,12 @@ impl MacosRouting {
     /// Set the TUN IPv4 peer IP — must be called before `set_default_route`.
     pub fn set_tun_peer(&mut self, peer: IpAddr) {
         self.tun_peer = Some(peer);
+    }
+
+    /// Seed the bypass-plane CIDRs — must be called before `set_default_route`
+    /// so they're installed (via the original gateway) ahead of the /1 overrides.
+    pub fn set_bypass_nets(&mut self, nets: Vec<String>) {
+        self.bypassed_nets = nets;
     }
 
     /// Set the TUN IPv6 address (the address assigned to the utun interface, not a peer).
@@ -83,6 +96,19 @@ impl PlatformRouting for MacosRouting {
             }
         }
 
+        // Bypass-PLANE v4 CIDRs via the original gateway — installed BEFORE the
+        // /1 overrides so they're more-specific than default-via-tun → egress NIC.
+        for cidr in self.bypassed_nets.clone() {
+            if cidr_is_v6(&cidr) {
+                continue;
+            }
+            if let Err(e) = add_net_route(&cidr, gw, false).await {
+                warn!("bypass net route v4 {} failed: {}", cidr, e);
+            } else {
+                info!("bypass-plane v4 net {} via {}", cidr, gw);
+            }
+        }
+
         let peer = self.tun_peer.ok_or_else(|| MacosTunError::GatewayParse(
             "tun_peer must be set before set_default_route on macOS".into()
         ))?;
@@ -101,6 +127,17 @@ impl PlatformRouting for MacosRouting {
                         if let Err(e) = add_host_route_v6(relay, gw6).await {
                             warn!("bypass host route v6 {} failed: {}", relay, e);
                         }
+                    }
+                }
+                // Bypass-PLANE v6 CIDRs via the original v6 gateway.
+                for cidr in self.bypassed_nets.clone() {
+                    if !cidr_is_v6(&cidr) {
+                        continue;
+                    }
+                    if let Err(e) = add_net_route(&cidr, gw6, true).await {
+                        warn!("bypass net route v6 {} failed: {}", cidr, e);
+                    } else {
+                        info!("bypass-plane v6 net {} via {}", cidr, gw6);
                     }
                 }
             }
@@ -173,6 +210,14 @@ impl PlatformRouting for MacosRouting {
                         Err(e) => warn!("delete host route v6 {} failed: {}", relay, e),
                     }
                 }
+            }
+        }
+
+        // Remove bypass-plane net routes
+        for cidr in self.bypassed_nets.drain(..) {
+            let v6 = cidr_is_v6(&cidr);
+            if let Err(e) = del_net_route(&cidr, v6).await {
+                warn!("delete bypass net route {} failed: {}", cidr, e);
             }
         }
 
@@ -258,6 +303,34 @@ async fn get_default_gateway_v6() -> Result<IpAddr, MacosTunError> {
     Err(MacosTunError::GatewayParse(
         "no IPv6 default gateway found".to_string(),
     ))
+}
+
+/// True if the network part of `cidr` ("addr/prefix") parses as IPv6.
+fn cidr_is_v6(cidr: &str) -> bool {
+    cidr.split('/')
+        .next()
+        .and_then(|a| a.parse::<IpAddr>().ok())
+        .map(|ip| ip.is_ipv6())
+        .unwrap_or(false)
+}
+
+/// Add a network route for `cidr` (e.g. "1.0.0.1/32", "10.0.0.0/8") via `gateway`.
+/// `v6` selects the `-inet6` family. macOS `route` accepts CIDR for `-net`.
+async fn add_net_route(cidr: &str, gateway: IpAddr, v6: bool) -> Result<(), MacosTunError> {
+    if v6 {
+        run_route(&["add", "-inet6", "-net", cidr, &gateway.to_string()]).await
+    } else {
+        run_route(&["add", "-net", cidr, &gateway.to_string()]).await
+    }
+}
+
+/// Delete a previously-installed bypass network route.
+async fn del_net_route(cidr: &str, v6: bool) -> Result<(), MacosTunError> {
+    if v6 {
+        run_route(&["delete", "-inet6", "-net", cidr]).await
+    } else {
+        run_route(&["delete", "-net", cidr]).await
+    }
 }
 
 /// Add an IPv4 host route for `addr` via `gateway`.

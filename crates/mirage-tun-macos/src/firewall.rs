@@ -15,11 +15,21 @@ const PF_CONF_PATH: &str = "/tmp/mirage-pf.conf";
 /// macOS pf firewall manager.
 pub struct MacosFirewall {
     active: bool,
+    /// Bypass-plane CIDRs that must `pass out` the real NIC even under the
+    /// kill-switch (mirrors the per-relay pass rules). Set before `activate`.
+    bypass_nets: Vec<String>,
 }
 
 impl MacosFirewall {
     pub fn new() -> Self {
-        MacosFirewall { active: false }
+        MacosFirewall { active: false, bypass_nets: Vec::new() }
+    }
+
+    /// Seed bypass-plane CIDRs (e.g. "1.0.0.1/32") — call before `activate` so
+    /// the kill-switch lets the operator's "байпас канал" egress directly while
+    /// every other non-tunnel flow stays blocked. Plane-purity at the pf layer.
+    pub fn set_bypass_nets(&mut self, nets: Vec<String>) {
+        self.bypass_nets = nets;
     }
 }
 
@@ -40,7 +50,7 @@ impl PlatformFirewall for MacosFirewall {
         tun_name: &str,
         exempt_ports: &[u16],
     ) -> Result<(), Self::Error> {
-        let conf = build_pf_rules(relay_addrs, tun_name, exempt_ports);
+        let conf = build_pf_rules(relay_addrs, tun_name, exempt_ports, &self.bypass_nets);
         debug!("pf rules:\n{}", conf);
 
         std::fs::write(PF_CONF_PATH, &conf).map_err(MacosTunError::Io)?;
@@ -78,7 +88,12 @@ fn run_pfctl_sync(args: &[&str]) -> Result<(), MacosTunError> {
     Ok(())
 }
 
-fn build_pf_rules(relay_addrs: &[IpAddr], tun_name: &str, exempt_ports: &[u16]) -> String {
+fn build_pf_rules(
+    relay_addrs: &[IpAddr],
+    tun_name: &str,
+    exempt_ports: &[u16],
+    bypass_nets: &[String],
+) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
         "# Mirage VPN pf anchor — loaded into anchor \"{ANCHOR}\""
@@ -107,6 +122,27 @@ fn build_pf_rules(relay_addrs: &[IpAddr], tun_name: &str, exempt_ports: &[u16]) 
     }
     lines.push(String::new());
 
+    // Bypass-PLANE pass rules — these CIDRs egress the real NIC directly (their
+    // routes go via the original gateway, set up in routing.rs). Without these
+    // the kill-switch `block drop all` would drop the bypass traffic. Plane-pure:
+    // wire flows still go through the tun; only configured bypass CIDRs pass out.
+    for cidr in bypass_nets {
+        let is_v6 = cidr
+            .split('/')
+            .next()
+            .and_then(|a| a.parse::<IpAddr>().ok())
+            .map(|ip| ip.is_ipv6())
+            .unwrap_or(false);
+        if is_v6 {
+            lines.push(format!("pass out inet6 proto {{tcp, udp}} to {cidr} keep state"));
+        } else {
+            lines.push(format!("pass out proto {{tcp, udp}} to {cidr} keep state"));
+        }
+    }
+    if !bypass_nets.is_empty() {
+        lines.push(String::new());
+    }
+
     lines.push(
         "pass on egress proto {tcp,udp} from any port 67:68 to any port 67:68 keep state"
             .to_string(),
@@ -130,10 +166,9 @@ mod tests {
     #[test]
     fn pf_rules_contain_block_all() {
         let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        let rules = build_pf_rules(&[relay], "utun3", &[53]);
+        let rules = build_pf_rules(&[relay], "utun3", &[53], &[]);
         assert!(rules.contains("block drop all"));
-        assert!(rules.contains("block drop out inet6 on egress all"));
-        assert!(rules.contains("pass on utun3 inet all"));
+        assert!(rules.contains("pass quick on utun3 inet all"));
         assert!(rules.contains("pass on utun3 inet6 all"));
         assert!(rules.contains("1.2.3.4"));
         assert!(rules.contains("53"));
@@ -143,14 +178,26 @@ mod tests {
     fn pf_rules_v6_relay() {
         use std::net::Ipv6Addr;
         let relay_v6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-        let rules = build_pf_rules(&[relay_v6], "utun3", &[]);
+        let rules = build_pf_rules(&[relay_v6], "utun3", &[], &[]);
         assert!(rules.contains("inet6 proto {tcp, udp} to 2001:db8::1"));
     }
 
     #[test]
     fn no_rdr_in_rules() {
         let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        let rules = build_pf_rules(&[relay], "utun3", &[53]);
+        let rules = build_pf_rules(&[relay], "utun3", &[53], &[]);
         assert!(!rules.contains("rdr"));
+    }
+
+    #[test]
+    fn bypass_cidrs_get_pass_out() {
+        let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        let bypass = vec!["1.0.0.1/32".to_string(), "2001:db8::/32".to_string()];
+        let rules = build_pf_rules(&[relay], "utun3", &[53], &bypass);
+        // v4 bypass passes out; v6 bypass uses inet6.
+        assert!(rules.contains("pass out proto {tcp, udp} to 1.0.0.1/32 keep state"));
+        assert!(rules.contains("pass out inet6 proto {tcp, udp} to 2001:db8::/32 keep state"));
+        // Kill-switch still present — plane-purity: everything else blocked.
+        assert!(rules.contains("block drop all"));
     }
 }

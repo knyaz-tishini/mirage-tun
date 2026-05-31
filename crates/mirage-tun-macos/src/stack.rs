@@ -100,6 +100,21 @@ impl MacosTunStack {
             .and_then(|c| chain_dns_map.get(&c.name).copied())
             .unwrap_or(global_dns_upstream);
 
+        // Phase 2a — bypass plane. Compile the policy and extract Bypass CIDRs.
+        // These egress the real NIC directly (route via original gw + pf pass +
+        // smoltcp ip_filter exclude) — the operator's "байпас канал", plane-pure:
+        // wire flows still traverse the tun, only bypass CIDRs go direct.
+        let compiled_policy = mirage_tun_core::policy::CompiledPolicy::compile(
+            cfg.policy.rules.clone(),
+            cfg.policy.default_action.clone(),
+        );
+        let bypass_cidr_strings = compiled_policy.bypass_cidr_strings();
+        let bypass_v4: Vec<(u32, u32)> = compiled_policy.bypass_cidrs();
+        let bypass_v6: Vec<(u128, u128)> = compiled_policy.bypass_cidrs_v6();
+        if !bypass_cidr_strings.is_empty() {
+            info!(bypass_cidrs = ?bypass_cidr_strings, "Phase 2a: bypass-plane CIDRs configured");
+        }
+
         // 1. Open utun device
         let device = MacosTunDevice::open(0)?;
         let tun_name = device.interface_name().to_string();
@@ -122,6 +137,9 @@ impl MacosTunStack {
         // 3. Set up firewall (kill-switch only — no rdr)
         let mut firewall = MacosFirewall::new();
         if cfg.kill_switch {
+            // Bypass-plane CIDRs get `pass out` rules so the kill-switch doesn't
+            // drop them (they egress the real NIC via their original-gw routes).
+            firewall.set_bypass_nets(bypass_cidr_strings.clone());
             firewall.activate(&cfg.relay_addrs, &tun_name, &[53])?;
         }
 
@@ -145,6 +163,9 @@ impl MacosTunStack {
             for relay in &cfg.relay_addrs {
                 r.add_bypass_host(*relay).await?;
             }
+            // Bypass-plane CIDRs routed via the original gateway (before the /1
+            // overrides inside set_default_route) → they egress the real NIC.
+            r.set_bypass_nets(bypass_cidr_strings.clone());
             // 5. Set default route AFTER stack read loop is about to start
             r.set_default_route(&tun_name).await?;
         }
@@ -164,13 +185,34 @@ impl MacosTunStack {
         let relay_set: Arc<std::collections::HashSet<std::net::IpAddr>> =
             Arc::new(cfg.relay_addrs.iter().copied().collect());
         let relay_set2 = relay_set.clone();
+        // Bypass CIDRs excluded from smoltcp interception too (they route direct
+        // via the original gw). Belt-and-suspenders parity with relay handling:
+        // even if a bypass packet reaches the tun before its route lands, smoltcp
+        // must not grab it.
+        let bypass_v4_filter = Arc::new(bypass_v4.clone());
+        let bypass_v6_filter = Arc::new(bypass_v6.clone());
 
         let (stack, runner, udp_socket_opt, tcp_listener_opt) = StackBuilder::default()
             .enable_tcp(true)
             .enable_udp(true)
             .enable_icmp(false)
             .mtu(cfg.mtu as usize)
-            .add_ip_filter_fn(move |_src, dst| !relay_set2.contains(dst))
+            .add_ip_filter_fn(move |_src, dst| {
+                if relay_set2.contains(dst) {
+                    return false;
+                }
+                let bypassed = match dst {
+                    IpAddr::V4(v4) => {
+                        let u = u32::from(*v4);
+                        bypass_v4_filter.iter().any(|(net, mask)| u & mask == net & mask)
+                    }
+                    IpAddr::V6(v6) => {
+                        let u = u128::from(*v6);
+                        bypass_v6_filter.iter().any(|(net, mask)| u & mask == net & mask)
+                    }
+                };
+                !bypassed
+            })
             .build()
             .map_err(|e| MacosTunError::Other(format!("smoltcp build: {e}")))?;
 

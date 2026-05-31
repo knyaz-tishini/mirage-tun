@@ -1,5 +1,5 @@
 use clap::Parser;
-use mirage_tun_core::policy::{PolicyConfigRequest, PolicyDecision};
+use mirage_tun_core::policy::{PolicyConfigRequest, PolicyDecision, PolicyRule};
 use mirage_tun_core::stack_config::{ChainDnsConfig, ChainEntry, StackConfig};
 use mirage_tun_macos::{api, MacosTunStack};
 use serde::Deserialize;
@@ -49,12 +49,50 @@ struct BinConfig {
     per_chain_tun: bool,
     #[serde(default = "default_api_bind")]
     api_bind: String,
+    /// Full routing policy (CIDR/domain/port/app → chain|bypass). Absent = all
+    /// flows use the first chain (legacy single-wire). Phase 2a: Bypass DestCidr
+    /// rules form the bypass plane.
+    #[serde(default)]
+    policy: Option<PolicyConfigRequest>,
+    /// Convenience shortcut for the common "байпас канал" case — CIDRs/domains
+    /// to egress DIRECT (real NIC). Appended as Bypass policy rules.
+    #[serde(default)]
+    bypass: BypassShortcut,
 }
 
 #[derive(Deserialize)]
 struct BinChainEntry {
     name: String,
     socks5_addr: SocketAddr,
+}
+
+#[derive(Deserialize, Default)]
+struct BypassShortcut {
+    #[serde(default)]
+    cidrs: Vec<String>,
+    #[serde(default)]
+    domains: Vec<String>,
+}
+
+/// Merge the optional explicit policy with the bypass-shortcut CIDRs/domains.
+fn build_policy(base: Option<PolicyConfigRequest>, bypass: &BypassShortcut) -> PolicyConfigRequest {
+    let mut req = base.unwrap_or_else(|| PolicyConfigRequest {
+        rules: vec![],
+        default_action: PolicyDecision::default_chain(),
+    });
+    for cidr in &bypass.cidrs {
+        req.rules.push(PolicyRule::DestCidr {
+            cidr: cidr.clone(),
+            action: PolicyDecision::Bypass,
+        });
+    }
+    for domain in &bypass.domains {
+        req.rules.push(PolicyRule::DestDomain {
+            domain: domain.clone(),
+            action: PolicyDecision::Bypass,
+        });
+    }
+    req
 }
 
 #[derive(Deserialize)]
@@ -78,10 +116,7 @@ impl From<BinConfig> for StackConfig {
             tun_addr_v6: b.tun_addr_v6,
             mtu: b.mtu,
             chains: b.chains.into_iter().map(|c| ChainEntry { name: c.name, socks5_addr: c.socks5_addr }).collect(),
-            policy: PolicyConfigRequest {
-                rules: vec![],
-                default_action: PolicyDecision::default_chain(),
-            },
+            policy: build_policy(b.policy, &b.bypass),
             chain_dns: b.chain_dns.into_iter().map(|d| ChainDnsConfig { chain_name: d.chain_name, servers: d.servers }).collect(),
             kill_switch: b.kill_switch,
             relay_addrs: b.relay_addrs,
