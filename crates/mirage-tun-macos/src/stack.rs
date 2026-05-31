@@ -29,6 +29,7 @@ use mirage_tun_core::{
         private::Sealed, PlatformDns, PlatformFirewall, PlatformRouting, StackHandle,
         TunStack,
     },
+    wire_health::WireHealthMap,
 };
 use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::Arc};
 use tokio::sync::{mpsc, Mutex};
@@ -126,6 +127,28 @@ impl MacosTunStack {
         if cfg.chains.len() > 1 {
             info!(wires = cfg.chains.len(), "Phase 2b: multi-wire routing (policy → chain)");
         }
+
+        // Wave 3 — per-wire liveness + failover groups.
+        // WireHealthMap: shared between the accept loop and each forward_tcp task.
+        // Updated on each SOCKS5 connect success/failure; consulted at accept time
+        // to enforce fail-closed / failover semantics before spawning a task.
+        let wire_health = WireHealthMap::new();
+
+        // WireGroupMap: group_name → ordered Vec<(chain_name, socks5_addr)>.
+        // Built once at startup. Chains without a group do not appear here;
+        // a Failover rule naming an unknown/empty group degrades to fail-closed.
+        let wire_group_map: HashMap<String, Vec<(String, SocketAddr)>> = {
+            let mut m: HashMap<String, Vec<(String, SocketAddr)>> = HashMap::new();
+            for c in &cfg.chains {
+                if let Some(ref g) = c.group {
+                    m.entry(g.clone())
+                        .or_default()
+                        .push((c.name.clone(), c.socks5_addr));
+                }
+            }
+            m
+        };
+        let wire_groups_arc = Arc::new(wire_group_map);
 
         // 1. Open utun device
         let device = MacosTunDevice::open(0)?;
@@ -322,6 +345,8 @@ impl MacosTunStack {
         let tcp_default_chain = chain_name.clone();
         let tcp_policy = Arc::clone(&policy_arc);
         let tcp_chain_socks = Arc::clone(&chain_socks_arc);
+        let tcp_wire_health = Arc::clone(&wire_health);
+        let tcp_wire_groups = Arc::clone(&wire_groups_arc);
         tokio::spawn(async move {
             tcp_accept_loop(
                 tcp_listener,
@@ -331,6 +356,8 @@ impl MacosTunStack {
                 tcp_default_chain,
                 tcp_cancel,
                 tcp_metrics,
+                tcp_wire_health,
+                tcp_wire_groups,
             )
             .await;
         });
@@ -459,8 +486,10 @@ async fn tcp_accept_loop(
     default_chain: String,
     cancel: CancellationToken,
     metrics: Arc<MetricsRegistry>,
+    wire_health: Arc<WireHealthMap>,
+    wire_groups: Arc<HashMap<String, Vec<(String, SocketAddr)>>>,
 ) {
-    use mirage_tun_core::policy::PolicyDecision;
+    use mirage_tun_core::policy::{FailurePolicy, PolicyDecision};
     loop {
         tokio::select! {
             biased;
@@ -468,25 +497,93 @@ async fn tcp_accept_loop(
             conn = listener.next() => match conn {
                 None => break,
                 Some((stream, _local, remote)) => {
-                    // Phase 2b: pick the wire (chain) for this flow by policy.
-                    // Bypass dsts never arrive here (ip_filter excludes them); a
-                    // Bypass verdict or an unknown chain name falls back to the
-                    // default chain (single-wire behaviour preserved).
-                    let (chain_name, socks5_addr) = match policy.decide(
-                        remote.ip(),
-                        remote.port(),
-                        None,
-                        None,
-                    ) {
-                        PolicyDecision::Chain(name) => match chain_socks.get(&name) {
-                            Some(s) => (name, *s),
-                            None => (default_chain.clone(), default_socks),
-                        },
-                        PolicyDecision::Bypass => (default_chain.clone(), default_socks),
+                    // Wave 3: full routing decision — includes failure policy.
+                    // Bypass dsts never arrive here (ip_filter excludes them).
+                    let decision = policy.decide_full(remote.ip(), remote.port(), None, None);
+
+                    // Resolve the (wire_name, socks5_addr) to use, or None → fail-closed.
+                    let chosen: Option<(String, SocketAddr)> = match decision.action {
+                        // Bypass should never reach here, but if it does (domain-bypass
+                        // without a pre-installed route): fall back to default chain.
+                        // Bypass is unconditional and never affected by wire health.
+                        PolicyDecision::Bypass => Some((default_chain.clone(), default_socks)),
+
+                        PolicyDecision::Chain(name) => {
+                            // Resolve preferred wire's socks addr.
+                            // Unknown chain name → fall back to default chain.
+                            let (pref_name, pref_socks) = if chain_socks.contains_key(&name) {
+                                let s = *chain_socks.get(&name).expect("checked above");
+                                (name, s)
+                            } else {
+                                (default_chain.clone(), default_socks)
+                            };
+
+                            match decision.failure_policy {
+                                FailurePolicy::FailClosed => {
+                                    // No reroute ever. Fail closed if wire is unhealthy.
+                                    if wire_health.is_healthy(&pref_name) {
+                                        Some((pref_name, pref_socks))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                FailurePolicy::Failover { ref group } => {
+                                    // Try group members in order. Unknown/empty group →
+                                    // degrade to fail-closed on the preferred wire.
+                                    match wire_groups.get(group) {
+                                        Some(cands) if !cands.is_empty() => {
+                                            match wire_health.first_healthy(cands) {
+                                                Some(pair) => {
+                                                    if pair.0 != pref_name {
+                                                        info!(
+                                                            dst = %remote,
+                                                            preferred = %pref_name,
+                                                            chosen = %pair.0,
+                                                            group = %group,
+                                                            "failover: preferred wire down, rerouting"
+                                                        );
+                                                    }
+                                                    Some(pair.clone())
+                                                }
+                                                // All group members unhealthy → fail closed.
+                                                None => None,
+                                            }
+                                        }
+                                        _ => {
+                                            // Unknown or empty group → fall back to
+                                            // fail-closed semantics on preferred wire.
+                                            if wire_health.is_healthy(&pref_name) {
+                                                Some((pref_name, pref_socks))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     };
-                    metrics.record_connection(&chain_name);
-                    let chain_m = metrics.get_or_create(&chain_name);
-                    tokio::spawn(forward_tcp(stream, remote, socks5_addr, chain_m));
+
+                    match chosen {
+                        Some((chain_name, socks5_addr)) => {
+                            metrics.record_connection(&chain_name);
+                            let chain_m = metrics.get_or_create(&chain_name);
+                            tokio::spawn(forward_tcp(
+                                stream,
+                                remote,
+                                socks5_addr,
+                                chain_name,
+                                Arc::clone(&wire_health),
+                                chain_m,
+                            ));
+                        }
+                        None => {
+                            // Fail-closed: drop the accepted stream → smoltcp RST.
+                            // Zero egress. No reroute. Bypass plane is untouched.
+                            warn!(dst = %remote, "wire fail-closed (unhealthy, no healthy failover) — RST");
+                            drop(stream);
+                        }
+                    }
                 }
             }
         }
@@ -497,10 +594,15 @@ async fn tcp_accept_loop(
 /// bidirectionally pipe `stream` to the SOCKS5 channel.
 ///
 /// SOCKS5 no-auth CONNECT per RFC 1928.
+///
+/// Wave 3: `wire_name` and `wire_health` are used to record success/failure
+/// so the accept loop can make health-aware routing decisions for future flows.
 async fn forward_tcp(
     mut stream: mirage_tcpip_stack::TcpStream,
     target: SocketAddr,
     socks5_addr: SocketAddr,
+    wire_name: String,
+    wire_health: Arc<WireHealthMap>,
     chain_metrics: Arc<crate::metrics::ChainMetrics>,
 ) {
     use std::sync::atomic::Ordering;
@@ -510,6 +612,7 @@ async fn forward_tcp(
         Ok(s) => s,
         Err(e) => {
             warn!("SOCKS5 connect to {} failed: {}", socks5_addr, e);
+            wire_health.record_failure(&wire_name);
             chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -518,6 +621,7 @@ async fn forward_tcp(
     // Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
     if let Err(e) = socks.write_all(&[0x05, 0x01, 0x00]).await {
         warn!("SOCKS5 greeting write failed: {e}");
+        wire_health.record_failure(&wire_name);
         chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -525,11 +629,13 @@ async fn forward_tcp(
     let mut resp = [0u8; 2];
     if let Err(e) = socks.read_exact(&mut resp).await {
         warn!("SOCKS5 greeting read failed: {e}");
+        wire_health.record_failure(&wire_name);
         chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
     if resp[0] != 0x05 || resp[1] != 0x00 {
         warn!("SOCKS5 auth method rejected: {:?}", resp);
+        wire_health.record_failure(&wire_name);
         chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -538,6 +644,7 @@ async fn forward_tcp(
     let req = build_socks5_connect(target);
     if let Err(e) = socks.write_all(&req).await {
         warn!("SOCKS5 CONNECT write failed: {e}");
+        wire_health.record_failure(&wire_name);
         chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -546,11 +653,13 @@ async fn forward_tcp(
     let mut hdr = [0u8; 4];
     if let Err(e) = socks.read_exact(&mut hdr).await {
         warn!("SOCKS5 CONNECT response read failed: {e}");
+        wire_health.record_failure(&wire_name);
         chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
     if hdr[1] != 0x00 {
         warn!("SOCKS5 CONNECT failed, reply code: 0x{:02x}", hdr[1]);
+        wire_health.record_failure(&wire_name);
         chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -561,6 +670,7 @@ async fn forward_tcp(
         0x03 => {
             let mut len = [0u8; 1];
             if socks.read_exact(&mut len).await.is_err() {
+                wire_health.record_failure(&wire_name);
                 chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -568,6 +678,7 @@ async fn forward_tcp(
         }
         _ => {
             warn!("SOCKS5 unknown atyp: 0x{:02x}", hdr[3]);
+            wire_health.record_failure(&wire_name);
             chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -575,9 +686,13 @@ async fn forward_tcp(
     let mut tail = vec![0u8; skip];
     if let Err(e) = socks.read_exact(&mut tail).await {
         warn!("SOCKS5 bound addr read failed: {e}");
+        wire_health.record_failure(&wire_name);
         chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
+
+    // SOCKS5 handshake succeeded — wire proved it can carry this flow.
+    wire_health.record_success(&wire_name);
 
     match tokio::io::copy_bidirectional(&mut stream, &mut socks).await {
         Ok((tx, rx)) => {
