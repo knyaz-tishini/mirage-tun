@@ -1,10 +1,21 @@
-/// macOS pf firewall — bypass-safe posture (no global block).
+/// macOS pf firewall — leak-proof traffic-adoption floor.
 ///
 /// Rules are loaded into the `mirage` pf anchor to avoid interfering with
 /// system rules in `/etc/pf.conf`. The anchor is flushed on deactivation.
-/// Selective fail-closed is enforced at the `tcp_accept_loop` routing layer,
-/// not here. pf's role: allow relay egress + bypass plane; tun traffic passes
-/// through smoltcp.
+///
+/// This is the macOS equivalent of the Windows WFP block-all floor: route
+/// priority (`0/1 + 128/1` via the utun peer, set up in routing.rs) CAPTURES
+/// traffic into the tun, and this pf anchor ENFORCES that capture — any egress
+/// that escaped the tun (stale more-specific route, IPv6 with no tun_peer_v6,
+/// the route install/teardown window) is DROPPED by the floor instead of
+/// leaking the real NIC IP. Loaded BEFORE routing (activate precedes
+/// set_default_route) and flushed AFTER route restore (deactivate follows
+/// restore_routes), so the floor guards every transition.
+///
+/// It is NOT a global `block drop all`: tun, relay egress, the bypass plane,
+/// LAN/control link, link-local, multicast, DHCP and exempt ports are all
+/// `pass quick` exempted, so the bypass plane, the opbox↔Mac control link and
+/// any OTHER tun cluster's local traffic stay fully alive.
 ///
 /// TCP is handled by mirage-tcpip-stack (smoltcp) — no rdr rule needed.
 use crate::error::MacosTunError;
@@ -114,11 +125,11 @@ fn build_pf_rules(
 
     for relay in relay_addrs {
         if relay.is_ipv6() {
-            lines.push(format!("pass out inet6 proto {{tcp, udp}} to {relay} keep state"));
-            lines.push(format!("pass in inet6 proto {{tcp, udp}} from {relay} keep state"));
+            lines.push(format!("pass quick out inet6 proto {{tcp, udp}} to {relay} keep state"));
+            lines.push(format!("pass quick in inet6 proto {{tcp, udp}} from {relay} keep state"));
         } else {
-            lines.push(format!("pass out proto {{tcp, udp}} to {relay} keep state"));
-            lines.push(format!("pass in proto {{tcp, udp}} from {relay} keep state"));
+            lines.push(format!("pass quick out proto {{tcp, udp}} to {relay} keep state"));
+            lines.push(format!("pass quick in proto {{tcp, udp}} from {relay} keep state"));
         }
     }
     lines.push(String::new());
@@ -134,26 +145,53 @@ fn build_pf_rules(
             .map(|ip| ip.is_ipv6())
             .unwrap_or(false);
         if is_v6 {
-            lines.push(format!("pass out inet6 proto {{tcp, udp}} to {cidr} keep state"));
+            lines.push(format!("pass quick out inet6 proto {{tcp, udp}} to {cidr} keep state"));
         } else {
-            lines.push(format!("pass out proto {{tcp, udp}} to {cidr} keep state"));
+            lines.push(format!("pass quick out proto {{tcp, udp}} to {cidr} keep state"));
         }
     }
     if !bypass_nets.is_empty() {
         lines.push(String::new());
     }
 
+    // ── Control / LAN / link-local / multicast — NEVER severed by the floor ──
+    // Keeps the bypass plane (incl. the opbox↔Mac control link over the LAN),
+    // DHCP, mDNS/ND, and ANY OTHER tun cluster's local traffic alive. RFC1918 +
+    // link-local + multicast egress the real NIC unconditionally; the floor
+    // below only drops escaped PUBLIC-internet wire traffic.
+    lines.push("pass quick out to 10.0.0.0/8 keep state".to_string());
+    lines.push("pass quick out to 172.16.0.0/12 keep state".to_string());
+    lines.push("pass quick out to 192.168.0.0/16 keep state".to_string());
+    lines.push("pass quick out to 169.254.0.0/16 keep state".to_string());
+    lines.push("pass quick out to 224.0.0.0/4 keep state".to_string());
+    lines.push("pass quick out inet6 to fe80::/10 keep state".to_string());
+    lines.push("pass quick out inet6 to ff00::/8 keep state".to_string());
+    lines.push(String::new());
+
     lines.push(
-        "pass on egress proto {tcp,udp} from any port 67:68 to any port 67:68 keep state"
+        "pass quick on egress proto {tcp,udp} from any port 67:68 to any port 67:68 keep state"
             .to_string(),
     );
     if !exempt_ports.is_empty() {
         let ports: Vec<String> = exempt_ports.iter().map(|p| p.to_string()).collect();
         let ports_str = ports.join(", ");
         lines.push(format!(
-            "pass out proto {{tcp, udp}} to any port {{{ports_str}}} keep state"
+            "pass quick out proto {{tcp, udp}} to any port {{{ports_str}}} keep state"
         ));
     }
+    lines.push(String::new());
+
+    // ── LEAK-FLOOR (kernel-enforced fail-closed) ──────────────────────────────
+    // Any egress NOT matched by an exempt `pass quick` above — i.e. wire traffic
+    // that escaped capture into the tun (stale route, IPv6 with no tun_peer_v6,
+    // route install/teardown window) — is DROPPED here, never leaked to the real
+    // NIC. macOS equivalent of the Windows WFP block-all floor. `out inet/inet6
+    // all` (NOT `on egress`, which would resolve to the utun once routes flip);
+    // the `pass quick on {tun}` above exempts the captured path. The `inet6`
+    // floor also closes the IPv6 capture gap: when tun_peer_v6 is unset and v6 is
+    // not routed into the tun, v6 egress fails CLOSED instead of leaking.
+    lines.push("block drop out inet all".to_string());
+    lines.push("block drop out inet6 all".to_string());
 
     lines.join("\n") + "\n"
 }
@@ -164,17 +202,25 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
-    fn pf_rules_have_no_global_block() {
+    fn pf_rules_have_leak_floor_with_exemptions() {
         let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         let rules = build_pf_rules(&[relay], "utun3", &[53], &[]);
-        // No global kill-switch block — selective fail-closed is at the accept loop.
+        // Kernel-enforced leak-floor: wire egress that escaped the tun is dropped,
+        // never leaked to the real NIC (macOS equivalent of Windows WFP block-all).
+        assert!(rules.contains("block drop out inet all"));
+        assert!(rules.contains("block drop out inet6 all"));
+        // NOT a global block-everything — that would sever the bypass plane.
         assert!(!rules.contains("block drop all"));
-        assert!(!rules.contains("block drop out inet6"));
-        // But the essential pass rules must still be present.
+        // Exemptions must be `pass quick` so they win over the floor.
         assert!(rules.contains("pass quick on utun3 inet all"));
         assert!(rules.contains("pass quick on utun3 inet6 all"));
-        assert!(rules.contains("1.2.3.4"));
-        assert!(rules.contains("53"));
+        assert!(rules.contains("pass quick out proto {tcp, udp} to 1.2.3.4 keep state")); // relay
+        assert!(rules.contains("pass quick out to 192.168.0.0/16 keep state"));            // LAN/control
+        assert!(rules.contains("pass quick out to 10.0.0.0/8 keep state"));
+        assert!(rules.contains("pass quick out inet6 to fe80::/10 keep state"));           // v6 ND
+        assert!(rules.contains("53")); // exempt port
+        // lo0 skipped so loopback (control IPC) is never touched.
+        assert!(rules.contains("set skip on lo0"));
     }
 
     #[test]
@@ -197,10 +243,11 @@ mod tests {
         let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         let bypass = vec!["1.0.0.1/32".to_string(), "2001:db8::/32".to_string()];
         let rules = build_pf_rules(&[relay], "utun3", &[53], &bypass);
-        // v4 bypass passes out; v6 bypass uses inet6.
-        assert!(rules.contains("pass out proto {tcp, udp} to 1.0.0.1/32 keep state"));
-        assert!(rules.contains("pass out inet6 proto {tcp, udp} to 2001:db8::/32 keep state"));
-        // No global block — bypass-safe posture; fail-closed is at the accept loop.
+        // v4 bypass passes out (quick, above the floor); v6 bypass uses inet6.
+        assert!(rules.contains("pass quick out proto {tcp, udp} to 1.0.0.1/32 keep state"));
+        assert!(rules.contains("pass quick out inet6 proto {tcp, udp} to 2001:db8::/32 keep state"));
+        // Floor present, but bypass exemptions sit above it (quick) — never severed.
+        assert!(rules.contains("block drop out inet all"));
         assert!(!rules.contains("block drop all"));
     }
 }
