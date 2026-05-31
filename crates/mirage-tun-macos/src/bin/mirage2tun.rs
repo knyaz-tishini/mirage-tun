@@ -64,7 +64,7 @@ struct BinChainDnsConfig {
 }
 
 fn default_api_bind() -> String { "127.0.0.1:19485".to_string() }
-fn default_mtu() -> u16 { 1500 }
+fn default_mtu() -> u16 { 1280 } // onion+AEAD+camo headroom; 1500 = PMTUD blackhole on the onion handshake
 fn default_true() -> bool { true }
 fn default_dns_upstream() -> SocketAddr { "8.8.8.8:53".parse().expect("static addr") }
 fn default_ttl() -> u64 { 300 }

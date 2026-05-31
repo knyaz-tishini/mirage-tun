@@ -19,7 +19,12 @@ impl Default for TunConfig {
         Self {
             tun_name: "mirage0".into(),
             tun_addr: "10.0.85.1/24".into(),
-            mtu: 1500,
+            // 1280 (IPv6 minimum) leaves headroom for onion+AEAD+camo per-hop
+            // overhead. At 1500 the onion-wrapped segments exceed path MTU →
+            // PMTUD blackhole: TCP connect succeeds but the onion handshake /
+            // data-exchange stalls (verified on Mac edge — 1500 = 0% E2E,
+            // 1280 = traffic flows). Tunable; compute from hop count later.
+            mtu: 1280,
             dns_hijack: true,
             intercept: InterceptStrategy::IpStack,
         }
