@@ -36,6 +36,10 @@ pub struct StackConfig {
 pub struct ChainEntry {
     pub name: String,
     pub socks5_addr: SocketAddr,
+    /// Optional failover group this chain belongs to.
+    /// Chains in the same group are interchangeable for `FailurePolicy::Failover`.
+    /// `None` = chain is not part of any group.
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone)]
