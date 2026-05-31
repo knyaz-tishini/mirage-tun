@@ -112,6 +112,15 @@ impl PlatformRouting for MacosRouting {
         let peer = self.tun_peer.ok_or_else(|| MacosTunError::GatewayParse(
             "tun_peer must be set before set_default_route on macOS".into()
         ))?;
+        // Idempotent install. A prior CRASH (panic / memory-guard / SIGKILL)
+        // exits without restore_routes, leaving these /1 routes behind. On
+        // respawn a bare `route add` would fail with "route already in table",
+        // the `?` would abort stack startup, the tun would never come up, and
+        // the leak-floor (which also survives the crash) would stay up — the box
+        // is then bricked fail-closed. Delete-first (ignore "not found") makes
+        // respawn-after-crash always recover.
+        let _ = run_route(&["delete", "-net", "0.0.0.0/1"]).await;
+        let _ = run_route(&["delete", "-net", "128.0.0.0/1"]).await;
         run_route(&["add", "-net", "0.0.0.0/1", &peer.to_string()]).await?;
         run_route(&["add", "-net", "128.0.0.0/1", &peer.to_string()]).await?;
         info!("IPv4 default route via {} peer={} (0/1 + 128/1 trick)", tun_name, peer);
@@ -151,6 +160,9 @@ impl PlatformRouting for MacosRouting {
         // through the tunnel regardless of local-network capability.
         if let Some(peer6) = self.tun_peer_v6 {
             let peer6_str = peer6.to_string();
+            // Idempotent install (same crash-recovery reasoning as the v4 /1 routes).
+            let _ = run_route(&["delete", "-inet6", "-net", "::/1"]).await;
+            let _ = run_route(&["delete", "-inet6", "-net", "8000::/1"]).await;
             let r1 = run_route(&["add", "-inet6", "-net", "::/1", &peer6_str]).await;
             let r2 = run_route(&["add", "-inet6", "-net", "8000::/1", &peer6_str]).await;
             match (r1, r2) {
