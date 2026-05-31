@@ -314,22 +314,44 @@ fn cidr_is_v6(cidr: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Add a network route for `cidr` (e.g. "1.0.0.1/32", "10.0.0.0/8") via `gateway`.
-/// `v6` selects the `-inet6` family. macOS `route` accepts CIDR for `-net`.
-async fn add_net_route(cidr: &str, gateway: IpAddr, v6: bool) -> Result<(), MacosTunError> {
-    if v6 {
-        run_route(&["add", "-inet6", "-net", cidr, &gateway.to_string()]).await
+/// Decide route form for a CIDR: a /32 (v4) or /128 (v6) MUST use the `-host`
+/// form, otherwise `-net`. macOS stores a `route add -net 1.2.3.4/32` AS a host
+/// route, but `route delete -net 1.2.3.4/32` then does NOT match it → the route
+/// leaks on teardown (the stale-1.1.1.1 bug). Using host form symmetrically on
+/// add+delete fixes it. Returns (route_kind_flag, target_string).
+fn route_form(cidr: &str) -> (&'static str, String) {
+    if let Some((addr, prefix)) = cidr.split_once('/') {
+        if let Ok(p) = prefix.parse::<u32>() {
+            let is_v6 = addr.parse::<IpAddr>().map(|i| i.is_ipv6()).unwrap_or(false);
+            let host_prefix = if is_v6 { 128 } else { 32 };
+            if p == host_prefix {
+                return ("-host", addr.to_string());
+            }
+        }
+        ("-net", cidr.to_string())
     } else {
-        run_route(&["add", "-net", cidr, &gateway.to_string()]).await
+        ("-host", cidr.to_string())
     }
 }
 
-/// Delete a previously-installed bypass network route.
-async fn del_net_route(cidr: &str, v6: bool) -> Result<(), MacosTunError> {
+/// Add a route for `cidr` (e.g. "1.0.0.1/32", "10.0.0.0/8") via `gateway`.
+/// `v6` selects the `-inet6` family. /32 + /128 use `-host` (see `route_form`).
+async fn add_net_route(cidr: &str, gateway: IpAddr, v6: bool) -> Result<(), MacosTunError> {
+    let (kind, target) = route_form(cidr);
     if v6 {
-        run_route(&["delete", "-inet6", "-net", cidr]).await
+        run_route(&["add", "-inet6", kind, &target, &gateway.to_string()]).await
     } else {
-        run_route(&["delete", "-net", cidr]).await
+        run_route(&["add", kind, &target, &gateway.to_string()]).await
+    }
+}
+
+/// Delete a previously-installed bypass route (symmetric host/net form).
+async fn del_net_route(cidr: &str, v6: bool) -> Result<(), MacosTunError> {
+    let (kind, target) = route_form(cidr);
+    if v6 {
+        run_route(&["delete", "-inet6", kind, &target]).await
+    } else {
+        run_route(&["delete", kind, &target]).await
     }
 }
 
