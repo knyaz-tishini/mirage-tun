@@ -2,7 +2,7 @@
 //!
 //! Extracts the 5-tuple (protocol, src_ip, src_port, dst_ip, dst_port) from
 //! raw Layer-3 packets.  Used by the userspace NAT path and by the UDP DNS
-//! hijack path.
+//! take-over path.
 //!
 //! No options parsing.  No reassembly.  No packet construction.
 
