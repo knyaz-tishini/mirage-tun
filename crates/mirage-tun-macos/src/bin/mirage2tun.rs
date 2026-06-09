@@ -51,6 +51,14 @@ struct BinConfig {
     per_chain_tun: bool,
     #[serde(default = "default_api_bind")]
     api_bind: String,
+    /// Optional Bearer token required on all guarded control-API routes.
+    ///
+    /// When `Some`, every request to a guarded route must carry
+    /// `Authorization: Bearer <api_key>`.  `/health` and `/metrics` are always open.
+    /// When `None` (default), the API is unauthenticated and a one-time warning
+    /// is emitted at startup.
+    #[serde(default)]
+    api_key: Option<String>,
     /// Full routing policy (CIDR/domain/port/app → chain|bypass). Absent = all
     /// flows use the first chain (legacy single-wire). Phase 2a: Bypass DestCidr
     /// rules form the bypass plane.
@@ -182,6 +190,7 @@ fn main() {
         });
 
         let api_bind_str = bin_cfg.api_bind.clone();
+        let api_key = bin_cfg.api_key.clone();
         let cfg: StackConfig = bin_cfg.into();
 
         let cancel = CancellationToken::new();
@@ -219,7 +228,7 @@ fn main() {
                     tracing::error!(val = %api_bind_str, err = %e, "invalid api_bind — using default");
                     "127.0.0.1:19485".parse().expect("hardcoded fallback is valid")
                 });
-                tokio::spawn(api::serve(api_bind, chain_metrics, chain_registry, cancel.child_token()));
+                tokio::spawn(api::serve(api_bind, chain_metrics, chain_registry, cancel.child_token(), api_key));
 
                 cancel.cancelled().await;
                 tracing::info!("cancelled — exiting");

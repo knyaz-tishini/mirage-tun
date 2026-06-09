@@ -34,6 +34,14 @@ pub struct TunConfig {
     /// Optional Bearer token sent to the monitor on every request.
     #[serde(default)]
     pub monitor_api_key: Option<String>,
+    /// Optional Bearer token required on all mutating control-API routes.
+    ///
+    /// When `Some`, every request to a guarded route must carry
+    /// `Authorization: Bearer <api_key>`.  `/health` is always open.
+    /// When `None` (default), the API is unauthenticated and a one-time
+    /// warning is emitted at startup.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Per-connection TCP send buffer size inside smoltcp (bytes).
     /// Default: 524288 (512 KB).
     #[serde(default = "default_tcp_send_buffer_size")]
@@ -103,6 +111,7 @@ impl Default for TunConfig {
             drain_timeout_secs: default_drain_timeout_secs(),
             monitor_url: None,
             monitor_api_key: None,
+            api_key: None,
             tcp_send_buffer_size: default_tcp_send_buffer_size(),
             tcp_recv_buffer_size: default_tcp_recv_buffer_size(),
         }

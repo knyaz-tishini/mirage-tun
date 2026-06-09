@@ -1,14 +1,19 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::net::{IpAddr, SocketAddr};
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
+
+/// Emitted at most once across the process lifetime.
+static UNAUTHED_WARNED: OnceLock<()> = OnceLock::new();
 
 use mirage_tun_core::traits::PlatformFirewall;
 
@@ -72,8 +77,14 @@ pub struct AppState {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    // Routes that are always open (unauthenticated health/metrics scrapers).
+    let open = Router::new()
         .route("/health", get(get_health))
+        .route("/metrics", get(get_metrics))
+        .route("/connections", get(get_connections));
+
+    // All mutating and state-exposing routes require auth when api_key is set.
+    let guarded = Router::new()
         .route("/status", get(get_status))
         .route("/config", get(get_config))
         .route("/tun/start", post(post_tun_start))
@@ -84,10 +95,57 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/policy/get", get(get_policy))
         .route("/policy/set", post(set_policy))
         .route("/chains/list", get(get_chains_list))
-        .route("/chains/update", post(post_chains_update))
-        .route("/metrics", get(get_metrics))
-        .route("/connections", get(get_connections))
-        .with_state(state)
+        .route("/chains/update", post(post_chains_update));
+
+    // Wrap guarded routes with the Bearer middleware when api_key is configured.
+    let guarded = match state.config.api_key.clone() {
+        Some(key) => {
+            let key = Arc::new(key);
+            guarded.layer(middleware::from_fn_with_state(key, bearer_gate))
+        }
+        None => {
+            UNAUTHED_WARNED.get_or_init(|| {
+                warn!(
+                    "TUN control API is unauthenticated — set `api_key` in tun.json to enable Bearer enforcement"
+                );
+            });
+            guarded
+        }
+    };
+
+    open.merge(guarded).with_state(state)
+}
+
+/// Axum middleware: require `Authorization: Bearer <key>`.
+/// Constant-time compare guards against timing attacks.
+async fn bearer_gate(
+    State(key): State<Arc<String>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    // Constant-time compare: equal length AND byte-by-byte fold.
+    let ok = provided.map_or(false, |tok| {
+        let a = tok.as_bytes();
+        let b = key.as_bytes();
+        a.len() == b.len()
+            && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    });
+
+    if ok {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response()
+    }
 }
 
 async fn get_health() -> StatusCode {
