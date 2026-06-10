@@ -32,7 +32,7 @@ Windows Service — Wintun адаптер, split tunnel, multi-chain routing, ap
 
 В `TunConfig` есть optional `monitor_url` + `monitor_api_key` (etap E), включающий собственный MonitorLink в TUN. Это **fallback для headless сценариев без cli/sentinel** (server-side TUN, mobile native service). На обычной desktop-конфигурации не использовать — sentinel + cli уже покрывают.
 
-## Reliability hardening
+## Reliability robustness
 
 mirage2tun под нагрузкой может накапливать зомби-state и аллокации в userspace TCP/IP stack. Четыре защитных механизма:
 
@@ -51,7 +51,7 @@ Reaper в `handle_socket` loop:
 
 ### Memory guard (`crates/mirage-tun-windows/src/runtime_guard.rs`)
 
-Локальная копия `mirage-runtime-guard` (cross-workspace path не работает — mirage2tun отдельный workspace). Подробнее см. `mirage2app/CLAUDE.md` секция Reliability hardening.
+Локальная копия `mirage-runtime-guard` (cross-workspace path не работает — mirage2tun отдельный workspace). Подробнее см. `mirage2app/CLAUDE.md` секция Reliability robustness.
 
 `run_service_logic` спавнит guard при старте. На Fatal threshold (95% RSS) — `exit(0)`, OS service manager respawn'ит TUN.
 
@@ -66,7 +66,7 @@ Reaper в `handle_socket` loop:
 - Нет hard cap на одновременно активные SOCKS5 tasks (semaphore только на handshake phase).
 - TCP buffer sizes (1.6 MB × 4 per socket) hardcoded; стоит сделать configurable через TunConfig.
 
-**Статус (2026-04-30): Production-ready + reaper hardening** — 0.3s latency, split tunnel, multi-chain routing, app-based bypass, per-chain metrics, configurable runtime, graceful drain. 14 API endpoints. Socket idle reaper, memory guard, panic catcher.
+**Статус (2026-04-30): Production-ready + reaper robustness** — 0.3s latency, split tunnel, multi-chain routing, app-based bypass, per-chain metrics, configurable runtime, graceful drain. 14 API endpoints. Socket idle reaper, memory guard, panic catcher.
 
 ## Workspace crates
 

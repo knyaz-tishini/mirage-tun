@@ -50,7 +50,7 @@
 ## Что сделано после стабильного (общими чертами)
 
 - **Multi-chain routing** — SOCKS5 routing по именованным цепочкам, live chain updates, DNS chain routing
-- **Audit + hardening** — 9 audit fixes (route cleanup, UDP bypass, IPv6 WFP, policy persistence), DNS bypass guarantee (никогда не fallthrough в SOCKS5)
+- **Audit + robustness** — 9 audit fixes (route cleanup, UDP bypass, IPv6 WFP, policy persistence), DNS bypass guarantee (никогда не fallthrough в SOCKS5)
 - **Metrics + config** — per-chain метрики, конфигурируемые значения, graceful drain, protocol enum
 - **Restructure** — workspace переделан под мультиплатформу: mirage-tcpip-stack (бывший netstack-smoltcp), стабы для linux/macos/android/ios, mirage-dns вынесен на уровень workspace
 - **smoltcp fork** — smoltcp 0.12.0 форкнут внутрь mirage-tcpip-stack, удалены etherparse и spin, все зависимости чистые

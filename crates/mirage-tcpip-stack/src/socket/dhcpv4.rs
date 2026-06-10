@@ -274,7 +274,7 @@ impl<'a> Socket<'a> {
     /// This is not compliant with the DHCP RFCs, since theoretically
     /// we must stop using the assigned IP when receiving a NAK. This
     /// can increase reliability on broken networks with buggy routers
-    /// or rogue DHCP servers, however.
+    /// or unauthorized DHCP servers, however.
     pub fn set_ignore_naks(&mut self, ignore_naks: bool) {
         self.ignore_naks = ignore_naks;
     }
