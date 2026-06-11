@@ -172,6 +172,12 @@ pub struct ConnState {
     pub bytes_rx: u64,
     pub started_at: Instant,
     pub last_active: Instant,
+    /// Transport protocol: `"tcp"` or `"udp"`.
+    pub proto: &'static str,
+    /// PID of the attributed process, if attribution succeeded.
+    pub pid: Option<u32>,
+    /// Full normalized exe path of the attributed process.
+    pub exe_path: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -186,6 +192,12 @@ pub struct ConnSnapshot {
     pub age_ms: u128,
     /// Milliseconds since the last byte was recorded — `0` for currently active.
     pub idle_ms: u128,
+    /// Transport protocol: `"tcp"` or `"udp"`.
+    pub proto: &'static str,
+    /// PID of the attributed process, `null` when attribution missed.
+    pub pid: Option<u32>,
+    /// Full normalized exe path, `null` when attribution missed.
+    pub exe_path: Option<String>,
 }
 
 /// Live per-destination connection registry.
@@ -207,9 +219,21 @@ impl ConnectionRegistry {
     }
 
     /// Record a new connection (or refresh the timestamp on an existing one).
-    /// Called once when the chain decision is made for a TCP flow.
-    pub fn record_open(&self, chain: &str, dest: SocketAddr, domain: Option<String>) {
+    ///
+    /// `proto` is `"tcp"` or `"udp"`.  `app_info` carries the attributed process
+    /// (PID + exe path); pass `None` when attribution missed — the ledger records
+    /// that explicitly so attribution-miss flows are observable via `/connections`.
+    pub fn record_open(
+        &self,
+        chain: &str,
+        dest: SocketAddr,
+        domain: Option<String>,
+        proto: &'static str,
+        app_info: Option<&crate::process_info::ProcessInfo>,
+    ) {
         let now = Instant::now();
+        let pid = app_info.map(|i| i.pid);
+        let exe_path = app_info.map(|i| i.exe_path.clone());
         let mut map = self.inner.write().expect("conn registry write lock poisoned");
         let key = (dest, chain.to_string());
         match map.entry(key) {
@@ -218,6 +242,11 @@ impl ConnectionRegistry {
                 v.last_active = now;
                 if v.domain.is_none() && domain.is_some() {
                     v.domain = domain;
+                }
+                // Update attribution if we now have it and didn't before.
+                if v.pid.is_none() {
+                    v.pid = pid;
+                    v.exe_path = exe_path;
                 }
             }
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -229,6 +258,9 @@ impl ConnectionRegistry {
                     bytes_rx: 0,
                     started_at: now,
                     last_active: now,
+                    proto,
+                    pid,
+                    exe_path,
                 });
             }
         }
@@ -254,6 +286,9 @@ impl ConnectionRegistry {
                     bytes_rx: rx,
                     started_at: now,
                     last_active: now,
+                    proto: "tcp",
+                    pid: None,
+                    exe_path: None,
                 },
             );
         }
@@ -284,6 +319,9 @@ impl ConnectionRegistry {
                 bytes_rx: v.bytes_rx,
                 age_ms: now.duration_since(v.started_at).as_millis(),
                 idle_ms: now.duration_since(v.last_active).as_millis(),
+                proto: v.proto,
+                pid: v.pid,
+                exe_path: v.exe_path.clone(),
             })
             .collect();
         // Stable order — by total bytes desc — so heavy hitters appear first.
