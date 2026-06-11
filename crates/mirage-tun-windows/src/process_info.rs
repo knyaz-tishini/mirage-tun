@@ -78,6 +78,25 @@ impl ProcessResolver {
         }
     }
 
+    /// Looks up the process owning the UDP socket bound to `src_port`.
+    ///
+    /// Unlike TCP, the UDP table has no remote-address column — the match is
+    /// local-port only.  Both `0.0.0.0`-bound and address-bound rows are
+    /// considered (the kernel shows the actual local address in the table).
+    /// Returns `None` gracefully on any lookup failure.
+    /// Must be called from a `spawn_blocking` context — uses synchronous Win32 APIs.
+    pub fn resolve_udp(&self, src_port: u16) -> Option<ProcessInfo> {
+        #[cfg(windows)]
+        {
+            self.resolve_udp_windows(src_port)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = src_port;
+            None
+        }
+    }
+
     #[cfg(windows)]
     fn resolve_windows(&self, src_port: u16, dst: SocketAddr) -> Option<ProcessInfo> {
         let pid = match find_pid_in_tcp_table(src_port, dst) {
@@ -89,6 +108,42 @@ impl ProcessResolver {
         };
 
         // Check cache first
+        {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((exe_path, ancestor_paths)) = cache.get(pid) {
+                return Some(ProcessInfo { pid, exe_path, ancestor_paths });
+            }
+        }
+
+        let exe_path = match exe_path_for_pid(pid) {
+            Ok(p) => normalize_path(&p),
+            Err(e) => {
+                tracing::warn!("process_info: exe_path_for_pid({pid}) failed: {e}");
+                return None;
+            }
+        };
+
+        let ancestor_paths = get_ancestor_paths(pid, self);
+
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.insert(pid, exe_path.clone(), ancestor_paths.clone());
+        }
+
+        Some(ProcessInfo { pid, exe_path, ancestor_paths })
+    }
+
+    #[cfg(windows)]
+    fn resolve_udp_windows(&self, src_port: u16) -> Option<ProcessInfo> {
+        let pid = match find_pid_in_udp_table(src_port) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("process_info: udp table lookup failed: {e}");
+                return None;
+            }
+        };
+
+        // Check cache first (PidCache is keyed by PID, not protocol — reusable as-is)
         {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             if let Some((exe_path, ancestor_paths)) = cache.get(pid) {
@@ -240,6 +295,100 @@ fn find_pid_in_tcp_table(src_port: u16, dst: SocketAddr) -> Result<u32, String> 
 
     Err(format!(
         "connection not found in tcp table: src_port={src_port} dst={dst}"
+    ))
+}
+
+/// Find the PID owning a UDP socket bound to `src_port`.
+///
+/// The UDP table (`MIB_UDPTABLE_OWNER_PID`) contains only the local endpoint
+/// (local_addr + local_port); there is no remote-addr column.  We match on
+/// local port only — both `0.0.0.0`-bound and address-bound rows qualify.
+#[cfg(windows)]
+fn find_pid_in_udp_table(src_port: u16) -> Result<u32, String> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedUdpTable, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+        UDP_TABLE_OWNER_PID,
+    };
+
+    // AF_INET = 2
+    const AF_INET: u32 = 2;
+
+    // First call: get required buffer size.
+    let mut size: u32 = 0;
+    let ret = unsafe {
+        GetExtendedUdpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0, // bOrder = FALSE
+            AF_INET,
+            UDP_TABLE_OWNER_PID,
+            0,
+        )
+    };
+
+    if ret != ERROR_INSUFFICIENT_BUFFER {
+        return Err(format!("GetExtendedUdpTable size probe returned {ret}"));
+    }
+
+    // Allocate buffer with extra margin in case table grows between calls.
+    let buf_size = (size as usize).saturating_add(1024);
+    let mut buf: Vec<u8> = vec![0u8; buf_size];
+    let mut actual_size = buf_size as u32;
+
+    let ret = unsafe {
+        GetExtendedUdpTable(
+            buf.as_mut_ptr() as *mut _,
+            &mut actual_size,
+            0,
+            AF_INET,
+            UDP_TABLE_OWNER_PID,
+            0,
+        )
+    };
+
+    if ret != 0 {
+        return Err(format!("GetExtendedUdpTable failed: {ret}"));
+    }
+
+    if buf.len() < size_of::<u32>() {
+        return Err("udp table buffer too small for header".into());
+    }
+
+    let num_entries = unsafe {
+        let table_ptr = buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID;
+        (*table_ptr).dwNumEntries
+    };
+
+    let header_size = size_of::<u32>(); // dwNumEntries
+    let row_size = size_of::<MIB_UDPROW_OWNER_PID>();
+    let required = header_size + num_entries as usize * row_size;
+
+    if buf.len() < required {
+        return Err(format!(
+            "udp table buffer too small: have={} need={}",
+            buf.len(),
+            required
+        ));
+    }
+
+    for i in 0..num_entries as usize {
+        let row_ptr = unsafe {
+            let base = buf.as_ptr().add(header_size + i * row_size);
+            &*(base as *const MIB_UDPROW_OWNER_PID)
+        };
+
+        // dwLocalPort is network byte order in the low 16 bits of a DWORD.
+        let local_port_host = u16::from_be((row_ptr.dwLocalPort & 0xFFFF) as u16);
+
+        if local_port_host == src_port {
+            return Ok(row_ptr.dwOwningPid);
+        }
+    }
+
+    Err(format!(
+        "udp socket not found in udp table: src_port={src_port}"
     ))
 }
 
