@@ -114,6 +114,8 @@ impl IpStackRunner {
             cancel.clone(),
             stats.clone(),
         ));
+        let process_resolver2 = process_resolver.clone();
+        let connections2 = connections.clone();
         tokio::spawn(tcp_accept_loop(
             tcp_listener,
             chain_registry.clone(),
@@ -143,6 +145,8 @@ impl IpStackRunner {
             dns_cache_max,
             dns_concurrency,
             udp_proxy_sessions,
+            process_resolver2,
+            connections2,
         ));
 
         // Stats printer
@@ -324,7 +328,7 @@ async fn tcp_accept_loop(
                             let metrics2 = metrics.clone();
                             metrics2.record_bypass_connection();
                             let conns = connections.clone();
-                            conns.record_open("__bypass__", dst, domain_hint.clone());
+                            conns.record_open("__bypass__", dst, domain_hint.clone(), "tcp", app_info.as_ref());
                             let ac = active_conns.clone();
                             ac.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
@@ -377,7 +381,7 @@ async fn tcp_accept_loop(
                             let metrics2 = metrics.clone();
                             metrics2.record_connection(&primary_chain_id);
                             let conns = connections.clone();
-                            conns.record_open(&primary_chain_id, dst, domain_hint.clone());
+                            conns.record_open(&primary_chain_id, dst, domain_hint.clone(), "tcp", app_info.as_ref());
                             let chain_for_task = primary_chain_id.clone();
                             let ac = active_conns.clone();
                             ac.fetch_add(1, Ordering::Relaxed);
@@ -461,8 +465,16 @@ impl DnsCache {
 
 // ── UDP bypass session map ───────────────────────────────────────────────────
 
+/// Per-session state for a UDP bypass session.
+///
+/// The verdict is decided ONCE at session-open (D1); subsequent packets reuse
+/// the forwarding channel without re-calling Win32 or policy.
+struct UdpBypassSession {
+    fwd_tx: mpsc::Sender<Vec<u8>>,
+}
+
 /// Key: (client_src, original_dst) — one entry per active UDP bypass session.
-type UdpSessionMap = Arc<Mutex<HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Vec<u8>>>>>;
+type UdpSessionMap = Arc<Mutex<HashMap<(SocketAddr, SocketAddr), UdpBypassSession>>>;
 
 async fn udp_bypass_forward(
     payload: Vec<u8>,
@@ -471,23 +483,28 @@ async fn udp_bypass_forward(
     resp_tx: mpsc::UnboundedSender<UdpMsg>,
     sessions: UdpSessionMap,
     if_index: u32,
+    app_info: Option<crate::process_info::ProcessInfo>,
+    connections: Arc<crate::metrics::ConnectionRegistry>,
+    domain_hint: Option<String>,
 ) {
-    // Check if session already exists.
+    // Check if session already exists — reuse stored verdict, no Win32 re-call.
     {
         let map = sessions.lock().await;
-        if let Some(tx) = map.get(&(src_addr, dst_addr)) {
-            let _ = tx.send(payload);
+        if let Some(session) = map.get(&(src_addr, dst_addr)) {
+            let _ = session.fwd_tx.send(payload);
             return;
         }
     }
 
-    // No session — create one.
+    // No session — create one, record ledger entry at session-open.
+    connections.record_open("__bypass__", dst_addr, domain_hint, "udp", app_info.as_ref());
+
     let (fwd_tx, mut fwd_rx) = mpsc::channel::<Vec<u8>>(64);
 
     {
         let mut map = sessions.lock().await;
         // Insert; send initial payload.
-        map.insert((src_addr, dst_addr), fwd_tx.clone());
+        map.insert((src_addr, dst_addr), UdpBypassSession { fwd_tx: fwd_tx.clone() });
     }
     let _ = fwd_tx.send(payload).await;
 
@@ -627,6 +644,17 @@ pub(crate) async fn connect_via_interface_pub(
     connect_via_interface(remote, if_index).await
 }
 
+/// Per-session verdict for non-DNS UDP flows.
+///
+/// Keyed by `(src_addr, dst_addr)`.  Created once at session-open and removed
+/// when either `UdpSessionMap` (bypass) or `UdpProxySessionMap` (chain) reaps
+/// the corresponding session.  We keep this map in sync with the session maps by
+/// inserting on first packet and cleaning up when sessions are reaped (the
+/// session maps own the lifecycle; this map is consulted for routing on subsequent
+/// packets and then dropped if the session map entry is absent — no explicit
+/// removal needed here because lookups are cheap and entries are small).
+type UdpVerdictMap = Arc<Mutex<HashMap<(SocketAddr, SocketAddr), (PolicyDecision, Option<crate::process_info::ProcessInfo>)>>>;
+
 async fn udp_dns_loop(
     udp_socket: UdpSocket,
     chain_registry: Arc<ChainRegistry>,
@@ -640,6 +668,8 @@ async fn udp_dns_loop(
     dns_cache_max: usize,
     dns_concurrency: usize,
     udp_proxy_sessions: crate::udp_socks5::UdpProxySessionMap,
+    process_resolver: Arc<ProcessResolver>,
+    connections: Arc<crate::metrics::ConnectionRegistry>,
 ) {
     let (mut read_half, write_half) = udp_socket.split();
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<UdpMsg>();
@@ -657,6 +687,10 @@ async fn udp_dns_loop(
     let dns_sem = Arc::new(Semaphore::new(dns_concurrency));
     let cache = Arc::new(Mutex::new(DnsCache::new(dns_cache_ttl, dns_cache_max)));
     let udp_sessions: UdpSessionMap = Arc::new(Mutex::new(HashMap::new()));
+    // Per-session verdict cache (D1): verdict + attribution decided once at session-open,
+    // reused for all subsequent packets of the same (src, dst) — no per-packet Win32 cost,
+    // no mid-session flip.
+    let udp_verdicts: UdpVerdictMap = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -667,10 +701,50 @@ async fn udp_dns_loop(
                 Some((payload, src_addr, dst_addr)) => {
                     if dst_addr.port() != 53 {
                         let dst_ip = dst_addr.ip();
+
+                        // D1: look up per-session verdict.  On session-open (first packet
+                        // for this (src, dst) pair) run attribution + policy.decide ONCE and
+                        // store.  Subsequent packets reuse the stored entry.
+                        let session_key = (src_addr, dst_addr);
+                        let is_new_session = {
+                            let map = udp_verdicts.lock().await;
+                            !map.contains_key(&session_key)
+                        };
+
+                        let (decision, app_info_for_session) = if is_new_session {
+                            // Attribution: resolve UDP src_port → PID → exe.
+                            // spawn_blocking because find_pid_in_udp_table is a sync Win32 call.
+                            let resolver = process_resolver.clone();
+                            let src_port = src_addr.port();
+                            let app_info: Option<crate::process_info::ProcessInfo> =
+                                tokio::task::spawn_blocking(move || {
+                                    resolver.resolve_udp(src_port)
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+
+                            let domain_hint = dns_map.get(&dst_ip);
+                            let decision = policy
+                                .decide(dst_ip, dst_addr.port(), domain_hint.as_deref(), app_info.as_ref())
+                                .await;
+
+                            // Store verdict for subsequent packets.
+                            {
+                                let mut map = udp_verdicts.lock().await;
+                                map.insert(session_key, (decision.clone(), app_info.clone()));
+                            }
+
+                            (decision, app_info)
+                        } else {
+                            // Reuse stored verdict — no Win32 call, no policy re-eval.
+                            let map = udp_verdicts.lock().await;
+                            let (d, a) = map.get(&session_key)
+                                .expect("is_new_session=false means entry exists");
+                            (d.clone(), a.clone())
+                        };
+
                         let domain_hint = dns_map.get(&dst_ip);
-                        let decision = policy
-                            .decide(dst_ip, dst_addr.port(), domain_hint.as_deref(), None)
-                            .await;
 
                         if decision == PolicyDecision::Bypass {
                             udp_bypass_forward(
@@ -680,6 +754,9 @@ async fn udp_dns_loop(
                                 resp_tx.clone(),
                                 udp_sessions.clone(),
                                 if_index,
+                                app_info_for_session,
+                                connections.clone(),
+                                domain_hint,
                             )
                             .await;
                         } else {
@@ -695,6 +772,18 @@ async fn udp_dns_loop(
                                 PolicyDecision::Bypass => unreachable!("bypass handled above"),
                             };
                             if let Some(socks5_addr) = socks5_addr {
+                                // Record ledger entry for chain-routed UDP sessions at session-open.
+                                if is_new_session {
+                                    if let PolicyDecision::Chain(ref chain_name) = decision {
+                                        connections.record_open(
+                                            chain_name,
+                                            dst_addr,
+                                            domain_hint,
+                                            "udp",
+                                            app_info_for_session.as_ref(),
+                                        );
+                                    }
+                                }
                                 crate::udp_socks5::udp_proxy_forward(
                                     payload,
                                     src_addr,
@@ -709,6 +798,19 @@ async fn udp_dns_loop(
                                 warn!("UDP {dst_addr}: no chain available — dropped");
                             }
                         }
+
+                        // Reap verdict entry when the underlying session is gone.
+                        // Both UdpSessionMap (bypass) and UdpProxySessionMap (chain) remove their
+                        // entries on idle timeout/close.  We mirror that here so stale verdict
+                        // entries don't accumulate.
+                        {
+                            let bypass_alive = udp_sessions.lock().await.contains_key(&session_key);
+                            let chain_alive = udp_proxy_sessions.lock().await.contains_key(&session_key);
+                            if !bypass_alive && !chain_alive {
+                                udp_verdicts.lock().await.remove(&session_key);
+                            }
+                        }
+
                         continue;
                     }
                     // Check cache first (no upstream query needed)
