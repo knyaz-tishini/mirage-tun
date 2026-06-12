@@ -269,6 +269,10 @@ pub async fn activate_tun_inner(
         .as_ref()
         .map(|p| p.bypass_cidrs())
         .unwrap_or_default();
+    let bypass_cidrs_v6_for_wfp: Vec<(u128, u128)> = initial_policy
+        .as_ref()
+        .map(|p| p.bypass_cidrs_v6())
+        .unwrap_or_default();
 
     // Activate WFP kill-switch (needs if_index for native bypass permit).
     // TUN interface index was resolved via spawn_blocking before taking the mutex.
@@ -278,14 +282,22 @@ pub async fn activate_tun_inner(
         killswitch.set_tun_if_index(tun_idx);
     }
     killswitch.set_bypass_cidrs(bypass_cidrs_for_wfp);
+    killswitch.set_bypass_cidrs_v6(bypass_cidrs_v6_for_wfp);
     if let Err(e) = killswitch.activate(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate (non-fatal): {e}");
     }
 
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let native_dns = discover_native_dns(if_index).await;
-    info!("native_dns resolved: {native_dns:?}");
+    // D5: use pinned direct_dns from config when set; skip OS discovery entirely.
+    let native_dns = if let Some(pinned) = state.config.direct_dns {
+        info!("native_dns: using pinned direct_dns={pinned}");
+        Some(pinned)
+    } else {
+        let dns = discover_native_dns(if_index).await;
+        info!("native_dns discovered: {dns:?}");
+        dns
+    };
 
     let process_resolver = Arc::new(crate::process_info::ProcessResolver::new());
 
@@ -486,20 +498,21 @@ async fn set_policy(
 ) -> StatusCode {
     let compiled = crate::policy::CompiledPolicy::compile(req.rules.clone(), req.default_action.clone());
     let new_bypass_cidrs = compiled.bypass_cidrs();
+    let new_bypass_cidrs_v6 = compiled.bypass_cidrs_v6();
     state.policy.update(compiled).await;
     info!("Policy updated via API");
 
-    // Re-apply WFP bypass CIDR permits when TUN is active.
+    // Re-apply WFP bypass CIDR permits (IPv4 + IPv6) when TUN is active.
     {
         let mut s = state.service.lock().await;
         if s.tun_phase == TunPhase::TunActive {
             let relay_ips: Vec<IpAddr> = s.bypass_addrs.clone();
             let tun_name = s.tun_name.clone();
             if let Some(ks) = s.killswitch.as_mut() {
-                if let Err(e) = ks.update_bypass_cidrs(new_bypass_cidrs, &relay_ips, &tun_name, &[]) {
+                if let Err(e) = ks.update_bypass_cidrs(new_bypass_cidrs, new_bypass_cidrs_v6, &relay_ips, &tun_name, &[]) {
                     warn!("WFP bypass CIDR update failed (non-fatal): {e}");
                 } else {
-                    info!("WFP bypass CIDRs updated");
+                    info!("WFP bypass CIDRs updated (IPv4 + IPv6)");
                 }
             }
         }

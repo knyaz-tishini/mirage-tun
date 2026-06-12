@@ -18,11 +18,19 @@ pub struct WfpKillSwitch {
     tun_if_index: Option<u32>,
     /// Bypass CIDR list: (network_addr_be, mask) pairs for IPv4.
     bypass_cidrs: Vec<(u32, u32)>,
+    /// Bypass CIDR list: (network_addr, mask) pairs for IPv6.
+    bypass_cidrs_v6: Vec<(u128, u128)>,
 }
 
 impl WfpKillSwitch {
     pub fn new() -> Self {
-        Self { engine: None, native_if_index: None, tun_if_index: None, bypass_cidrs: Vec::new() }
+        Self {
+            engine: None,
+            native_if_index: None,
+            tun_if_index: None,
+            bypass_cidrs: Vec::new(),
+            bypass_cidrs_v6: Vec::new(),
+        }
     }
 
     pub fn set_native_if_index(&mut self, idx: u32) {
@@ -41,16 +49,24 @@ impl WfpKillSwitch {
         self.bypass_cidrs = cidrs;
     }
 
-    /// Re-apply WFP filters with an updated bypass CIDR list.
+    /// Set bypass CIDRs to be permitted by WFP at weight 12 (IPv6).
+    /// Each entry is (network_addr_u128, mask_u128).
+    pub fn set_bypass_cidrs_v6(&mut self, cidrs: Vec<(u128, u128)>) {
+        self.bypass_cidrs_v6 = cidrs;
+    }
+
+    /// Re-apply WFP filters with an updated bypass CIDR list (IPv4 + IPv6).
     /// Deactivates the current engine and re-activates with the new CIDRs.
     pub fn update_bypass_cidrs(
         &mut self,
         cidrs: Vec<(u32, u32)>,
+        cidrs_v6: Vec<(u128, u128)>,
         relay_addrs: &[IpAddr],
         tun_name: &str,
         exempt_ports: &[u16],
     ) -> Result<(), TunError> {
         self.bypass_cidrs = cidrs;
+        self.bypass_cidrs_v6 = cidrs_v6;
         // deactivate drops old engine (removes all filters), then re-activate.
         self.engine.take();
         self.activate(relay_addrs, tun_name, exempt_ports)
@@ -257,6 +273,22 @@ impl WfpKillSwitch {
                 .add(tx)
                 .map_err(|e| TunError::Wfp(format!("exempt port {port} IPv6 failed: {e}")))?;
             info!(port, "WFP: permit exempt port IPv6");
+        }
+
+        // 6. Permit bypass CIDRs for IPv6 (weight 12).
+        for &(network, mask) in &self.bypass_cidrs_v6 {
+            let prefix_len = mask.count_ones() as u8;
+            let addr = Ipv6Addr::from(network);
+            FilterBuilder::new()
+                .name("Mirage: permit bypass CIDR IPv6")
+                .action(Action::Permit)
+                .layer(Layer::ConnectV6)
+                .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                .weight(Self::weight(12))
+                .condition(AddrConditionBuilder::remote().prefix_v6(addr, prefix_len))
+                .add(tx)
+                .map_err(|e| TunError::Wfp(format!("bypass CIDR IPv6 permit {addr}/{prefix_len} failed: {e}")))?;
+            info!(%addr, prefix_len, "WFP: permit bypass CIDR IPv6");
         }
 
         Ok(())
