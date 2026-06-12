@@ -4,6 +4,9 @@ use crate::policy::PolicyConfigRequest;
 /// Config passed to `TunStack::start()` — platform-agnostic.
 #[derive(Debug, Clone)]
 pub struct StackConfig {
+    /// Adapter name (e.g. "mirage0").  Passed to WintunHandle::create on Windows.
+    /// D9: propagated from TunConfig::tun_name so the adapter name is configurable.
+    pub tun_name: String,
     /// Tunnel interface address + prefix (e.g. "10.0.85.1/24").
     pub tun_addr: String,
     /// Optional IPv6 address for the TUN interface (e.g. "fd00:7::2/64").

@@ -26,6 +26,13 @@ pub(crate) fn find_config() -> Option<PathBuf> {
             return Some(beside_exe);
         }
     }
+    // D9 note: the C:\ProgramData\mirage2tun path is install-time and tied to
+    // the SCM service name "mirage2tun".  Renaming the path half (ProgramData dir +
+    // service name + dispatcher names in service.rs:132/149 + bin/mirage2tun.rs:244/305)
+    // requires a coordinated install-time rename of the service registration and is
+    // deferred to a separate task.  The adapter name (mirage0) and tunnel-type string
+    // ("Mirage") are already configurable via TunConfig::tun_name / tunnel_type (D9
+    // adapter-naming half — done).
     let prog_data = PathBuf::from(r"C:\ProgramData\mirage2tun\tun.json");
     if prog_data.exists() {
         return Some(prog_data);
@@ -224,7 +231,7 @@ pub async fn run_service_logic(
     cleanup_stale_routes(&tun_name).await;
     crate::proxy::clear_system_proxy().await;
 
-    let wintun = match WintunHandle::create(&tun_name, &tun_addr, tun_cfg.tun_addr_v6.as_deref(), TUN_MTU).await {
+    let wintun = match WintunHandle::create(&tun_name, &tun_addr, tun_cfg.tun_addr_v6.as_deref(), TUN_MTU, Some(&tun_cfg.tunnel_type)).await {
         Ok(w) => {
             info!("Wintun adapter '{tun_name}' ready");
             Some(w)

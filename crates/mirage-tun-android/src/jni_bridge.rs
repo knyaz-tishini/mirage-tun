@@ -139,6 +139,7 @@ mod android {
             });
 
             Ok((StackConfig {
+                tun_name: "tun0".to_owned(),
                 tun_addr: self.tun_addr,
                 mtu: self.mtu,
                 chains,

@@ -22,6 +22,8 @@ struct Cli {
 
 #[derive(Deserialize)]
 struct BinConfig {
+    #[serde(default = "default_tun_name")]
+    tun_name: String,
     tun_addr: String,
     #[serde(default)]
     tun_addr_v6: Option<String>,
@@ -118,6 +120,7 @@ struct BinChainDnsConfig {
     servers: Vec<IpAddr>,
 }
 
+fn default_tun_name() -> String { "utun0".to_owned() }
 fn default_api_bind() -> String { "127.0.0.1:19485".to_string() }
 fn default_mtu() -> u16 { 1280 } // onion+AEAD+camo headroom; 1500 = PMTUD blackhole on the onion handshake
 fn default_dns_upstream() -> SocketAddr { "8.8.8.8:53".parse().expect("static addr") }
@@ -128,6 +131,7 @@ fn default_concurrency() -> usize { 64 }
 impl From<BinConfig> for StackConfig {
     fn from(b: BinConfig) -> Self {
         StackConfig {
+            tun_name: b.tun_name,
             tun_addr: b.tun_addr,
             tun_addr_v6: b.tun_addr_v6,
             mtu: b.mtu,

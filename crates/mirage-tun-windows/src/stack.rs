@@ -50,11 +50,13 @@ impl TunStack for WindowsTunStack {
         cancel: CancellationToken,
     ) -> Result<StackHandle<WintunTcpAcceptor, WintunUdpSocket>, mirage_tun_core::error::TunError> {
         // ── Step 1: Create and configure Wintun adapter ──────────────────────
+        // D9: use cfg.tun_name instead of hardcoded "mirage0" (bug 20 fix).
         let handle = WintunHandle::create(
-            "mirage0",
+            &cfg.tun_name,
             &cfg.tun_addr,
             cfg.tun_addr_v6.as_deref(),
             cfg.mtu,
+            None, // tunnel_type: None = default "Mirage"; set via TunConfig on the main service path
         )
         .await
         .map_err(win_err)?;
@@ -173,16 +175,19 @@ async fn pump_stack_to_wintun(
 //
 // TunStack::Device is a required associated type but WindowsTunStack does not
 // expose a TunDevice to the consumer — the Wintun device is managed internally.
-// This zero-sized placeholder satisfies the type constraint.
+// This placeholder satisfies the type constraint and carries the configured name.
 
-pub struct NoopTunDevice;
+pub struct NoopTunDevice {
+    // D9: carry the adapter name from StackConfig so Name() reflects config.
+    name: String,
+}
 
 impl private::Sealed for NoopTunDevice {}
 
 #[async_trait]
 impl TunDevice for NoopTunDevice {
     fn name(&self) -> &str {
-        "mirage0"
+        &self.name
     }
 
     async fn configure(

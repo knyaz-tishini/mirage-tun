@@ -201,13 +201,27 @@ pub struct WintunHandle {
 }
 
 impl WintunHandle {
-    pub async fn create(tun_name: &str, tun_addr: &str, tun_addr_v6: Option<&str>, mtu: u16) -> Result<Self> {
+    /// Create or open a Wintun adapter.
+    ///
+    /// `tunnel_type` is the type string shown in Device Manager (defaults to
+    /// "Mirage" when `None`).  Pass `Some(s)` from TunConfig::tunnel_type to
+    /// make it configurable (D9).
+    pub async fn create(
+        tun_name: &str,
+        tun_addr: &str,
+        tun_addr_v6: Option<&str>,
+        mtu: u16,
+        tunnel_type: Option<&str>,
+    ) -> Result<Self> {
         let name = tun_name.to_owned();
         let addr = tun_addr.to_owned();
         let addr_v6 = tun_addr_v6.map(str::to_owned);
-        let shared = tokio::task::spawn_blocking(move || create_wintun_shared(&name, &addr, addr_v6.as_deref(), mtu))
-            .await
-            .map_err(|e| TunError::Wintun(format!("spawn_blocking panicked: {e}")))??;
+        let tt = tunnel_type.unwrap_or("Mirage").to_owned();
+        let shared = tokio::task::spawn_blocking(move || {
+            create_wintun_shared(&name, &addr, addr_v6.as_deref(), mtu, &tt)
+        })
+        .await
+        .map_err(|e| TunError::Wintun(format!("spawn_blocking panicked: {e}")))??;
         info!(name = tun_name, addr = tun_addr, ?tun_addr_v6, mtu, "WintunHandle created");
         Ok(Self { shared: Arc::new(shared) })
     }
@@ -255,6 +269,7 @@ fn create_wintun_shared(
     tun_addr: &str,
     tun_addr_v6: Option<&str>,
     mtu: u16,
+    tunnel_type: &str,
 ) -> Result<WintunShared> {
     // Dynamically load wintun.dll.
     // Safety: we validate all function pointers immediately after loading.
@@ -296,7 +311,8 @@ fn create_wintun_shared(
 
     // Convert the adapter name to a wide (UTF-16) string.
     let name_wide = to_wide(tun_name);
-    let tunnel_type_wide = to_wide("Mirage");
+    // D9: tunnel_type is configurable from TunConfig::tunnel_type (default "Mirage").
+    let tunnel_type_wide = to_wide(tunnel_type);
 
     // Try to open an existing adapter first; create one if not found.
     let adapter_ptr = unsafe { fn_open(name_wide.as_ptr()) };

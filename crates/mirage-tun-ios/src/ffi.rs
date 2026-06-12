@@ -335,6 +335,7 @@ fn parse_ffi_config(json: &[u8]) -> Result<StackConfig, IosTunError> {
         .unwrap_or_else(|_| "1.1.1.1:53".parse().expect("fallback addr is valid"));
 
     Ok(StackConfig {
+        tun_name: "utun0".to_owned(),
         tun_addr: raw.tun_addr,
         mtu: raw.mtu,
         chains,
