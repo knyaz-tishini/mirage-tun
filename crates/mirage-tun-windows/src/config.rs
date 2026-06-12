@@ -50,6 +50,20 @@ pub struct TunConfig {
     /// Default: 524288 (512 KB).
     #[serde(default = "default_tcp_recv_buffer_size")]
     pub tcp_recv_buffer_size: u32,
+    /// Pinned bypass (direct-egress) DNS resolver.
+    ///
+    /// When set, `discover_native_dns` is skipped entirely and this address is used
+    /// for all `dns_via_native` calls.  Useful when the native resolver is known
+    /// (e.g. a LAN DNS server) and DHCP renewal would otherwise stale the
+    /// auto-discovered value.  `None` (default) = discover at `/tun/start`.
+    #[serde(default)]
+    pub direct_dns: Option<SocketAddr>,
+    /// Wintun tunnel-type string visible in Device Manager.
+    ///
+    /// Defaults to `"Mirage"`.  Configurable so the adapter type name can be
+    /// set to a less distinctive string at deploy time.
+    #[serde(default = "default_tunnel_type")]
+    pub tunnel_type: String,
 }
 
 fn default_api_bind() -> SocketAddr {
@@ -96,6 +110,10 @@ fn default_tcp_recv_buffer_size() -> u32 {
     mirage_tcpip_stack::tcp::DEFAULT_TCP_RECV_BUFFER_SIZE
 }
 
+fn default_tunnel_type() -> String {
+    "Mirage".to_owned()
+}
+
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
@@ -114,6 +132,8 @@ impl Default for TunConfig {
             api_key: None,
             tcp_send_buffer_size: default_tcp_send_buffer_size(),
             tcp_recv_buffer_size: default_tcp_recv_buffer_size(),
+            direct_dns: None,
+            tunnel_type: default_tunnel_type(),
         }
     }
 }
