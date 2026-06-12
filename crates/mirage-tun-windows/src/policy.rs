@@ -275,7 +275,52 @@ impl CompiledPolicy {
         self.default_action.clone()
     }
 
-    pub fn domain_decision(&self, domain: &str) -> PolicyDecision {
+    /// DNS routing decision for `domain`.
+    ///
+    /// When `app_info` is provided the app-path / app-dir tables are checked
+    /// FIRST, mirroring the precedence in `decide()` (app > domain > port >
+    /// CIDR > default).  A Bypass-app's DNS query goes `dns_via_native` even
+    /// for unlisted domains; a chain-marked app routes via its chain.
+    /// Unattributed queries (app_info = None) fall through to existing domain
+    /// logic unchanged.
+    pub fn domain_decision(
+        &self,
+        domain: &str,
+        app_info: Option<&crate::process_info::ProcessInfo>,
+    ) -> PolicyDecision {
+        // App-based checks first — same precedence as decide().
+        if let Some(info) = app_info {
+            let paths: Vec<&str> = std::iter::once(info.exe_path.as_str())
+                .chain(info.ancestor_paths.iter().map(|s| s.as_str()))
+                .collect();
+
+            // Exact path match.
+            for (rule_path, decision, rule_idx) in &self.app_path_table {
+                for &p in &paths {
+                    if p == rule_path.as_str() {
+                        if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return decision.clone();
+                    }
+                }
+            }
+
+            // Directory prefix match.
+            for (rule_dir, decision, rule_idx) in &self.app_dir_table {
+                for &p in &paths {
+                    if p.starts_with(rule_dir.as_str()) {
+                        if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return decision.clone();
+                    }
+                }
+            }
+        }
+
+        // Domain check (unattributed queries + attributed queries whose app
+        // has no app-level rule fall through to here).
         let domain_lower = domain.to_lowercase();
         for (suffix, decision, rule_idx) in &self.domain_table {
             let matched = if suffix.starts_with('.') {
@@ -337,9 +382,13 @@ impl PolicyEngine {
         config.decide(dst_ip, dst_port, domain_hint, app_info)
     }
 
-    pub async fn domain_decision(&self, domain: &str) -> PolicyDecision {
+    pub async fn domain_decision(
+        &self,
+        domain: &str,
+        app_info: Option<&crate::process_info::ProcessInfo>,
+    ) -> PolicyDecision {
         let config = self.config.read().await;
-        config.domain_decision(domain)
+        config.domain_decision(domain, app_info)
     }
 
     pub async fn update(&self, new_config: CompiledPolicy) {

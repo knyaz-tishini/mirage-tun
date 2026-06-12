@@ -691,6 +691,11 @@ async fn udp_dns_loop(
     // reused for all subsequent packets of the same (src, dst) — no per-packet Win32 cost,
     // no mid-session flip.
     let udp_verdicts: UdpVerdictMap = Arc::new(Mutex::new(HashMap::new()));
+    // D2: per-src_port DNS attribution cache.  Keyed by the querying process's
+    // UDP source port.  TTL matches PID_CACHE_TTL (30 s) — avoids a Win32 call
+    // per DNS query while still refreshing when the port is reused after 30 s.
+    let dns_attr_cache: Arc<Mutex<HashMap<u16, (crate::process_info::ProcessInfo, std::time::Instant)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -822,10 +827,40 @@ async fn udp_dns_loop(
                         }
                     }
 
-                    // Extract domain and check policy BEFORE spawning (no locks held)
+                    // Extract domain and check policy BEFORE spawning (no locks held).
+                    // D2: resolve querying process for app-attributed DNS routing.
+                    let src_port = src_addr.port();
+                    let dns_app_info: Option<crate::process_info::ProcessInfo> = {
+                        const DNS_ATTR_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+                        let cached = {
+                            let c = dns_attr_cache.lock().await;
+                            c.get(&src_port).and_then(|(info, ts)| {
+                                if ts.elapsed() < DNS_ATTR_TTL { Some(info.clone()) } else { None }
+                            })
+                        };
+                        if let Some(info) = cached {
+                            Some(info)
+                        } else {
+                            // Win32 call: spawn_blocking to keep async loop unblocked.
+                            let resolver = process_resolver.clone();
+                            let resolved = tokio::task::spawn_blocking(move || {
+                                resolver.resolve_udp(src_port)
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Some(ref info) = resolved {
+                                dns_attr_cache.lock().await.insert(
+                                    src_port,
+                                    (info.clone(), std::time::Instant::now()),
+                                );
+                            }
+                            resolved
+                        }
+                    };
                     let domain = extract_dns_domain(&payload);
                     let decision = if let Some(ref dom) = domain {
-                        policy.domain_decision(dom).await
+                        policy.domain_decision(dom, dns_app_info.as_ref()).await
                     } else {
                         PolicyDecision::default_chain()
                     };
