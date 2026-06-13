@@ -19,7 +19,8 @@
 ///
 /// TCP is handled by mirage-tcpip-stack (smoltcp) — no rdr rule needed.
 use crate::error::MacosTunError;
-use mirage_tun_core::traits::{PlatformFirewall, private::Sealed};
+use mirage_tun_core::traits::{PlatformFirewall, PlatformExecutor, FlowProto, FlowKey, private::Sealed};
+use mirage_tun_core::plane::{Plane, ProcessIdentity};
 use std::net::IpAddr;
 use tracing::{debug, info, warn};
 
@@ -220,6 +221,38 @@ fn build_pf_rules(
     lines.push("block drop out inet6 all".to_string());
 
     lines.join("\n") + "\n"
+}
+
+// ── T2: PlatformExecutor stub ─────────────────────────────────────────────────
+
+impl PlatformExecutor for MacosFirewall {
+    type Error = MacosTunError;
+
+    /// Attribution is not available on macOS at T2 — returns None.
+    /// T3 will attach NEAppProxyFlow source app signing IDs here.
+    fn attribute(
+        &self,
+        _src_port: u16,
+        _dst: std::net::SocketAddr,
+        _proto: FlowProto,
+    ) -> Option<ProcessIdentity> {
+        None
+    }
+
+    /// T2: no-op — pf anchor handles coarse enforcement via activate().
+    /// Per-process enforcement (NE framework app containers) is T3.
+    /// `Plane::Group` must not reach here — caller resolves group first.
+    fn enforce(
+        &mut self,
+        plane: &Plane,
+        _identity: Option<&ProcessIdentity>,
+        flow: &FlowKey,
+    ) -> Result<(), MacosTunError> {
+        if let Plane::Group(_) = plane {
+            warn!(?flow, "enforce called with unresolved Group plane — bug in caller");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

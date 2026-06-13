@@ -136,3 +136,63 @@ pub trait PlatformDns: Send + Sync + private::Sealed {
 
     async fn revert_dns(&mut self) -> Result<(), Self::Error>;
 }
+
+// ── PlatformExecutor: T2 kill-switch execution interface ──────────────────────
+
+/// Transport protocol for attribution and enforcement context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowProto {
+    Tcp,
+    Udp,
+}
+
+/// Minimal flow key passed to enforce — enough to identify the connection for logging.
+#[derive(Debug, Clone)]
+pub struct FlowKey {
+    pub src_port: u16,
+    pub dst: std::net::SocketAddr,
+    pub proto: FlowProto,
+}
+
+/// Platform executor — the ONLY interface platforms implement for T2+.
+///
+/// Core (`PlaneEngine`) does all policy logic. Platforms do exactly two things:
+///   (a) attribute a packet/flow to a `ProcessIdentity`
+///   (b) enforce the `Plane` decision from the engine
+///
+/// Both methods are synchronous. Attribution is called from `spawn_blocking`
+/// where Win32 table lookup happens; enforcement installs/removes firewall rules
+/// synchronously (WFP transaction, pfctl shell, nft ruleset).
+///
+/// Sealed — not implementable outside the mirage-tun-* crates.
+/// Add `impl mirage_tun_core::traits::private::Sealed for YourType {}` in the platform crate.
+pub trait PlatformExecutor: Send + Sync + private::Sealed {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Attribute a flow (identified by src_port + dst) to a ProcessIdentity.
+    /// Returns None when attribution is unavailable (coarse-granularity platforms).
+    /// Must be called from a blocking context (synchronous OS API calls).
+    fn attribute(
+        &self,
+        src_port: u16,
+        dst: std::net::SocketAddr,
+        proto: FlowProto,
+    ) -> Option<crate::plane::ProcessIdentity>;
+
+    /// Enforce the plane decision for a flow / process pair.
+    ///
+    /// Invariant contract (core guarantees, platform must not violate):
+    ///   - `Plane::Bypass` → permit the flow via the TUN bypass path; NEVER drop.
+    ///   - `Plane::Wire(id)` → route flow into the named SOCKS5 chain.
+    ///   - `Plane::Kill` → drop the flow (RST TCP / ICMP unreachable UDP / silent drop).
+    ///   - `Plane::Group` MUST NOT reach enforce — caller resolves group first via
+    ///     `PlaneEngine::resolve_group`.
+    ///
+    /// `identity` is None for unattributed flows (coarse platforms use None always).
+    fn enforce(
+        &mut self,
+        plane: &crate::plane::Plane,
+        identity: Option<&crate::plane::ProcessIdentity>,
+        flow: &FlowKey,
+    ) -> Result<(), Self::Error>;
+}

@@ -2,7 +2,8 @@ use std::net::IpAddr;
 use std::process::Command as StdCommand;
 use tracing::{debug, info, warn};
 
-use mirage_tun_core::traits::{PlatformFirewall, private};
+use mirage_tun_core::traits::{PlatformFirewall, PlatformExecutor, FlowProto, FlowKey, private};
+use mirage_tun_core::plane::{Plane, ProcessIdentity};
 use crate::error::LinuxTunError;
 
 /// Intercept port for TCP REDIRECT: traffic from TUN is redirected here.
@@ -37,6 +38,38 @@ impl LinuxFirewall {
 }
 
 impl private::Sealed for LinuxFirewall {}
+
+// ── T2: PlatformExecutor stub ─────────────────────────────────────────────────
+
+impl PlatformExecutor for LinuxFirewall {
+    type Error = LinuxTunError;
+
+    /// Attribution is not available on Linux at T2 — returns None.
+    /// T3 will use cgroup / SO_PEERCRED / eBPF attribution here.
+    fn attribute(
+        &self,
+        _src_port: u16,
+        _dst: std::net::SocketAddr,
+        _proto: FlowProto,
+    ) -> Option<ProcessIdentity> {
+        None
+    }
+
+    /// T2: no-op — nftables/iptables handle coarse enforcement via activate().
+    /// Per-process enforcement (cgroup v2 / eBPF) is T3.
+    /// `Plane::Group` must not reach here — caller resolves group first.
+    fn enforce(
+        &mut self,
+        plane: &Plane,
+        _identity: Option<&ProcessIdentity>,
+        flow: &FlowKey,
+    ) -> Result<(), LinuxTunError> {
+        if let Plane::Group(_) = plane {
+            warn!(?flow, "enforce called with unresolved Group plane — bug in caller");
+        }
+        Ok(())
+    }
+}
 
 impl PlatformFirewall for LinuxFirewall {
     type Error = LinuxTunError;

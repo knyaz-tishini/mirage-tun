@@ -7,8 +7,12 @@ use mirage_wfp::{
     InterfaceConditionBuilder, Layer, PortConditionBuilder, SubLayerBuilder, WfpEngine,
     WfpTransaction, WeightRange, GUID, delete_filter,
 };
-use mirage_tun_core::traits::PlatformFirewall;
+use mirage_tun_core::traits::{PlatformFirewall, PlatformExecutor, FlowProto, FlowKey};
+use mirage_tun_core::plane::{Plane, ProcessIdentity};
+use mirage_tun_core::policy::ProcessInfo as CoreProcessInfo;
+use mirage_tun_core::traits::private;
 use crate::error::TunError;
+use crate::process_info::ProcessResolver;
 
 // Fixed GUID for our sublayer — deterministic so we don't leak sublayers on crash.
 const KILLSWITCH_SUBLAYER_GUID: GUID = GUID::from_u128(0x4d697261_6765_4b69_6c6c_537769746368);
@@ -21,6 +25,8 @@ pub struct WfpKillSwitch {
     bypass_cidrs: Vec<(u32, u32)>,
     /// Bypass CIDR list: (network_addr, mask) pairs for IPv6.
     bypass_cidrs_v6: Vec<(u128, u128)>,
+    /// Process resolver for flow attribution (T2 addition — additive field).
+    resolver: ProcessResolver,
 }
 
 impl WfpKillSwitch {
@@ -31,6 +37,7 @@ impl WfpKillSwitch {
             tun_if_index: None,
             bypass_cidrs: Vec::new(),
             bypass_cidrs_v6: Vec::new(),
+            resolver: ProcessResolver::new(),
         }
     }
 
@@ -454,6 +461,69 @@ impl Drop for WfpKillSwitch {
             warn!("WfpKillSwitch dropped while active — removing filters");
             Self::remove_killswitch_filters_best_effort();
             self.engine.take();
+        }
+    }
+}
+
+// ── T2: PlatformExecutor impl ─────────────────────────────────────────────────
+
+impl private::Sealed for WfpKillSwitch {}
+
+/// Convert the Windows-local `ProcessInfo` (from `process_info.rs`) to the core type.
+/// The two structs are structurally identical — this is a name-only conversion.
+/// T3 will delete `mirage-tun-windows/src/policy.rs` and unify the types.
+fn local_info_to_core(info: crate::process_info::ProcessInfo) -> CoreProcessInfo {
+    CoreProcessInfo {
+        pid: info.pid,
+        exe_path: info.exe_path,
+        ancestor_paths: info.ancestor_paths,
+    }
+}
+
+impl PlatformExecutor for WfpKillSwitch {
+    type Error = TunError;
+
+    /// Attribute a flow to a `ProcessIdentity` using the existing `ProcessResolver`.
+    ///
+    /// For TCP: uses `resolver.resolve(src_port, dst)`.
+    /// For UDP: uses `resolver.resolve_udp(src_port)`.
+    /// Must be called from a `spawn_blocking` context — Win32 synchronous APIs.
+    ///
+    /// For T2: attribution is returned without a `platform_token` (WFP app-id blob
+    /// attachment is T3). T3 will attach the FWP_BYTE_BLOB app-id here.
+    fn attribute(
+        &self,
+        src_port: u16,
+        dst: std::net::SocketAddr,
+        proto: FlowProto,
+    ) -> Option<ProcessIdentity> {
+        let local_info = match proto {
+            FlowProto::Tcp => self.resolver.resolve(src_port, dst)?,
+            FlowProto::Udp => self.resolver.resolve_udp(src_port)?,
+        };
+        Some(ProcessIdentity::from_process_info(local_info_to_core(local_info)))
+    }
+
+    /// Enforce the plane decision.
+    ///
+    /// T2: coarse enforcement — the existing WFP sublayer already handles
+    /// block/permit at interface granularity via `activate()`. Per-process
+    /// WFP app-id conditions are T3. The only invalid call is `Plane::Group`
+    /// (caller must resolve it before calling enforce).
+    fn enforce(
+        &mut self,
+        plane: &Plane,
+        _identity: Option<&ProcessIdentity>,
+        flow: &FlowKey,
+    ) -> Result<(), TunError> {
+        match plane {
+            Plane::Group(_) => {
+                tracing::error!(?flow, "enforce called with unresolved Group plane — bug in caller");
+                Err(TunError::Other("unresolved Group plane in enforce".into()))
+            }
+            // T2: Bypass / Wire / Kill are all handled coarsely by the existing
+            // WFP sublayer activated via activate(). No per-flow action needed.
+            _ => Ok(()),
         }
     }
 }
