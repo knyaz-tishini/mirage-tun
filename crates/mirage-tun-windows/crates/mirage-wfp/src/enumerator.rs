@@ -159,6 +159,11 @@ impl FilterEnumItem<'_, '_, '_> {
     pub fn description(&self) -> io::Result<Option<String>> {
         read_wstr(self.filter.displayData.description)
     }
+
+    /// The sublayer key this filter belongs to.
+    pub fn sublayer(&self) -> windows_sys::core::GUID {
+        self.filter.subLayerKey
+    }
 }
 
 fn read_wstr(p: *const u16) -> io::Result<Option<String>> {

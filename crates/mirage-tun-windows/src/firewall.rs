@@ -1,10 +1,11 @@
 #![cfg(windows)]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use mirage_wfp::{
-    Action, AddrConditionBuilder, FilterBuilder, FilterWeight, InterfaceConditionBuilder,
-    Layer, PortConditionBuilder, SubLayerBuilder, WfpEngine, WfpTransaction, WeightRange, GUID,
+    Action, AddrConditionBuilder, FilterBuilder, FilterEnumerator, FilterWeight,
+    InterfaceConditionBuilder, Layer, PortConditionBuilder, SubLayerBuilder, WfpEngine,
+    WfpTransaction, WeightRange, GUID, delete_filter,
 };
 use mirage_tun_core::traits::PlatformFirewall;
 use crate::error::TunError;
@@ -67,8 +68,8 @@ impl WfpKillSwitch {
     ) -> Result<(), TunError> {
         self.bypass_cidrs = cidrs;
         self.bypass_cidrs_v6 = cidrs_v6;
-        // deactivate drops old engine (removes all filters), then re-activate.
-        self.engine.take();
+        // activate already runs stale-filter cleanup before installing new filters,
+        // so calling it directly is sufficient; deactivate first is not required.
         self.activate(relay_addrs, tun_name, exempt_ports)
     }
 
@@ -311,6 +312,56 @@ pub fn resolve_interface_index(name: &str) -> Option<u32> {
     None
 }
 
+/// Compare two WFP GUIDs for equality.
+///
+/// `windows_sys::core::GUID` does not implement `PartialEq` in all versions;
+/// compare the constituent fields directly.
+fn guid_eq(a: GUID, b: GUID) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+}
+
+impl WfpKillSwitch {
+    /// Best-effort deletion of all kill-switch filters via a fresh persistent session.
+    /// Always opens a new session so there are no borrow issues with `self.engine`.
+    /// Errors are logged as warnings and swallowed — cleanup must never panic.
+    fn remove_killswitch_filters_best_effort() {
+        match WfpEngine::open() {
+            Ok(mut engine) => {
+                if let Err(e) = Self::delete_killswitch_filters(&mut engine) {
+                    warn!("WFP: filter cleanup error (best-effort): {e}");
+                }
+            }
+            Err(e) => {
+                warn!("WFP: could not open engine for filter cleanup: {e}");
+            }
+        }
+    }
+
+    fn delete_killswitch_filters(engine: &mut WfpEngine) -> Result<(), std::io::Error> {
+        let tx = WfpTransaction::begin(engine)
+            .map_err(|e| std::io::Error::other(format!("tx begin: {e}")))?;
+
+        let stale_ids: Vec<u64> = {
+            let mut enumerator = FilterEnumerator::new(&tx)?;
+            let mut ids = Vec::new();
+            while let Some(result) = enumerator.next() {
+                let item = result?;
+                if guid_eq(item.sublayer(), KILLSWITCH_SUBLAYER_GUID) {
+                    ids.push(item.id());
+                }
+            }
+            ids
+        };
+
+        for id in stale_ids {
+            delete_filter(&tx, id)?;
+        }
+
+        tx.commit().map_err(|e| std::io::Error::other(format!("tx commit: {e}")))?;
+        Ok(())
+    }
+}
+
 impl PlatformFirewall for WfpKillSwitch {
     type Error = TunError;
 
@@ -326,10 +377,10 @@ impl PlatformFirewall for WfpKillSwitch {
         let tun_if_index = self.tun_if_index.or_else(|| resolve_interface_index(tun_name));
         info!(tun_name, ?tun_if_index, "WFP: resolved TUN interface index");
 
-        // Drop old engine first — removes all previously installed dynamic filters.
-        self.engine.take();
-
-        let mut engine = WfpEngine::open_dynamic().map_err(|e| {
+        // Open a persistent session — filters survive engine drop and process crash,
+        // ensuring fail-closed behaviour. Filters do NOT survive a reboot because we
+        // do not set FWPM_FILTER_FLAG_PERSISTENT or FWPM_FILTER_FLAG_BOOTTIME.
+        let mut engine = WfpEngine::open().map_err(|e| {
             TunError::Wfp(format!("WFP engine open failed: {e}"))
         })?;
 
@@ -338,14 +389,42 @@ impl PlatformFirewall for WfpKillSwitch {
                 TunError::Wfp(format!("WFP transaction begin failed: {e}"))
             })?;
 
-            // Add our sublayer — ignore "already exists" on a clean dynamic session.
-            SubLayerBuilder::default()
+            // Add our sublayer. On a persistent session a previous run may have left
+            // it behind; FWP_E_ALREADY_EXISTS (0x80320009) is not an error here.
+            match SubLayerBuilder::default()
                 .name("Mirage Kill-switch")
                 .description("Blocks traffic leaks when TUN active")
                 .guid(KILLSWITCH_SUBLAYER_GUID)
                 .weight(100)
                 .add(&tx)
-                .map_err(|e| TunError::Wfp(format!("sublayer add failed: {e}")))?;
+            {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(0x80320009u32 as i32) => {
+                    debug!("WFP: kill-switch sublayer already exists — reusing");
+                }
+                Err(e) => return Err(TunError::Wfp(format!("sublayer add failed: {e}"))),
+            }
+
+            // Remove any stale filters from a previous run (crashed or clean).
+            // Collect IDs first to avoid a simultaneous borrow of `tx`.
+            let stale_ids: Vec<u64> = {
+                let mut enumerator = FilterEnumerator::new(&tx)
+                    .map_err(|e| TunError::Wfp(format!("filter enumerator failed: {e}")))?;
+                let mut ids = Vec::new();
+                while let Some(result) = enumerator.next() {
+                    let item = result
+                        .map_err(|e| TunError::Wfp(format!("filter enumeration error: {e}")))?;
+                    if guid_eq(item.sublayer(), KILLSWITCH_SUBLAYER_GUID) {
+                        ids.push(item.id());
+                    }
+                }
+                ids
+            };
+            for id in stale_ids {
+                delete_filter(&tx, id)
+                    .map_err(|e| TunError::Wfp(format!("stale filter delete failed: {e}")))?;
+            }
+            debug!("WFP: stale kill-switch filters removed");
 
             self.install_v4_filters(&tx, relay_addrs, tun_if_index, exempt_ports)?;
             self.install_v6_filters(&tx, relay_addrs, tun_if_index, exempt_ports)?;
@@ -359,17 +438,22 @@ impl PlatformFirewall for WfpKillSwitch {
     }
 
     fn deactivate(&mut self) -> Result<(), TunError> {
-        if self.engine.take().is_some() {
-            info!("WFP kill-switch deactivated (dynamic filters removed)");
-        }
+        Self::remove_killswitch_filters_best_effort();
+        self.engine.take();
+        info!("WFP kill-switch deactivated — filters removed");
         Ok(())
     }
 }
 
 impl Drop for WfpKillSwitch {
     fn drop(&mut self) {
+        // On a clean drop (e.g. forgot to call deactivate), remove our filters so
+        // they don't linger. On a process CRASH, Drop does NOT run → filters persist
+        // in the kernel → that is the intended fail-closed behaviour.
         if self.engine.is_some() {
-            warn!("WfpKillSwitch dropped while active — filters will be removed");
+            warn!("WfpKillSwitch dropped while active — removing filters");
+            Self::remove_killswitch_filters_best_effort();
+            self.engine.take();
         }
     }
 }
