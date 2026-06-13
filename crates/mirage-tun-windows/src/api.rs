@@ -33,7 +33,7 @@ pub struct TunStartParams {
     #[serde(default)]
     pub relay_addrs: Vec<String>,
     #[serde(default)]
-    pub policy: Option<crate::policy::PolicyConfigRequest>,
+    pub policy: Option<mirage_tun_core::policy::PolicyConfigRequest>,
     /// Named SOCKS5 chains. If empty and `socks5_addr` is set, synthesizes
     /// a single "default" chain from `socks5_addr` for backward compat.
     #[serde(default)]
@@ -68,7 +68,7 @@ struct ErrorBody {
 pub struct AppState {
     pub service: Arc<Mutex<ServiceState>>,
     pub stop_tx: watch::Sender<()>,
-    pub policy: Arc<crate::policy::PolicyEngine>,
+    pub policy: Arc<mirage_tun_core::policy::PolicyEngine>,
     pub dns_map: Arc<crate::dns_map::DnsMap>,
     pub chains: Arc<ChainRegistry>,
     pub metrics: Arc<MetricsRegistry>,
@@ -263,7 +263,7 @@ pub async fn activate_tun_inner(
 
     // Compile policy from params early so we can extract bypass CIDRs for WFP.
     let initial_policy = params.policy.map(|policy_req| {
-        crate::policy::CompiledPolicy::compile(policy_req.rules, policy_req.default_action)
+        mirage_tun_core::policy::CompiledPolicy::compile(policy_req.rules, policy_req.default_action)
     });
     let bypass_cidrs_for_wfp: Vec<(u32, u32)> = initial_policy
         .as_ref()
@@ -494,9 +494,9 @@ async fn get_policy(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 
 async fn set_policy(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<crate::policy::PolicyConfigRequest>,
+    Json(req): Json<mirage_tun_core::policy::PolicyConfigRequest>,
 ) -> StatusCode {
-    let compiled = crate::policy::CompiledPolicy::compile(req.rules.clone(), req.default_action.clone());
+    let compiled = mirage_tun_core::policy::CompiledPolicy::compile(req.rules.clone(), req.default_action.clone());
     let new_bypass_cidrs = compiled.bypass_cidrs();
     let new_bypass_cidrs_v6 = compiled.bypass_cidrs_v6();
     state.policy.update(compiled).await;

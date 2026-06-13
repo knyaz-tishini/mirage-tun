@@ -2,14 +2,17 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::{debug, info, warn};
+use std::collections::HashMap;
+use std::ffi::OsStr;
+
 use mirage_wfp::{
-    Action, AddrConditionBuilder, FilterBuilder, FilterEnumerator, FilterWeight,
-    InterfaceConditionBuilder, Layer, PortConditionBuilder, SubLayerBuilder, WfpEngine,
-    WfpTransaction, WeightRange, GUID, delete_filter,
+    Action, AddrConditionBuilder, AppIdConditionBuilder, FilterBuilder, FilterEnumerator,
+    FilterWeight, FlagsConditionBuilder, InterfaceConditionBuilder, Layer, OwnedByteBlob,
+    PortConditionBuilder, SubLayerBuilder, WfpEngine, WfpTransaction, WeightRange, GUID,
+    FLAG_IS_RAW_ENDPOINT, delete_filter,
 };
 use mirage_tun_core::traits::{PlatformFirewall, PlatformExecutor, FlowProto, FlowKey};
 use mirage_tun_core::plane::{Plane, ProcessIdentity};
-use mirage_tun_core::policy::ProcessInfo as CoreProcessInfo;
 use mirage_tun_core::traits::private;
 use crate::error::TunError;
 use crate::process_info::ProcessResolver;
@@ -27,6 +30,9 @@ pub struct WfpKillSwitch {
     bypass_cidrs_v6: Vec<(u128, u128)>,
     /// Process resolver for flow attribution (T2 addition — additive field).
     resolver: ProcessResolver,
+    /// Per-process filter tracking: normalized exe path → list of installed WFP filter IDs.
+    /// On plane change the old IDs are deleted and a new set installed.
+    per_process_filters: HashMap<String, Vec<u64>>,
 }
 
 impl WfpKillSwitch {
@@ -38,6 +44,7 @@ impl WfpKillSwitch {
             bypass_cidrs: Vec::new(),
             bypass_cidrs_v6: Vec::new(),
             resolver: ProcessResolver::new(),
+            per_process_filters: HashMap::new(),
         }
     }
 
@@ -445,6 +452,21 @@ impl PlatformFirewall for WfpKillSwitch {
     }
 
     fn deactivate(&mut self) -> Result<(), TunError> {
+        // Remove per-process filters (T3 addition) before closing the engine.
+        if let Some(engine) = self.engine.as_mut() {
+            if !self.per_process_filters.is_empty() {
+                if let Ok(tx) = WfpTransaction::begin(engine) {
+                    for ids in self.per_process_filters.values() {
+                        for &id in ids {
+                            let _ = delete_filter(&tx, id);
+                        }
+                    }
+                    let _ = tx.commit();
+                }
+                self.per_process_filters.clear();
+            }
+        }
+        // Existing coarse-filter cleanup.
         Self::remove_killswitch_filters_best_effort();
         self.engine.take();
         info!("WFP kill-switch deactivated — filters removed");
@@ -465,18 +487,111 @@ impl Drop for WfpKillSwitch {
     }
 }
 
-// ── T2: PlatformExecutor impl ─────────────────────────────────────────────────
+// ── T3: PlatformExecutor impl ─────────────────────────────────────────────────
 
 impl private::Sealed for WfpKillSwitch {}
 
-/// Convert the Windows-local `ProcessInfo` (from `process_info.rs`) to the core type.
-/// The two structs are structurally identical — this is a name-only conversion.
-/// T3 will delete `mirage-tun-windows/src/policy.rs` and unify the types.
-fn local_info_to_core(info: crate::process_info::ProcessInfo) -> CoreProcessInfo {
-    CoreProcessInfo {
-        pid: info.pid,
-        exe_path: info.exe_path,
-        ancestor_paths: info.ancestor_paths,
+impl WfpKillSwitch {
+    /// Install per-process Bypass permit filters (ConnectV4 + ConnectV6, weight 11).
+    /// Returns the list of installed filter IDs.
+    fn install_bypass_filters(&mut self, app_id_bytes: &[u8]) -> Result<Vec<u64>, TunError> {
+        let engine = self.engine.as_mut()
+            .ok_or_else(|| TunError::Other("enforce called before activate".into()))?;
+        let tx = WfpTransaction::begin(engine)
+            .map_err(|e| TunError::Wfp(format!("tx begin (bypass): {e}")))?;
+
+        let app_id_blob = OwnedByteBlob::from(app_id_bytes);
+        let cond = AppIdConditionBuilder::equal_from_blob(app_id_blob)
+            .map_err(|e| TunError::Wfp(format!("app-id condition: {e}")))?;
+
+        let mut ids = Vec::with_capacity(2);
+
+        for layer in [Layer::ConnectV4, Layer::ConnectV6] {
+            let id = FilterBuilder::new()
+                .name("Mirage: per-process bypass permit")
+                .action(Action::Permit)
+                .layer(layer)
+                .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                .weight(Self::weight(11))
+                .condition(cond.clone())
+                .add(&tx)
+                .map_err(|e| TunError::Wfp(format!("bypass permit {layer:?}: {e}")))?;
+            ids.push(id);
+        }
+
+        tx.commit().map_err(|e| TunError::Wfp(format!("tx commit (bypass): {e}")))?;
+        Ok(ids)
+    }
+
+    /// Install per-process Kill/Wire block filters:
+    ///   - ConnectV4 + ConnectV6 block (weight 8) — blocks all TCP/UDP/ICMP egress.
+    ///   - AleResourceAssignmentV4 + V6 block with IS_RAW_ENDPOINT (weight 8) —
+    ///     blocks raw socket creation.
+    ///
+    /// // TODO(T3-follow): also block promiscuous mode via FWPM_CONDITION_ALE_PROMISCUOUS_MODE
+    ///
+    /// Returns the list of installed filter IDs.
+    fn install_kill_filters(&mut self, app_id_bytes: &[u8]) -> Result<Vec<u64>, TunError> {
+        let engine = self.engine.as_mut()
+            .ok_or_else(|| TunError::Other("enforce called before activate".into()))?;
+        let tx = WfpTransaction::begin(engine)
+            .map_err(|e| TunError::Wfp(format!("tx begin (kill): {e}")))?;
+
+        let app_id_blob = OwnedByteBlob::from(app_id_bytes);
+        let app_id_cond = AppIdConditionBuilder::equal_from_blob(app_id_blob)
+            .map_err(|e| TunError::Wfp(format!("app-id condition: {e}")))?;
+        let raw_ep_cond = FlagsConditionBuilder::any_set(FLAG_IS_RAW_ENDPOINT);
+
+        let mut ids = Vec::with_capacity(4);
+
+        // Block connect-path egress (TCP/UDP/ICMP).
+        for layer in [Layer::ConnectV4, Layer::ConnectV6] {
+            let id = FilterBuilder::new()
+                .name("Mirage: per-process egress block")
+                .action(Action::Block)
+                .layer(layer)
+                .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                .weight(Self::weight(8))
+                .condition(app_id_cond.clone())
+                .add(&tx)
+                .map_err(|e| TunError::Wfp(format!("egress block {layer:?}: {e}")))?;
+            ids.push(id);
+        }
+
+        // Block raw socket creation (IS_RAW_ENDPOINT at ALE_RESOURCE_ASSIGNMENT).
+        for layer in [Layer::AleResourceAssignmentV4, Layer::AleResourceAssignmentV6] {
+            let id = FilterBuilder::new()
+                .name("Mirage: per-process raw socket block")
+                .action(Action::Block)
+                .layer(layer)
+                .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                .weight(Self::weight(8))
+                .condition(app_id_cond.clone())
+                .condition(raw_ep_cond.clone())
+                .add(&tx)
+                .map_err(|e| TunError::Wfp(format!("raw socket block {layer:?}: {e}")))?;
+            ids.push(id);
+        }
+
+        tx.commit().map_err(|e| TunError::Wfp(format!("tx commit (kill): {e}")))?;
+        Ok(ids)
+    }
+
+    /// Remove per-process filters previously installed for `exe_key`.
+    /// Best-effort: individual filter-delete errors are ignored (process may have died).
+    fn remove_per_process_filters(&mut self, exe_key: &str) -> Result<(), TunError> {
+        if let Some(ids) = self.per_process_filters.remove(exe_key) {
+            if let Some(engine) = self.engine.as_mut() {
+                let tx = WfpTransaction::begin(engine)
+                    .map_err(|e| TunError::Wfp(format!("tx begin (remove): {e}")))?;
+                for id in ids {
+                    // Best-effort: if filter already gone (process died), ignore.
+                    let _ = delete_filter(&tx, id);
+                }
+                tx.commit().map_err(|e| TunError::Wfp(format!("tx commit (remove): {e}")))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -489,8 +604,9 @@ impl PlatformExecutor for WfpKillSwitch {
     /// For UDP: uses `resolver.resolve_udp(src_port)`.
     /// Must be called from a `spawn_blocking` context — Win32 synchronous APIs.
     ///
-    /// For T2: attribution is returned without a `platform_token` (WFP app-id blob
-    /// attachment is T3). T3 will attach the FWP_BYTE_BLOB app-id here.
+    /// Acquires the WFP app-id blob via `FwpmGetAppIdFromFileName0` using the raw
+    /// Win32 path (pre-normalization) and stores it as `platform_token`. If blob
+    /// acquisition fails (e.g. process exited), `platform_token` is `None`.
     fn attribute(
         &self,
         src_port: u16,
@@ -501,29 +617,122 @@ impl PlatformExecutor for WfpKillSwitch {
             FlowProto::Tcp => self.resolver.resolve(src_port, dst)?,
             FlowProto::Udp => self.resolver.resolve_udp(src_port)?,
         };
-        Some(ProcessIdentity::from_process_info(local_info_to_core(local_info)))
+        // Use raw_exe_path (pre-normalization Win32 form) for FwpmGetAppIdFromFileName0.
+        // The normalized exe_path (forward slashes) is rejected by WFP.
+        let token: Option<Vec<u8>> = mirage_wfp::app_id_from_filename(
+            OsStr::new(&local_info.raw_exe_path)
+        )
+        .ok()
+        .map(|blob| {
+            // SAFETY: blob pointer is valid; we copy the bytes out immediately via as_ptr.
+            let ptr = blob.as_ptr();
+            let size = unsafe { (*ptr).size as usize };
+            let data = unsafe { std::slice::from_raw_parts((*ptr).data, size) };
+            data.to_vec()
+        });
+        let core_info = crate::process_info::process_info_to_core(local_info);
+        Some(ProcessIdentity::with_token(core_info, token.unwrap_or_default()))
     }
 
-    /// Enforce the plane decision.
+    /// Enforce the plane decision by installing or replacing per-process WFP filters.
     ///
-    /// T2: coarse enforcement — the existing WFP sublayer already handles
-    /// block/permit at interface granularity via `activate()`. Per-process
-    /// WFP app-id conditions are T3. The only invalid call is `Plane::Group`
-    /// (caller must resolve it before calling enforce).
+    /// - `Plane::Group` must never reach this method; returns `Err` immediately.
+    /// - Without a non-empty `platform_token` the per-process filters cannot be installed;
+    ///   the coarse block-all (weight 1) remains in effect — safe default (fail-closed).
+    /// - `Plane::Bypass` → install weight-11 APP_ID permit on ConnectV4/V6.
+    /// - `Plane::Wire(_)` or `Plane::Kill` → install weight-8 APP_ID block on ConnectV4/V6
+    ///   and weight-8 APP_ID+IS_RAW_ENDPOINT block on AleResourceAssignmentV4/V6.
     fn enforce(
         &mut self,
         plane: &Plane,
-        _identity: Option<&ProcessIdentity>,
+        identity: Option<&ProcessIdentity>,
         flow: &FlowKey,
     ) -> Result<(), TunError> {
-        match plane {
-            Plane::Group(_) => {
-                tracing::error!(?flow, "enforce called with unresolved Group plane — bug in caller");
-                Err(TunError::Other("unresolved Group plane in enforce".into()))
-            }
-            // T2: Bypass / Wire / Kill are all handled coarsely by the existing
-            // WFP sublayer activated via activate(). No per-flow action needed.
-            _ => Ok(()),
+        // Group must be resolved before reaching enforce.
+        if matches!(plane, Plane::Group(_)) {
+            tracing::error!(?flow, "enforce called with unresolved Group plane — bug in caller");
+            return Err(TunError::Other("unresolved Group plane in enforce".into()));
         }
+
+        // Without a non-empty attribution token we cannot install per-process filters.
+        // The coarse block-all (weight 1) from activate() remains in effect — safe.
+        let (exe_key, app_id_bytes) = match identity {
+            Some(id) if !id.platform_token.as_deref().unwrap_or(&[]).is_empty() => {
+                (id.info.exe_path.clone(), id.platform_token.clone().unwrap())
+            }
+            _ => {
+                tracing::debug!(?flow, "no attribution token — skipping per-process filter");
+                return Ok(());
+            }
+        };
+
+        // Remove previous filter set for this exe (plane transition).
+        self.remove_per_process_filters(&exe_key)?;
+
+        // Install new filter set based on plane.
+        let filter_ids = match plane {
+            Plane::Bypass => self.install_bypass_filters(&app_id_bytes)?,
+            Plane::Wire(_) | Plane::Kill => self.install_kill_filters(&app_id_bytes)?,
+            Plane::Group(_) => unreachable!("Group checked above"),
+        };
+
+        self.per_process_filters.insert(exe_key, filter_ids);
+        Ok(())
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mirage_tun_core::plane::{Plane, ProcessIdentity};
+    use mirage_tun_core::policy::ProcessInfo as CoreProcessInfo;
+    use mirage_tun_core::traits::{FlowKey, FlowProto};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn make_flow_key() -> FlowKey {
+        FlowKey {
+            src_port: 12345,
+            dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443),
+            proto: FlowProto::Tcp,
+        }
+    }
+
+    fn make_identity_no_token() -> ProcessIdentity {
+        ProcessIdentity::from_process_info(CoreProcessInfo {
+            pid: 1234,
+            exe_path: "c:/windows/notepad.exe".to_owned(),
+            ancestor_paths: vec![],
+        })
+    }
+
+    #[test]
+    fn wfp_kill_switch_new_has_empty_per_process() {
+        let ks = WfpKillSwitch::new();
+        assert!(ks.per_process_filters.is_empty(), "new() must start with empty per_process_filters");
+    }
+
+    #[test]
+    fn enforce_group_returns_error() {
+        let mut ks = WfpKillSwitch::new();
+        let flow = make_flow_key();
+        let result = ks.enforce(&Plane::Group("g".to_owned()), None, &flow);
+        assert!(result.is_err(), "enforce with Group plane must return Err");
+        if let Err(TunError::Other(msg)) = result {
+            assert!(msg.contains("Group"), "error message should mention Group");
+        }
+    }
+
+    #[test]
+    fn enforce_no_token_is_noop() {
+        // With no engine and no token, enforce should return Ok(()) without panic.
+        let mut ks = WfpKillSwitch::new();
+        let flow = make_flow_key();
+        let identity = make_identity_no_token();
+        // Kill plane + no token → Ok(()) (no WFP call attempted since token is empty).
+        let result = ks.enforce(&Plane::Kill, Some(&identity), &flow);
+        assert!(result.is_ok(), "enforce with no token must be a no-op (Ok)");
+        assert!(ks.per_process_filters.is_empty(), "no filter should be inserted when token is absent");
     }
 }

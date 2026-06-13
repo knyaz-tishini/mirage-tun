@@ -25,7 +25,8 @@ use crate::config::TunConfig;
 use crate::dns_map::DnsMap;
 use crate::error::{Result, TunError};
 use crate::metrics::MetricsRegistry;
-use crate::policy::{PolicyDecision, PolicyEngine};
+use mirage_tun_core::policy::{PolicyDecision, PolicyEngine};
+use crate::process_info::process_info_to_core;
 use crate::process_info::ProcessResolver;
 use crate::wintun::WintunDevice;
 
@@ -305,10 +306,11 @@ async fn tcp_accept_loop(
                     .ok()
                     .flatten();
 
-                    // Policy decision
+                    // Policy decision — convert local ProcessInfo to core type for the engine.
                     let domain_hint = dns_map.get(&dst.ip());
+                    let core_app_info = app_info.as_ref().map(|i| process_info_to_core(i.clone()));
                     let decision = policy
-                        .decide(dst.ip(), dst.port(), domain_hint.as_deref(), app_info.as_ref())
+                        .decide(dst.ip(), dst.port(), domain_hint.as_deref(), core_app_info.as_ref())
                         .await;
 
                     let exe_short = app_info.as_ref().map(|i| {
@@ -730,8 +732,9 @@ async fn udp_dns_loop(
                                 .flatten();
 
                             let domain_hint = dns_map.get(&dst_ip);
+                            let core_app_info_udp = app_info.as_ref().map(|i| process_info_to_core(i.clone()));
                             let decision = policy
-                                .decide(dst_ip, dst_addr.port(), domain_hint.as_deref(), app_info.as_ref())
+                                .decide(dst_ip, dst_addr.port(), domain_hint.as_deref(), core_app_info_udp.as_ref())
                                 .await;
 
                             // Store verdict for subsequent packets.
@@ -860,7 +863,8 @@ async fn udp_dns_loop(
                     };
                     let domain = extract_dns_domain(&payload);
                     let decision = if let Some(ref dom) = domain {
-                        policy.domain_decision(dom, dns_app_info.as_ref()).await
+                        let core_dns_app_info = dns_app_info.as_ref().map(|i| process_info_to_core(i.clone()));
+                        policy.domain_decision_with_app(dom, core_dns_app_info.as_ref()).await
                     } else {
                         PolicyDecision::default_chain()
                     };

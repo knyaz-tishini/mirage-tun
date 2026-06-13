@@ -34,8 +34,9 @@ mod weight;
 pub use action::Action;
 pub use blob::{OwnedByteBlob, app_id_from_filename};
 pub use condition::{
-    AddrConditionBuilder, AppIdConditionBuilder, Condition, ConditionField, InterfaceConditionBuilder,
-    MatchType, PortConditionBuilder, ProtocolConditionBuilder,
+    AddrConditionBuilder, AppIdConditionBuilder, Condition, ConditionField, FlagsConditionBuilder,
+    InterfaceConditionBuilder, MatchType, PortConditionBuilder, ProtocolConditionBuilder,
+    FLAG_IS_RAW_ENDPOINT,
 };
 pub use engine::WfpEngine;
 pub use enumerator::{FilterEnumItem, FilterEnumerator};

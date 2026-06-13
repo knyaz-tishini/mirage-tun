@@ -399,6 +399,52 @@ impl CompiledPolicy {
     }
 
     pub fn domain_decision(&self, domain: &str) -> PolicyDecision {
+        self.domain_decision_with_app(domain, None)
+    }
+
+    /// DNS routing decision for `domain`, with optional app-info for app-path/app-dir priority.
+    ///
+    /// When `app_info` is provided, the app-path / app-dir tables are checked FIRST,
+    /// mirroring the precedence in `decide()` (app > domain > default).
+    /// A Bypass-app's DNS query goes direct even for unlisted domains.
+    /// Unattributed queries (`app_info = None`) fall through to domain-table lookup.
+    pub fn domain_decision_with_app(
+        &self,
+        domain: &str,
+        app_info: Option<&ProcessInfo>,
+    ) -> PolicyDecision {
+        // App-based checks first — same precedence as decide().
+        if let Some(info) = app_info {
+            let paths: Vec<&str> = std::iter::once(info.exe_path.as_str())
+                .chain(info.ancestor_paths.iter().map(|s| s.as_str()))
+                .collect();
+
+            // Exact path match.
+            for (rule_path, decision, _fp, _wc, rule_idx) in &self.app_path_table {
+                for &p in &paths {
+                    if p == rule_path.as_str() {
+                        if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return decision.clone();
+                    }
+                }
+            }
+
+            // Directory prefix match.
+            for (rule_dir, decision, _fp, _wc, rule_idx) in &self.app_dir_table {
+                for &p in &paths {
+                    if p.starts_with(rule_dir.as_str()) {
+                        if let Some(counter) = self.rule_hits.get(*rule_idx) {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return decision.clone();
+                    }
+                }
+            }
+        }
+
+        // Domain check — unattributed queries + attributed queries with no app-level rule.
         let domain_lower = domain.to_lowercase();
         for (suffix, decision, _fp, _wc, rule_idx) in &self.domain_table {
             let matched = if suffix.starts_with('.') {
@@ -493,6 +539,20 @@ impl PolicyEngine {
     pub async fn domain_decision(&self, domain: &str) -> PolicyDecision {
         let config = self.config.read().await;
         config.domain_decision(domain)
+    }
+
+    /// DNS routing decision with optional per-app priority (mirrors fork's `domain_decision`).
+    ///
+    /// When `app_info` is `Some`, app-path and app-dir rules are evaluated FIRST before
+    /// domain rules — same precedence order as `decide()`. Use this in the DNS path where
+    /// the querying process is known.
+    pub async fn domain_decision_with_app(
+        &self,
+        domain: &str,
+        app_info: Option<&ProcessInfo>,
+    ) -> PolicyDecision {
+        let config = self.config.read().await;
+        config.domain_decision_with_app(domain, app_info)
     }
 
     pub async fn update(&self, new_config: CompiledPolicy) {

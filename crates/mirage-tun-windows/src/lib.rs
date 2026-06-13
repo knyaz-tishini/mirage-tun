@@ -7,7 +7,6 @@ pub mod error;
 pub mod firewall;
 pub mod ipstack;
 pub mod metrics;
-pub mod policy;
 pub mod process_info;
 pub mod proxy;
 pub mod routing;

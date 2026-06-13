@@ -53,7 +53,7 @@ pub(crate) fn config_path_for_write() -> PathBuf {
 
 /// Persist `policy` into tun.json (read-modify-write).
 /// Best-effort: logs a warning on failure, never returns an error.
-pub(crate) fn save_policy_to_config(policy: &crate::policy::PolicyConfigRequest) {
+pub(crate) fn save_policy_to_config(policy: &mirage_tun_core::policy::PolicyConfigRequest) {
     let path = config_path_for_write();
 
     // Read current JSON object (or start with empty object).
@@ -242,7 +242,7 @@ pub async fn run_service_logic(
         }
     };
 
-    let policy = Arc::new(crate::policy::PolicyEngine::mirage_only());
+    let policy = Arc::new(mirage_tun_core::policy::PolicyEngine::mirage_only());
     let dns_map = Arc::new(crate::dns_map::DnsMap::new());
     let chains = Arc::new(crate::chains::ChainRegistry::empty());
     let metrics = Arc::new(MetricsRegistry::new());

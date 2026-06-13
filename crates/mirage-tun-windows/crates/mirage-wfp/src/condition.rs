@@ -6,13 +6,19 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FWP_BYTE_BLOB_TYPE, FWP_MATCH_EQUAL, FWP_MATCH_GREATER, FWP_MATCH_GREATER_OR_EQUAL,
-    FWP_MATCH_LESS, FWP_MATCH_LESS_OR_EQUAL, FWP_MATCH_RANGE, FWP_UINT8, FWP_UINT16, FWP_UINT32,
-    FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK,
-    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_INTERFACE_INDEX, FWPM_CONDITION_IP_LOCAL_ADDRESS,
-    FWPM_CONDITION_IP_LOCAL_PORT, FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS,
-    FWPM_CONDITION_IP_REMOTE_PORT, FWPM_FILTER_CONDITION0,
+    FWP_BYTE_BLOB_TYPE, FWP_MATCH_EQUAL, FWP_MATCH_FLAGS_ANY_SET, FWP_MATCH_GREATER,
+    FWP_MATCH_GREATER_OR_EQUAL, FWP_MATCH_LESS, FWP_MATCH_LESS_OR_EQUAL, FWP_MATCH_RANGE,
+    FWP_UINT8, FWP_UINT16, FWP_UINT32, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
+    FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_FLAGS,
+    FWPM_CONDITION_INTERFACE_INDEX, FWPM_CONDITION_IP_LOCAL_ADDRESS, FWPM_CONDITION_IP_LOCAL_PORT,
+    FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT,
+    FWPM_FILTER_CONDITION0,
 };
+
+/// WFP condition flag: the socket is a raw endpoint (SOCK_RAW).
+/// Used to block raw socket creation at `ALE_RESOURCE_ASSIGNMENT` layers.
+/// Value 16 (0x10) per Windows SDK `FWP_CONDITION_FLAG_IS_RAW_ENDPOINT`.
+pub const FLAG_IS_RAW_ENDPOINT: u32 = windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_FLAG_IS_RAW_ENDPOINT;
 use windows_sys::core::GUID;
 
 use crate::blob::{OwnedByteBlob, app_id_from_filename};
@@ -27,6 +33,9 @@ pub enum MatchType {
     GreaterOrEqual = FWP_MATCH_GREATER_OR_EQUAL,
     LessOrEqual = FWP_MATCH_LESS_OR_EQUAL,
     Range = FWP_MATCH_RANGE,
+    /// Bitmask test: match if ANY of the specified bits are set in the condition field.
+    /// Used with `FWPM_CONDITION_FLAGS` to test flags like `FWP_CONDITION_FLAG_IS_RAW_ENDPOINT`.
+    FlagsAnySet = FWP_MATCH_FLAGS_ANY_SET,
 }
 
 /// Which field in the network flow is inspected.
@@ -39,6 +48,9 @@ pub enum ConditionField {
     Protocol,
     AppId,
     InterfaceIndex,
+    /// `FWPM_CONDITION_FLAGS` — WFP condition flags bitmask.
+    /// Match using `MatchType::FlagsAnySet` to test individual flag bits.
+    ConditionFlags,
 }
 
 impl ConditionField {
@@ -52,6 +64,7 @@ impl ConditionField {
             Self::Protocol => &FWPM_CONDITION_IP_PROTOCOL,
             Self::AppId => &FWPM_CONDITION_ALE_APP_ID,
             Self::InterfaceIndex => &FWPM_CONDITION_INTERFACE_INDEX,
+            Self::ConditionFlags => &FWPM_CONDITION_FLAGS,
         }
     }
 }
@@ -243,8 +256,19 @@ pub struct AppIdConditionBuilder;
 
 impl AppIdConditionBuilder {
     /// Match application by executable path.
+    ///
+    /// Calls `FwpmGetAppIdFromFileName0` to acquire the WFP-internal device path.
     pub fn equal(path: impl AsRef<OsStr>) -> io::Result<Condition> {
         let blob = app_id_from_filename(path)?;
+        Ok(InnerBuilder { field: ConditionField::AppId, match_type: MatchType::Equal }
+            .build_blob(blob))
+    }
+
+    /// Match application by pre-acquired app-id blob bytes.
+    ///
+    /// Use when the blob was already obtained via `app_id_from_filename` and stored
+    /// (avoids a redundant `FwpmGetAppIdFromFileName0` call).
+    pub fn equal_from_blob(blob: OwnedByteBlob) -> io::Result<Condition> {
         Ok(InnerBuilder { field: ConditionField::AppId, match_type: MatchType::Equal }
             .build_blob(blob))
     }
@@ -260,5 +284,72 @@ impl InterfaceConditionBuilder {
     pub fn equal(idx: u32) -> Condition {
         InnerBuilder { field: ConditionField::InterfaceIndex, match_type: MatchType::Equal }
             .build_u32(idx)
+    }
+}
+
+// ── Flags conditions ─────────────────────────────────────────────────────────
+
+/// Builder for WFP condition-flags conditions (`FWPM_CONDITION_FLAGS`).
+pub struct FlagsConditionBuilder;
+
+impl FlagsConditionBuilder {
+    /// Match when ANY of the bits in `mask` are set in `FWPM_CONDITION_FLAGS`.
+    ///
+    /// Use with `FLAG_IS_RAW_ENDPOINT` to catch raw socket creation at
+    /// `ALE_RESOURCE_ASSIGNMENT` layers without blocking ordinary socket creation.
+    pub fn any_set(mask: u32) -> Condition {
+        InnerBuilder {
+            field: ConditionField::ConditionFlags,
+            match_type: MatchType::FlagsAnySet,
+        }
+        .build_u32(mask)
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FWP_MATCH_FLAGS_ANY_SET, FWP_UINT32,
+    };
+
+    #[test]
+    fn flags_condition_builder_raw_endpoint() {
+        let cond = FlagsConditionBuilder::any_set(FLAG_IS_RAW_ENDPOINT);
+        // conditionValue.type must be FWP_UINT32.
+        assert_eq!(
+            unsafe { cond.raw.conditionValue.r#type },
+            FWP_UINT32,
+            "flags condition must use FWP_UINT32 value type"
+        );
+        // matchType must be FWP_MATCH_FLAGS_ANY_SET.
+        assert_eq!(
+            cond.raw.matchType, FWP_MATCH_FLAGS_ANY_SET,
+            "flags condition must use FWP_MATCH_FLAGS_ANY_SET"
+        );
+        // The uint32 value must equal the mask we passed.
+        assert_eq!(
+            unsafe { cond.raw.conditionValue.Anonymous.uint32 },
+            FLAG_IS_RAW_ENDPOINT,
+            "flags condition value must match the raw-endpoint flag mask"
+        );
+    }
+
+    #[test]
+    fn app_id_condition_from_blob_roundtrip() {
+        // Build a blob from known bytes and verify the condition is constructed.
+        let data: &[u8] = b"\x0e\x00\x00\x00test\x00";
+        let blob = OwnedByteBlob::from(data);
+        // equal_from_blob must not return an error.
+        let cond = AppIdConditionBuilder::equal_from_blob(blob)
+            .expect("equal_from_blob must succeed with a valid blob");
+        // matchType must be Equal.
+        assert_eq!(
+            cond.raw.matchType,
+            windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_MATCH_EQUAL,
+            "app-id-from-blob condition must use FWP_MATCH_EQUAL"
+        );
     }
 }

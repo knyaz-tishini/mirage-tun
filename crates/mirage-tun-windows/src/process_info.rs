@@ -9,16 +9,30 @@ pub struct ProcessInfo {
     pub pid: u32,
     /// Full Win32 path, lowercased, backslashes replaced with forward slashes.
     pub exe_path: String,
+    /// Raw Win32 path as returned by `QueryFullProcessImageNameW`, before normalization.
+    /// Used by WFP `FwpmGetAppIdFromFileName0` which requires the native backslash form.
+    pub raw_exe_path: String,
     /// Parent chain, up to 5 levels, same normalization.
     pub ancestor_paths: Vec<String>,
+}
+
+/// Convert a Windows-local `ProcessInfo` to the core policy type.
+/// The two structs are structurally compatible; `raw_exe_path` is Windows-only
+/// and has no equivalent in the platform-agnostic core type.
+pub(crate) fn process_info_to_core(info: ProcessInfo) -> mirage_tun_core::policy::ProcessInfo {
+    mirage_tun_core::policy::ProcessInfo {
+        pid: info.pid,
+        exe_path: info.exe_path,
+        ancestor_paths: info.ancestor_paths,
+    }
 }
 
 const PID_CACHE_TTL: Duration = Duration::from_secs(30);
 const PID_CACHE_MAX: usize = 512;
 
 struct PidCache {
-    /// pid → (exe_path_normalized, ancestor_paths_normalized, inserted_at)
-    entries: HashMap<u32, (String, Vec<String>, Instant)>,
+    /// pid → (exe_path_normalized, raw_exe_path, ancestor_paths_normalized, inserted_at)
+    entries: HashMap<u32, (String, String, Vec<String>, Instant)>,
 }
 
 impl PidCache {
@@ -26,27 +40,27 @@ impl PidCache {
         Self { entries: HashMap::new() }
     }
 
-    fn get(&self, pid: u32) -> Option<(String, Vec<String>)> {
-        if let Some((path, ancestors, ts)) = self.entries.get(&pid) {
+    fn get(&self, pid: u32) -> Option<(String, String, Vec<String>)> {
+        if let Some((path, raw_path, ancestors, ts)) = self.entries.get(&pid) {
             if ts.elapsed() < PID_CACHE_TTL {
-                return Some((path.clone(), ancestors.clone()));
+                return Some((path.clone(), raw_path.clone(), ancestors.clone()));
             }
         }
         None
     }
 
-    fn insert(&mut self, pid: u32, path: String, ancestors: Vec<String>) {
+    fn insert(&mut self, pid: u32, path: String, raw_path: String, ancestors: Vec<String>) {
         if self.entries.len() >= PID_CACHE_MAX {
             // Evict the oldest entry
             let oldest = self.entries
                 .iter()
-                .min_by_key(|(_, (_, _, ts))| *ts)
+                .min_by_key(|(_, (_, _, _, ts))| *ts)
                 .map(|(k, _)| *k);
             if let Some(k) = oldest {
                 self.entries.remove(&k);
             }
         }
-        self.entries.insert(pid, (path, ancestors, Instant::now()));
+        self.entries.insert(pid, (path, raw_path, ancestors, Instant::now()));
     }
 
     fn remove(&mut self, pid: u32) {
@@ -110,27 +124,31 @@ impl ProcessResolver {
         // Check cache first
         {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((exe_path, ancestor_paths)) = cache.get(pid) {
-                return Some(ProcessInfo { pid, exe_path, ancestor_paths });
+            if let Some((exe_path, raw_exe_path, ancestor_paths)) = cache.get(pid) {
+                return Some(ProcessInfo { pid, exe_path, raw_exe_path, ancestor_paths });
             }
         }
 
-        let exe_path = match exe_path_for_pid(pid) {
-            Ok(p) => normalize_path(&p),
+        let raw_win32_path = match exe_path_for_pid(pid) {
+            Ok(p) => p,
             Err(e) => {
                 tracing::warn!("process_info: exe_path_for_pid({pid}) failed: {e}");
                 return None;
             }
         };
+        // raw_exe_path is the pre-normalization Win32 form (backslashes, original case).
+        // exe_path is normalized (lowercase, forward slashes) for policy matching.
+        let raw_exe_path = raw_win32_path.clone();
+        let exe_path = normalize_path(&raw_win32_path);
 
         let ancestor_paths = get_ancestor_paths(pid, self);
 
         {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            cache.insert(pid, exe_path.clone(), ancestor_paths.clone());
+            cache.insert(pid, exe_path.clone(), raw_exe_path.clone(), ancestor_paths.clone());
         }
 
-        Some(ProcessInfo { pid, exe_path, ancestor_paths })
+        Some(ProcessInfo { pid, exe_path, raw_exe_path, ancestor_paths })
     }
 
     #[cfg(windows)]
@@ -146,33 +164,35 @@ impl ProcessResolver {
         // Check cache first (PidCache is keyed by PID, not protocol — reusable as-is)
         {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((exe_path, ancestor_paths)) = cache.get(pid) {
-                return Some(ProcessInfo { pid, exe_path, ancestor_paths });
+            if let Some((exe_path, raw_exe_path, ancestor_paths)) = cache.get(pid) {
+                return Some(ProcessInfo { pid, exe_path, raw_exe_path, ancestor_paths });
             }
         }
 
-        let exe_path = match exe_path_for_pid(pid) {
-            Ok(p) => normalize_path(&p),
+        let raw_win32_path = match exe_path_for_pid(pid) {
+            Ok(p) => p,
             Err(e) => {
                 tracing::warn!("process_info: exe_path_for_pid({pid}) failed: {e}");
                 return None;
             }
         };
+        let raw_exe_path = raw_win32_path.clone();
+        let exe_path = normalize_path(&raw_win32_path);
 
         let ancestor_paths = get_ancestor_paths(pid, self);
 
         {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            cache.insert(pid, exe_path.clone(), ancestor_paths.clone());
+            cache.insert(pid, exe_path.clone(), raw_exe_path.clone(), ancestor_paths.clone());
         }
 
-        Some(ProcessInfo { pid, exe_path, ancestor_paths })
+        Some(ProcessInfo { pid, exe_path, raw_exe_path, ancestor_paths })
     }
 
     #[cfg(windows)]
     fn get_cached_exe_path(&self, pid: u32) -> Option<String> {
         let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.get(pid).map(|(path, _)| path)
+        cache.get(pid).map(|(path, _, _)| path)
     }
 
     #[cfg(windows)]
@@ -446,13 +466,13 @@ fn get_ancestor_paths(target_pid: u32, resolver: &ProcessResolver) -> Vec<String
             Some(cached)
         } else {
             match exe_path_for_pid(parent_pid) {
-                Ok(p) => {
-                    let normalized = normalize_path(&p);
+                Ok(raw_p) => {
+                    let normalized = normalize_path(&raw_p);
                     // Insert just the path into cache (no ancestors for ancestors themselves)
                     {
                         let mut cache = resolver.cache.lock().unwrap_or_else(|p| p.into_inner());
                         if cache.get(parent_pid).is_none() {
-                            cache.insert(parent_pid, normalized.clone(), vec![]);
+                            cache.insert(parent_pid, normalized.clone(), raw_p, vec![]);
                         }
                     }
                     Some(normalized)
