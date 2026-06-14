@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 use mirage_tun_core::chains::{ChainConfig, ChainEntry, ChainMap, ChainRegistry};
 
+use crate::conn_registry::ConnectionRegistry;
 use crate::metrics::MetricsRegistry;
 
 /// Emitted at most once across the process lifetime.
@@ -27,16 +28,18 @@ struct ChainsUpdateParams {
 struct AppState {
     metrics: Arc<MetricsRegistry>,
     chains: Arc<ChainRegistry>,
+    connections: Arc<ConnectionRegistry>,
 }
 
 pub async fn serve(
     bind: SocketAddr,
     metrics: Arc<MetricsRegistry>,
     chains: Arc<ChainRegistry>,
+    connections: Arc<ConnectionRegistry>,
     cancel: CancellationToken,
     api_key: Option<String>,
 ) {
-    let state = Arc::new(AppState { metrics, chains });
+    let state = Arc::new(AppState { metrics, chains, connections });
 
     // Routes always open (unauthenticated health/metrics scrapers).
     let open = Router::new()
@@ -46,7 +49,8 @@ pub async fn serve(
     // Guarded routes require auth when api_key is set.
     let guarded = Router::new()
         .route("/chains/list", get(get_chains_list))
-        .route("/chains/update", post(post_chains_update));
+        .route("/chains/update", post(post_chains_update))
+        .route("/connections", get(get_connections));
 
     let guarded = match api_key {
         Some(key) => {
@@ -124,6 +128,11 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
 async fn get_chains_list(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let configs = state.chains.to_configs().await;
     Json(serde_json::json!({ "chains": configs }))
+}
+
+async fn get_connections(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let snaps = state.connections.snapshot();
+    Json(serde_json::json!({ "connections": snaps }))
 }
 
 async fn post_chains_update(

@@ -6,7 +6,9 @@
 ///   UdpSocket → udp_forward loop → SOCKS5 UDP ASSOCIATE → chain exit
 ///   smoltcp Stack (Stream) → write loop → utun fd
 use crate::{
+    conn_registry::{ConnectionRegistry, SharedConnRegistry},
     dns::MacosDns,
+    dns_query_log::DnsQueryLog,
     dns_route::dns_via_socks5,
     error::MacosTunError,
     firewall::MacosFirewall,
@@ -43,12 +45,12 @@ impl Sealed for MacosTunStack {}
 
 impl MacosTunStack {
     /// Start the stack and return the `StackHandle` (for trait compat), the
-    /// per-chain `MetricsRegistry`, and the hot-reloadable `ChainRegistry`
-    /// (both for the API server).
+    /// per-chain `MetricsRegistry`, the hot-reloadable `ChainRegistry`,
+    /// and the `ConnectionRegistry` (all for the API server).
     pub async fn start_with_metrics(
         cfg: StackConfig,
         cancel: CancellationToken,
-    ) -> Result<(StackHandle<SmoltcpTcpAcceptor, SmoltcpUdpSocket>, Arc<MetricsRegistry>, Arc<ChainRegistry>), MacosTunError> {
+    ) -> Result<(StackHandle<SmoltcpTcpAcceptor, SmoltcpUdpSocket>, Arc<MetricsRegistry>, Arc<ChainRegistry>, SharedConnRegistry), MacosTunError> {
         // Phase 2b: multiple chains are now routed per-flow by policy (TCP path).
         // The first chain remains the default (used when no policy rule matches,
         // and for the DNS/UDP paths until those gain per-flow routing too).
@@ -277,6 +279,13 @@ impl MacosTunStack {
         // any connection is made.
         chain_metrics_registry.get_or_create(&chain_name);
 
+        // Forward-DNS query log: maps resolved IPs → queried domain name.
+        // Populated by the DNS-intercept loop; consulted at flow-open time.
+        let dns_query_log = Arc::new(DnsQueryLog::new());
+
+        // Per-flow connection registry: powering GET /connections.
+        let conn_registry: SharedConnRegistry = Arc::new(ConnectionRegistry::new());
+
         // Flat StackMetrics kept for StackHandle trait compat (unused by mac api).
         let flat_metrics = Arc::new(StackMetrics::default());
 
@@ -355,6 +364,8 @@ impl MacosTunStack {
         let tcp_chain_socks = Arc::clone(&chain_socks_arc);
         let tcp_wire_health = Arc::clone(&wire_health);
         let tcp_wire_groups = Arc::clone(&wire_groups_arc);
+        let tcp_conn_registry = Arc::clone(&conn_registry);
+        let tcp_dns_log = Arc::clone(&dns_query_log);
         tokio::spawn(async move {
             tcp_accept_loop(
                 tcp_listener,
@@ -366,6 +377,8 @@ impl MacosTunStack {
                 tcp_metrics,
                 tcp_wire_health,
                 tcp_wire_groups,
+                tcp_conn_registry,
+                tcp_dns_log,
             )
             .await;
         });
@@ -409,6 +422,8 @@ impl MacosTunStack {
         // Wrap chain_dns_map in an Arc so it can be moved into the spawn closure.
         let dns_chain_dns: Arc<HashMap<String, SocketAddr>> = Arc::new(chain_dns_map);
         let default_chain_name = chain_name.clone();
+        // DNS query log shared into the DNS-intercept closure.
+        let dns_log_udp = Arc::clone(&dns_query_log);
         tokio::spawn(async move {
             let mut udp_read = udp_read;
             loop {
@@ -470,12 +485,24 @@ impl MacosTunStack {
                                 let tx = resp_tx.clone();
                                 let q = payload.clone();
                                 let q2 = q.clone();
+                                // Clone log + domain for the spawned task.
+                                let dns_log_task = Arc::clone(&dns_log_udp);
+                                let forward_name = domain.clone();
                                 tokio::spawn(async move {
                                     let res = fc.resolve(&q, move || async move {
                                         dns_via_socks5(&q2, dns_socks, dns_upstream).await
                                     }).await;
                                     match res {
                                         Ok(response) => {
+                                            // Populate the DNS query log with every
+                                            // A/AAAA IP from the upstream answer so
+                                            // TCP flows can resolve IP → forward name.
+                                            if let Some(ref name) = forward_name {
+                                                let ips = mirage_dns::protocol::parse_answer_ips(&response);
+                                                if !ips.is_empty() {
+                                                    dns_log_task.insert_ips(name, &ips);
+                                                }
+                                            }
                                             let _ = tx.send((response, dst_addr, src_addr));
                                         }
                                         Err(e) => {
@@ -522,7 +549,7 @@ impl MacosTunStack {
         // TCP forwarding is self-contained in tcp_accept_loop; expose noop for StackHandle.
         let tcp = SmoltcpTcpAcceptor::noop();
 
-        Ok((StackHandle { tcp, udp, metrics: flat_metrics }, chain_metrics_registry, chain_registry))
+        Ok((StackHandle { tcp, udp, metrics: flat_metrics }, chain_metrics_registry, chain_registry, conn_registry))
     }
 }
 
@@ -537,7 +564,8 @@ impl TunStack for MacosTunStack {
         cfg: StackConfig,
         cancel: CancellationToken,
     ) -> Result<StackHandle<Self::Tcp, Self::Udp>, Self::Error> {
-        let (handle, _chain_metrics, _chain_registry) = Self::start_with_metrics(cfg, cancel).await?;
+        let (handle, _chain_metrics, _chain_registry, _conn_registry) =
+            Self::start_with_metrics(cfg, cancel).await?;
         Ok(handle)
     }
 }
@@ -554,6 +582,8 @@ async fn tcp_accept_loop(
     metrics: Arc<MetricsRegistry>,
     wire_health: Arc<WireHealthMap>,
     wire_groups: Arc<HashMap<String, Vec<(String, SocketAddr)>>>,
+    conn_registry: SharedConnRegistry,
+    dns_query_log: Arc<DnsQueryLog>,
 ) {
     use mirage_tun_core::policy::{FailurePolicy, PolicyDecision};
     loop {
@@ -634,6 +664,14 @@ async fn tcp_accept_loop(
                         Some((chain_name, socks5_addr)) => {
                             metrics.record_connection(&chain_name);
                             let chain_m = metrics.get_or_create(&chain_name);
+                            // Look up the forward DNS name for this destination IP.
+                            let domain = dns_query_log.lookup(remote.ip());
+                            let conn_id = conn_registry.record_open(
+                                chain_name.clone(),
+                                remote,
+                                domain,
+                                "tcp",
+                            );
                             tokio::spawn(forward_tcp(
                                 stream,
                                 remote,
@@ -641,6 +679,8 @@ async fn tcp_accept_loop(
                                 chain_name,
                                 Arc::clone(&wire_health),
                                 chain_m,
+                                Arc::clone(&conn_registry),
+                                conn_id,
                             ));
                         }
                         None => {
@@ -670,64 +710,54 @@ async fn forward_tcp(
     wire_name: String,
     wire_health: Arc<WireHealthMap>,
     chain_metrics: Arc<crate::metrics::ChainMetrics>,
+    conn_registry: SharedConnRegistry,
+    conn_id: u64,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut socks = match tokio::net::TcpStream::connect(socks5_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("SOCKS5 connect to {} failed: {}", socks5_addr, e);
+    // Inline helper: record flow close on any error exit.
+    macro_rules! bail_error {
+        ($msg:literal, $($arg:expr),*) => {{
+            warn!($msg, $($arg),*);
             wire_health.record_failure(&wire_name);
             chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
+            conn_registry.record_close(conn_id, 0, 0);
             return;
-        }
+        }};
+    }
+
+    let mut socks = match tokio::net::TcpStream::connect(socks5_addr).await {
+        Ok(s) => s,
+        Err(e) => bail_error!("SOCKS5 connect to {} failed: {}", socks5_addr, e),
     };
 
     // Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
     if let Err(e) = socks.write_all(&[0x05, 0x01, 0x00]).await {
-        warn!("SOCKS5 greeting write failed: {e}");
-        wire_health.record_failure(&wire_name);
-        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
-        return;
+        bail_error!("SOCKS5 greeting write failed: {e}",);
     }
 
     let mut resp = [0u8; 2];
     if let Err(e) = socks.read_exact(&mut resp).await {
-        warn!("SOCKS5 greeting read failed: {e}");
-        wire_health.record_failure(&wire_name);
-        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
-        return;
+        bail_error!("SOCKS5 greeting read failed: {e}",);
     }
     if resp[0] != 0x05 || resp[1] != 0x00 {
-        warn!("SOCKS5 auth method rejected: {:?}", resp);
-        wire_health.record_failure(&wire_name);
-        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
-        return;
+        bail_error!("SOCKS5 auth method rejected: {:?}", resp);
     }
 
     // CONNECT request
     let req = build_socks5_connect(target);
     if let Err(e) = socks.write_all(&req).await {
-        warn!("SOCKS5 CONNECT write failed: {e}");
-        wire_health.record_failure(&wire_name);
-        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
-        return;
+        bail_error!("SOCKS5 CONNECT write failed: {e}",);
     }
 
     // Response: VER RSP RSV ATYP ... (min 10 bytes for IPv4)
     let mut hdr = [0u8; 4];
     if let Err(e) = socks.read_exact(&mut hdr).await {
-        warn!("SOCKS5 CONNECT response read failed: {e}");
-        wire_health.record_failure(&wire_name);
-        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
-        return;
+        bail_error!("SOCKS5 CONNECT response read failed: {e}",);
     }
     if hdr[1] != 0x00 {
-        warn!("SOCKS5 CONNECT failed, reply code: 0x{:02x}", hdr[1]);
-        wire_health.record_failure(&wire_name);
-        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
-        return;
+        bail_error!("SOCKS5 CONNECT failed, reply code: 0x{:02x}", hdr[1]);
     }
     // Drain bound address from response
     let skip = match hdr[3] {
@@ -738,23 +768,16 @@ async fn forward_tcp(
             if socks.read_exact(&mut len).await.is_err() {
                 wire_health.record_failure(&wire_name);
                 chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
+                conn_registry.record_close(conn_id, 0, 0);
                 return;
             }
             len[0] as usize + 2
         }
-        _ => {
-            warn!("SOCKS5 unknown atyp: 0x{:02x}", hdr[3]);
-            wire_health.record_failure(&wire_name);
-            chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
+        atyp => bail_error!("SOCKS5 unknown atyp: 0x{:02x}", atyp),
     };
     let mut tail = vec![0u8; skip];
     if let Err(e) = socks.read_exact(&mut tail).await {
-        warn!("SOCKS5 bound addr read failed: {e}");
-        wire_health.record_failure(&wire_name);
-        chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
-        return;
+        bail_error!("SOCKS5 bound addr read failed: {e}",);
     }
 
     // SOCKS5 handshake succeeded — wire proved it can carry this flow.
@@ -764,10 +787,12 @@ async fn forward_tcp(
         Ok((tx, rx)) => {
             chain_metrics.bytes_tx.fetch_add(tx, Ordering::Relaxed);
             chain_metrics.bytes_rx.fetch_add(rx, Ordering::Relaxed);
+            conn_registry.record_close(conn_id, tx, rx);
         }
         Err(e) => {
             warn!("TCP forward {target} error: {e}");
             chain_metrics.errors.fetch_add(1, Ordering::Relaxed);
+            conn_registry.record_close(conn_id, 0, 0);
         }
     }
 }

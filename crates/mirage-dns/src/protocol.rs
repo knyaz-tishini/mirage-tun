@@ -83,6 +83,62 @@ pub fn is_nxdomain(buf: &[u8]) -> bool {
     parse_header(buf).map_or(false, |h| (h.flags & 0x000F) == 3)
 }
 
+/// Parse A (type 1) and AAAA (type 28) answer records from a DNS wire response.
+///
+/// Returns a vec of resolved `IpAddr`s from all answer RRs.  Silently ignores
+/// malformed records and non-A/AAAA types.  Call this on the upstream's
+/// response to extract which IPs a queried name resolved to.
+pub fn parse_answer_ips(buf: &[u8]) -> Vec<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let header = match parse_header(buf) {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let mut pos = 12usize;
+
+    // Skip question section
+    for _ in 0..header.qdcount {
+        if skip_name(buf, &mut pos).is_none() {
+            return Vec::new();
+        }
+        pos += 4; // qtype + qclass
+        if pos > buf.len() {
+            return Vec::new();
+        }
+    }
+
+    let mut ips = Vec::new();
+    for _ in 0..header.ancount {
+        if skip_name(buf, &mut pos).is_none() {
+            break;
+        }
+        if pos + 10 > buf.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        // skip type(2) + class(2) + ttl(4)
+        let rdlength = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlength > buf.len() {
+            break;
+        }
+        match rtype {
+            1 if rdlength == 4 => {
+                let octets: [u8; 4] = buf[pos..pos + 4].try_into().unwrap_or([0; 4]);
+                ips.push(IpAddr::V4(Ipv4Addr::from(octets)));
+            }
+            28 if rdlength == 16 => {
+                let octets: [u8; 16] = buf[pos..pos + 16].try_into().unwrap_or([0; 16]);
+                ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
+            }
+            _ => {}
+        }
+        pos += rdlength;
+    }
+    ips
+}
+
 fn read_name(buf: &[u8], pos: &mut usize) -> Option<String> {
     let mut labels = Vec::new();
     let mut p = *pos;
