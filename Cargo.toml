@@ -11,6 +11,12 @@ members = [
     "crates/mirage-tun-android",
     "crates/mirage-tun-ios",
 ]
+# bpf-progs holds the eBPF program as C source (mirage_bpf.c), compiled to a BPF
+# object by mirage-tun-linux/build.rs via `clang -target bpf`. It is NOT a cargo
+# crate; excluded so cargo never tries to treat it as a workspace member.
+exclude = [
+    "crates/mirage-tun-linux/bpf-progs",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -14,6 +14,10 @@ pub enum LinuxTunError {
     Dns(String),
     #[error("core: {0}")]
     Core(#[from] TunError),
+    #[error("eBPF error: {0}")]
+    Ebpf(String),
+    #[error("cgroup error: {0}")]
+    Cgroup(String),
     #[error("{0}")]
     Other(String),
 }
