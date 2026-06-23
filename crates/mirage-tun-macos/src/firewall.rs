@@ -47,6 +47,26 @@ impl MacosFirewall {
         self.bypass_nets = nets;
     }
 
+    /// Live update of bypass-plane CIDRs while the TUN is active.
+    ///
+    /// Replaces `self.bypass_nets` with `new_nets` then reloads the pf anchor via
+    /// `pfctl -f` (the same mechanism as `activate()`). The reload is atomic at
+    /// the kernel level — the old ruleset is replaced in one shot.
+    ///
+    /// `relay_addrs` and `tun_name` must be the values currently in use so the
+    /// reload preserves relay and tun-interface exemptions already in the anchor.
+    pub fn reload_bypass_nets(
+        &mut self,
+        new_nets: Vec<String>,
+        relay_addrs: &[IpAddr],
+        tun_name: &str,
+    ) -> Result<(), MacosTunError> {
+        self.bypass_nets = new_nets;
+        self.activate(relay_addrs, tun_name, &[53])?;
+        info!("pf anchor reloaded with updated bypass nets ({} CIDRs)", self.bypass_nets.len());
+        Ok(())
+    }
+
     /// Load the leak-floor WITHOUT the tun-interface exemption — the floor-first
     /// PRE-floor brought up BEFORE the utun device exists (Windows-WFP parity).
     /// Wire egress is already blocked here; bypass plane + relays + LAN/control +

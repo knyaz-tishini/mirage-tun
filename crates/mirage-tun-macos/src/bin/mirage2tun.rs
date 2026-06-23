@@ -227,12 +227,26 @@ fn main() {
         }
 
         match MacosTunStack::start_with_metrics(cfg, cancel.clone()).await {
-            Ok((_handle, chain_metrics, chain_registry, conn_registry)) => {
+            Ok((_handle, chain_metrics, chain_registry, conn_registry, policy, firewall, routing, relay_addrs, tun_name, bypass_v4_filter, bypass_v6_filter)) => {
                 let api_bind: SocketAddr = api_bind_str.parse().unwrap_or_else(|e| {
                     tracing::error!(val = %api_bind_str, err = %e, "invalid api_bind — using default");
                     "127.0.0.1:19485".parse().expect("hardcoded fallback is valid")
                 });
-                tokio::spawn(api::serve(api_bind, chain_metrics, chain_registry, conn_registry, cancel.child_token(), api_key));
+                tokio::spawn(api::serve(
+                    api_bind,
+                    chain_metrics,
+                    chain_registry,
+                    conn_registry,
+                    policy,
+                    firewall,
+                    routing,
+                    relay_addrs,
+                    tun_name,
+                    bypass_v4_filter,
+                    bypass_v6_filter,
+                    cancel.child_token(),
+                    api_key,
+                ));
 
                 cancel.cancelled().await;
                 tracing::info!("cancelled — exiting");

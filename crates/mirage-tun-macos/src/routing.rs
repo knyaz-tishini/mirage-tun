@@ -60,6 +60,56 @@ impl MacosRouting {
         self.bypassed_nets = nets;
     }
 
+    /// Live update of bypass-plane CIDRs while the TUN is active.
+    ///
+    /// Diffs `self.bypassed_nets` against `new_nets`:
+    /// - CIDRs no longer present → `route delete` via original gateway.
+    /// - New CIDRs → `route add` via original gateway.
+    ///
+    /// If no original gateway has been saved yet (routes not yet installed),
+    /// this is a no-op — the updated `bypassed_nets` is stored and will be
+    /// used the next time `set_default_route` is called.
+    pub async fn update_bypass_nets(&mut self, new_nets: Vec<String>) -> Result<(), MacosTunError> {
+        let old_nets: std::collections::HashSet<&str> =
+            self.bypassed_nets.iter().map(|s| s.as_str()).collect();
+        let new_nets_set: std::collections::HashSet<&str> =
+            new_nets.iter().map(|s| s.as_str()).collect();
+
+        // Only diff-apply when routes are already installed.
+        if self.original_gateway.is_some() || self.original_v6_gateway.is_some() {
+            // Remove stale CIDRs.
+            for cidr in &self.bypassed_nets {
+                if !new_nets_set.contains(cidr.as_str()) {
+                    let v6 = cidr_is_v6(cidr);
+                    if let Err(e) = del_net_route(cidr, v6).await {
+                        warn!("update_bypass_nets: del {} failed (non-fatal): {}", cidr, e);
+                    } else {
+                        info!("update_bypass_nets: removed bypass route {}", cidr);
+                    }
+                }
+            }
+            // Add new CIDRs.
+            for cidr in &new_nets {
+                if !old_nets.contains(cidr.as_str()) {
+                    let v6 = cidr_is_v6(cidr);
+                    let gw_opt = if v6 { self.original_v6_gateway } else { self.original_gateway };
+                    if let Some(gw) = gw_opt {
+                        if let Err(e) = add_net_route(cidr, gw, v6).await {
+                            warn!("update_bypass_nets: add {} failed (non-fatal): {}", cidr, e);
+                        } else {
+                            info!("update_bypass_nets: added bypass route {} via {}", cidr, gw);
+                        }
+                    } else {
+                        warn!("update_bypass_nets: no gateway for {} — skipping route add", cidr);
+                    }
+                }
+            }
+        }
+
+        self.bypassed_nets = new_nets;
+        Ok(())
+    }
+
     /// Set the TUN IPv6 address (the address assigned to the utun interface, not a peer).
     /// Used as the nexthop for the v6 /1 default routes.
     pub fn set_tun_peer_v6(&mut self, peer: IpAddr) {

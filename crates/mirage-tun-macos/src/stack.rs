@@ -26,6 +26,7 @@ use mirage_tcpip_stack::{udp::UdpMsg, StackBuilder};
 use mirage_tun_core::{
     chains::{ChainConfig, ChainRegistry},
     metrics::StackMetrics,
+    policy::PolicyEngine,
     stack_config::StackConfig,
     traits::{
         private::Sealed, PlatformDns, PlatformFirewall, PlatformRouting, StackHandle,
@@ -50,7 +51,7 @@ impl MacosTunStack {
     pub async fn start_with_metrics(
         cfg: StackConfig,
         cancel: CancellationToken,
-    ) -> Result<(StackHandle<SmoltcpTcpAcceptor, SmoltcpUdpSocket>, Arc<MetricsRegistry>, Arc<ChainRegistry>, SharedConnRegistry), MacosTunError> {
+    ) -> Result<(StackHandle<SmoltcpTcpAcceptor, SmoltcpUdpSocket>, Arc<MetricsRegistry>, Arc<ChainRegistry>, SharedConnRegistry, Arc<PolicyEngine>, Arc<Mutex<MacosFirewall>>, Arc<Mutex<MacosRouting>>, Vec<std::net::IpAddr>, String, Arc<std::sync::RwLock<Vec<(u32, u32)>>>, Arc<std::sync::RwLock<Vec<(u128, u128)>>>), MacosTunError> {
         // Phase 2b: multiple chains are now routed per-flow by policy (TCP path).
         // The first chain remains the default (used when no policy rule matches,
         // and for the DNS/UDP paths until those gain per-flow routing too).
@@ -124,7 +125,7 @@ impl MacosTunStack {
             .iter()
             .map(|c| (c.name.clone(), c.socks5_addr))
             .collect();
-        let policy_arc = Arc::new(compiled_policy);
+        let policy_arc = Arc::new(PolicyEngine::new(compiled_policy));
         let chain_socks_arc = Arc::new(chain_socks_map);
         if cfg.chains.len() > 1 {
             info!(wires = cfg.chains.len(), "Phase 2b: multi-wire routing (policy → chain)");
@@ -189,6 +190,10 @@ impl MacosTunStack {
         //    bypass plane + relays + LAN/control + lo are `pass quick` exempt.
         firewall.activate(&cfg.relay_addrs, &tun_name, &[53])?;
 
+        // Wrap firewall in Arc<Mutex> so the API server can call reload_bypass_nets
+        // at runtime (policy/set) without restarting the TUN.
+        let firewall_arc: Arc<Mutex<MacosFirewall>> = Arc::new(Mutex::new(firewall));
+
         // 4. Add bypass routes for relay addresses
         let routing = Arc::new(Mutex::new(MacosRouting::new()));
         {
@@ -235,8 +240,17 @@ impl MacosTunStack {
         // via the original gw). Belt-and-suspenders parity with relay handling:
         // even if a bypass packet reaches the tun before its route lands, smoltcp
         // must not grab it.
-        let bypass_v4_filter = Arc::new(bypass_v4.clone());
-        let bypass_v6_filter = Arc::new(bypass_v6.clone());
+        //
+        // Wrapped in Arc<std::sync::RwLock<>> so the filter is hot-reloadable
+        // when `/policy/set` changes bypass CIDRs at runtime. The read lock in
+        // the filter fn is sync and contention-free on the hot path (writes only
+        // happen on policy/set, which is rare).
+        let bypass_v4_filter: Arc<std::sync::RwLock<Vec<(u32, u32)>>> =
+            Arc::new(std::sync::RwLock::new(bypass_v4.clone()));
+        let bypass_v6_filter: Arc<std::sync::RwLock<Vec<(u128, u128)>>> =
+            Arc::new(std::sync::RwLock::new(bypass_v6.clone()));
+        let bypass_v4_filter2 = Arc::clone(&bypass_v4_filter);
+        let bypass_v6_filter2 = Arc::clone(&bypass_v6_filter);
 
         let (stack, runner, udp_socket_opt, tcp_listener_opt) = StackBuilder::default()
             .enable_tcp(true)
@@ -250,11 +264,17 @@ impl MacosTunStack {
                 let bypassed = match dst {
                     IpAddr::V4(v4) => {
                         let u = u32::from(*v4);
-                        bypass_v4_filter.iter().any(|(net, mask)| u & mask == net & mask)
+                        bypass_v4_filter2
+                            .read()
+                            .map(|g| g.iter().any(|(net, mask)| u & mask == net & mask))
+                            .unwrap_or(false)
                     }
                     IpAddr::V6(v6) => {
                         let u = u128::from(*v6);
-                        bypass_v6_filter.iter().any(|(net, mask)| u & mask == net & mask)
+                        bypass_v6_filter2
+                            .read()
+                            .map(|g| g.iter().any(|(net, mask)| u & mask == net & mask))
+                            .unwrap_or(false)
                     }
                 };
                 !bypassed
@@ -295,6 +315,7 @@ impl MacosTunStack {
         // 8. Read loop: utun fd → smoltcp stack
         let read_cancel = cancel.clone();
         let routing_teardown = Arc::clone(&routing);
+        let firewall_teardown = Arc::clone(&firewall_arc);
         tokio::spawn(async move {
             let mut buf = Vec::with_capacity(1504);
             loop {
@@ -332,8 +353,11 @@ impl MacosTunStack {
             if let Err(e) = dns.revert_dns().await {
                 error!("revert DNS failed: {}", e);
             }
-            if let Err(e) = firewall.deactivate() {
-                error!("firewall deactivate failed: {}", e);
+            {
+                let mut fw = firewall_teardown.lock().await;
+                if let Err(e) = fw.deactivate() {
+                    error!("firewall deactivate failed: {}", e);
+                }
             }
         });
 
@@ -360,7 +384,7 @@ impl MacosTunStack {
         let tcp_cancel = cancel.clone();
         let tcp_metrics = Arc::clone(&chain_metrics_registry);
         let tcp_default_chain = chain_name.clone();
-        let tcp_policy = Arc::clone(&policy_arc);
+        let tcp_policy: Arc<PolicyEngine> = Arc::clone(&policy_arc);
         let tcp_chain_socks = Arc::clone(&chain_socks_arc);
         let tcp_wire_health = Arc::clone(&wire_health);
         let tcp_wire_groups = Arc::clone(&wire_groups_arc);
@@ -417,7 +441,7 @@ impl MacosTunStack {
         let udp_metrics = Arc::clone(&chain_metrics_registry);
         let udp_chain_name = chain_name.clone();
         // Phase 2c captures
-        let dns_policy = Arc::clone(&policy_arc);
+        let dns_policy: Arc<PolicyEngine> = Arc::clone(&policy_arc);
         let dns_chain_socks = Arc::clone(&chain_socks_arc);
         // Wrap chain_dns_map in an Arc so it can be moved into the spawn closure.
         let dns_chain_dns: Arc<HashMap<String, SocketAddr>> = Arc::new(chain_dns_map);
@@ -445,7 +469,7 @@ impl MacosTunStack {
                                     .map(|(q, _)| q.qname);
 
                                 let (wire_name, dns_socks, dns_upstream) = match domain.as_deref() {
-                                    Some(d) => match dns_policy.domain_decision(d) {
+                                    Some(d) => match dns_policy.domain_decision(d).await {
                                         PolicyDecision::Chain(name) => {
                                             let socks = dns_chain_socks.get(&name).copied()
                                                 .unwrap_or(socks5_addr);
@@ -541,6 +565,8 @@ impl MacosTunStack {
             }),
         );
 
+        let relay_addrs_ret = cfg.relay_addrs.clone();
+        let tun_name_ret = tun_name.clone();
         spawn_route_monitor(tun_name, Arc::clone(&routing), cancel.clone());
 
         // UDP socket consumed by forward loop above; expose noop for StackHandle.
@@ -549,7 +575,19 @@ impl MacosTunStack {
         // TCP forwarding is self-contained in tcp_accept_loop; expose noop for StackHandle.
         let tcp = SmoltcpTcpAcceptor::noop();
 
-        Ok((StackHandle { tcp, udp, metrics: flat_metrics }, chain_metrics_registry, chain_registry, conn_registry))
+        Ok((
+            StackHandle { tcp, udp, metrics: flat_metrics },
+            chain_metrics_registry,
+            chain_registry,
+            conn_registry,
+            policy_arc,
+            firewall_arc,
+            routing,
+            relay_addrs_ret,
+            tun_name_ret,
+            bypass_v4_filter,
+            bypass_v6_filter,
+        ))
     }
 }
 
@@ -564,7 +602,7 @@ impl TunStack for MacosTunStack {
         cfg: StackConfig,
         cancel: CancellationToken,
     ) -> Result<StackHandle<Self::Tcp, Self::Udp>, Self::Error> {
-        let (handle, _chain_metrics, _chain_registry, _conn_registry) =
+        let (handle, _chain_metrics, _chain_registry, _conn_registry, _policy, _firewall, _routing, _relays, _tun, _bv4, _bv6) =
             Self::start_with_metrics(cfg, cancel).await?;
         Ok(handle)
     }
@@ -574,7 +612,7 @@ impl TunStack for MacosTunStack {
 
 async fn tcp_accept_loop(
     mut listener: mirage_tcpip_stack::TcpListener,
-    policy: Arc<mirage_tun_core::policy::CompiledPolicy>,
+    policy: Arc<PolicyEngine>,
     chain_socks: Arc<HashMap<String, SocketAddr>>,
     default_socks: SocketAddr,
     default_chain: String,
@@ -595,7 +633,9 @@ async fn tcp_accept_loop(
                 Some((stream, _local, remote)) => {
                     // Wave 3: full routing decision — includes failure policy.
                     // Bypass dsts never arrive here (ip_filter excludes them).
-                    let decision = policy.decide_full(remote.ip(), remote.port(), None, None);
+                    // Snapshot the current compiled policy (cheap Arc clone) so
+                    // decide_full stays sync while the engine stays hot-reloadable.
+                    let decision = policy.get_config().await.decide_full(remote.ip(), remote.port(), None, None);
 
                     // Resolve the (wire_name, socks5_addr) to use, or None → fail-closed.
                     let chosen: Option<(String, SocketAddr)> = match decision.action {
