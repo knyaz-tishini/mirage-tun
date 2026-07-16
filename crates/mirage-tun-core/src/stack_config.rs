@@ -1,5 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
-use crate::policy::PolicyConfigRequest;
+use crate::policy::{PolicyConfigRequest, WireNature};
 
 /// Config passed to `TunStack::start()` — platform-agnostic.
 #[derive(Debug, Clone)]
@@ -41,6 +41,11 @@ pub struct ChainEntry {
     /// Chains in the same group are interchangeable for `FailurePolicy::Failover`.
     /// `None` = chain is not part of any group.
     pub group: Option<String>,
+    /// Mirrors `mirage_core::config::ChainConfig::effective_nature()`.
+    /// Always concrete here (never `Option`) — the JSON-boundary layer
+    /// (`mirage2tun.rs::BinChainEntry`) is where the "None = infer"
+    /// resolution happens, one hop upstream of this struct.
+    pub nature: WireNature,
 }
 
 #[derive(Debug, Clone)]

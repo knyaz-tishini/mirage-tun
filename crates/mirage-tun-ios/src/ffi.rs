@@ -325,7 +325,7 @@ fn parse_ffi_config(json: &[u8]) -> Result<StackConfig, IosTunError> {
             c.socks5_addr
                 .parse()
                 .ok()
-                .map(|addr| ChainEntry { name: c.name, socks5_addr: addr, group: None })
+                .map(|addr| ChainEntry { name: c.name, socks5_addr: addr, group: None, nature: Default::default() })
         })
         .collect();
 
@@ -368,7 +368,7 @@ fn parse_chains_json(json: &[u8]) -> Result<Vec<ChainEntry>, serde_json::Error> 
             c.socks5_addr
                 .parse()
                 .ok()
-                .map(|addr| ChainEntry { name: c.name, socks5_addr: addr, group: None })
+                .map(|addr| ChainEntry { name: c.name, socks5_addr: addr, group: None, nature: Default::default() })
         })
         .collect())
 }

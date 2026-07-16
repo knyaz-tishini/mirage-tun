@@ -79,6 +79,17 @@ struct BinChainEntry {
     /// Optional failover group — forwarded to `ChainEntry::group`.
     #[serde(default)]
     group: Option<String>,
+    /// `None` in the JSON = "not declared" (mirrors mirage-core's
+    /// `Option<WireNature>` semantics exactly) — but there is no chain-shape
+    /// data available at this layer to infer from (BinChainEntry only knows
+    /// name+addr), so a missing `nature` here defaults to `WireNature::Direct`
+    /// via `#[serde(default)]` on the mirrored enum, NOT a re-run of
+    /// `infer()`. The inference step already happened upstream, in
+    /// `l0-sentinel::write_tun_config` (Phase 2b gap-e fix) or the sentinel's
+    /// materialization of `mirage_core::config::ChainConfig`; this layer only
+    /// carries the already-resolved value forward.
+    #[serde(default)]
+    nature: mirage_tun_core::policy::WireNature,
 }
 
 #[derive(Deserialize, Default)]
@@ -135,7 +146,7 @@ impl From<BinConfig> for StackConfig {
             tun_addr: b.tun_addr,
             tun_addr_v6: b.tun_addr_v6,
             mtu: b.mtu,
-            chains: b.chains.into_iter().map(|c| ChainEntry { name: c.name, socks5_addr: c.socks5_addr, group: c.group }).collect(),
+            chains: b.chains.into_iter().map(|c| ChainEntry { name: c.name, socks5_addr: c.socks5_addr, group: c.group, nature: c.nature }).collect(),
             policy: build_policy(b.policy, &b.bypass),
             chain_dns: b.chain_dns.into_iter().map(|d| ChainDnsConfig { chain_name: d.chain_name, servers: d.servers }).collect(),
             relay_addrs: b.relay_addrs,

@@ -73,6 +73,21 @@ pub enum FailurePolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WireClass(pub String);
 
+/// Mirrors `mirage_core::config::WireNature` (mirage2web/mirage2app repo).
+/// mirage-tun-core cannot path-dep mirage-core — separate git
+/// submodule/workspace (see mirage2app/CLAUDE.md, same constraint documented
+/// for mirage-runtime-guard). Re-derived at the JSON boundary in
+/// mirage2tun.rs::BinChainEntry from the identical serde tag strings, so the
+/// wire format is byte-compatible even though the Rust types are distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNature {
+    #[default]
+    Direct,
+    Mixnet,
+    Shadow,
+}
+
 /// Full routing decision returned by `CompiledPolicy::decide_full`.
 /// Contains everything the accept loop needs: the action, the failure policy,
 /// and the wire class.

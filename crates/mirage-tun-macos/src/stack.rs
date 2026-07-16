@@ -26,7 +26,7 @@ use mirage_tcpip_stack::{udp::UdpMsg, StackBuilder};
 use mirage_tun_core::{
     chains::{ChainConfig, ChainRegistry},
     metrics::StackMetrics,
-    policy::PolicyEngine,
+    policy::{PolicyEngine, WireNature},
     stack_config::StackConfig,
     traits::{
         private::Sealed, PlatformDns, PlatformFirewall, PlatformRouting, StackHandle,
@@ -152,6 +152,13 @@ impl MacosTunStack {
             m
         };
         let wire_groups_arc = Arc::new(wire_group_map);
+
+        // WireNatureMap: chain_name → WireNature. Built once at startup, same
+        // shape as wire_group_map. Consulted by the Failover arm to reject
+        // cross-nature substitution — same-nature failover invariant.
+        let wire_natures: HashMap<String, WireNature> =
+            cfg.chains.iter().map(|c| (c.name.clone(), c.nature)).collect();
+        let wire_natures_arc = Arc::new(wire_natures);
 
         // 0. Floor-FIRST (Windows-WFP parity). Load the leak-floor BEFORE opening
         //    the utun device, so a failure during utun open / ifconfig (e.g.
@@ -388,6 +395,7 @@ impl MacosTunStack {
         let tcp_chain_socks = Arc::clone(&chain_socks_arc);
         let tcp_wire_health = Arc::clone(&wire_health);
         let tcp_wire_groups = Arc::clone(&wire_groups_arc);
+        let tcp_wire_natures = Arc::clone(&wire_natures_arc);
         let tcp_conn_registry = Arc::clone(&conn_registry);
         let tcp_dns_log = Arc::clone(&dns_query_log);
         tokio::spawn(async move {
@@ -401,6 +409,7 @@ impl MacosTunStack {
                 tcp_metrics,
                 tcp_wire_health,
                 tcp_wire_groups,
+                tcp_wire_natures,
                 tcp_conn_registry,
                 tcp_dns_log,
             )
@@ -620,6 +629,7 @@ async fn tcp_accept_loop(
     metrics: Arc<MetricsRegistry>,
     wire_health: Arc<WireHealthMap>,
     wire_groups: Arc<HashMap<String, Vec<(String, SocketAddr)>>>,
+    wire_natures: Arc<HashMap<String, WireNature>>,
     conn_registry: SharedConnRegistry,
     dns_query_log: Arc<DnsQueryLog>,
 ) {
@@ -664,11 +674,22 @@ async fn tcp_accept_loop(
                                     }
                                 }
                                 FailurePolicy::Failover { ref group } => {
+                                    // Same-nature failover invariant: a group candidate
+                                    // is eligible only if its WireNature matches the
+                                    // preferred wire's. Never substitute a healthy
+                                    // cross-nature wire — that would silently swap the
+                                    // wire's structural fingerprint mid-session.
+                                    let pref_nature = wire_natures.get(&pref_name).copied().unwrap_or_default();
                                     // Try group members in order. Unknown/empty group →
                                     // degrade to fail-closed on the preferred wire.
                                     match wire_groups.get(group) {
                                         Some(cands) if !cands.is_empty() => {
-                                            match wire_health.first_healthy(cands) {
+                                            let same_nature: Vec<(String, SocketAddr)> = cands
+                                                .iter()
+                                                .filter(|(name, _)| wire_natures.get(name).copied().unwrap_or_default() == pref_nature)
+                                                .cloned()
+                                                .collect();
+                                            match wire_health.first_healthy(&same_nature) {
                                                 Some(pair) => {
                                                     if pair.0 != pref_name {
                                                         info!(
@@ -681,7 +702,7 @@ async fn tcp_accept_loop(
                                                     }
                                                     Some(pair.clone())
                                                 }
-                                                // All group members unhealthy → fail closed.
+                                                // All same-nature group members unhealthy → fail closed.
                                                 None => None,
                                             }
                                         }

@@ -105,14 +105,26 @@ impl PlaneEngine {
     ///
     /// Called by the accept loop after `resolve()` returns `Plane::Group(g)`.
     /// `candidates` = ordered list of (wire_id, endpoint) for group `g`.
-    /// Returns `Plane::Wire(first_healthy)` or `Plane::Kill` (all down = fail-closed).
+    /// `failed_nature` = the `WireNature` of the wire that just went down;
+    /// `natures` = wire_id → `WireNature` lookup. Candidates whose nature
+    /// disagrees with `failed_nature` are filtered out before health lookup —
+    /// same-nature failover invariant (never cross-nature substitution).
+    /// Returns `Plane::Wire(first_healthy_same_nature)` or `Plane::Kill` (all
+    /// down, or no same-nature candidate healthy = fail-closed).
     /// Invariant 3: NEVER returns Bypass as a fallback.
     pub fn resolve_group(
         &self,
         _group: &str,
+        failed_nature: crate::policy::WireNature,
+        natures: &std::collections::HashMap<String, crate::policy::WireNature>,
         candidates: &[(String, SocketAddr)],
     ) -> Plane {
-        match self.health.first_healthy(candidates) {
+        let filtered: Vec<(String, SocketAddr)> = candidates
+            .iter()
+            .filter(|(name, _)| natures.get(name).copied().unwrap_or_default() == failed_nature)
+            .cloned()
+            .collect();
+        match self.health.first_healthy(&filtered) {
             Some((wire_id, _addr)) => Plane::Wire(wire_id.clone()),
             None => Plane::Kill, // all wires in group down — fail-closed
         }
@@ -132,8 +144,9 @@ impl PlaneEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::net::SocketAddr;
-    use crate::policy::{CompiledPolicy, PolicyDecision, PolicyRule, FailurePolicy, WireClass};
+    use crate::policy::{CompiledPolicy, PolicyDecision, PolicyRule, FailurePolicy, WireClass, WireNature};
 
     fn sa(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
@@ -229,7 +242,8 @@ mod tests {
             ("wire1".to_owned(), sa(1080)),
             ("wire2".to_owned(), sa(1081)),
         ];
-        let plane = engine.resolve_group("g", &candidates);
+        let natures: HashMap<String, WireNature> = HashMap::new();
+        let plane = engine.resolve_group("g", WireNature::default(), &natures, &candidates);
         assert_eq!(plane, Plane::Kill);
     }
 
@@ -246,8 +260,42 @@ mod tests {
             ("wire1".to_owned(), sa(1080)),
             ("wire2".to_owned(), sa(1081)),
         ];
-        let plane = engine.resolve_group("g", &candidates);
+        let natures: HashMap<String, WireNature> = HashMap::new();
+        let plane = engine.resolve_group("g", WireNature::default(), &natures, &candidates);
         assert_eq!(plane, Plane::Wire("wire2".to_owned()));
+    }
+
+    /// Same-nature failover invariant: a healthy-but-wrong-nature candidate
+    /// (listed first, so it would win a naive first_healthy scan) must be
+    /// skipped; the right-nature candidate (even if listed second) is picked.
+    /// If NO same-nature candidate is healthy, the wrong-nature one must
+    /// never be substituted — result is `Plane::Kill`, never a cross-nature
+    /// wire.
+    #[test]
+    fn resolve_group_rejects_cross_nature_candidate() {
+        let policy = CompiledPolicy::compile(vec![], PolicyDecision::default_chain());
+        let (engine, health) = engine_with_policy_and_health(policy);
+        // wire1 (Shadow) is healthy but wrong-nature; wire2 (Direct) is
+        // healthy and right-nature.
+        health.record_success("wire1");
+        health.record_success("wire2");
+        let candidates = vec![
+            ("wire1".to_owned(), sa(1080)),
+            ("wire2".to_owned(), sa(1081)),
+        ];
+        let mut natures: HashMap<String, WireNature> = HashMap::new();
+        natures.insert("wire1".to_owned(), WireNature::Shadow);
+        natures.insert("wire2".to_owned(), WireNature::Direct);
+
+        let plane = engine.resolve_group("g", WireNature::Direct, &natures, &candidates);
+        assert_eq!(plane, Plane::Wire("wire2".to_owned()));
+
+        // Now make the only same-nature candidate unhealthy — must fail
+        // closed rather than substitute the healthy wrong-nature wire1.
+        health.record_failure("wire2");
+        health.record_failure("wire2");
+        let plane = engine.resolve_group("g", WireNature::Direct, &natures, &candidates);
+        assert_eq!(plane, Plane::Kill);
     }
 
     /// `identity=None` with default_action=Chain("default") → `Plane::Wire("default")`.

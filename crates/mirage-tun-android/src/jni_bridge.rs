@@ -124,7 +124,7 @@ mod android {
                 .iter()
                 .filter_map(|c| {
                     match c.socks5_addr.parse::<SocketAddr>() {
-                        Ok(addr) => Some(ChainEntry { name: c.name.clone(), socks5_addr: addr, group: None }),
+                        Ok(addr) => Some(ChainEntry { name: c.name.clone(), socks5_addr: addr, group: None, nature: Default::default() }),
                         Err(e) => {
                             warn!("start: invalid socks5_addr '{}' for chain '{}': {e}", c.socks5_addr, c.name);
                             None
