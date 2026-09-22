@@ -26,25 +26,32 @@ use crate::dns::LinuxDns;
 /// ```ignore
 /// let handle = LinuxTunStack::start(cfg, cancel).await?;
 /// ```
+///
+/// `start()` (the `TunStack` trait method) spawns the teardown task and
+/// discards its `JoinHandle` — fine for trait conformance, but it means a
+/// caller has no way to know teardown (firewall deactivate, route restore,
+/// DNS revert) actually finished before the process exits. A binary that
+/// must guarantee clean shutdown on signal should call
+/// [`LinuxTunStack::start_with_cleanup`] instead and await the returned
+/// handle after cancelling.
 pub struct LinuxTunStack;
 
 impl private::Sealed for LinuxTunStack {}
 
-#[async_trait]
-impl TunStack for LinuxTunStack {
-    type Device = LinuxTunDevice;
-    type Tcp = LinuxKernelTcpAcceptor;
-    type Udp = LinuxKernelUdpSocket;
-    type Error = LinuxTunError;
-
-    async fn start(
+impl LinuxTunStack {
+    /// Same as the `TunStack::start` trait method, but also returns the
+    /// `JoinHandle` of the spawned teardown task so the caller can await it
+    /// after triggering `cancel` — the only way to guarantee firewall/routing/DNS
+    /// cleanup has actually completed before the process exits.
+    pub async fn start_with_cleanup(
         cfg: StackConfig,
         cancel: CancellationToken,
-    ) -> Result<StackHandle<Self::Tcp, Self::Udp>, Self::Error> {
-        info!("LinuxTunStack::start — tun_addr={} mtu={}", cfg.tun_addr, cfg.mtu);
+    ) -> Result<(StackHandle<LinuxKernelTcpAcceptor, LinuxKernelUdpSocket>, tokio::task::JoinHandle<()>), LinuxTunError> {
+        info!("LinuxTunStack::start — tun_name={} tun_addr={} mtu={}", cfg.tun_name, cfg.tun_addr, cfg.mtu);
 
         // ── 1. Open TUN device ────────────────────────────────────────────────
-        let mut device = LinuxTunDevice::open("tun0")?;
+        let device_name = if cfg.tun_name.is_empty() { "tun0" } else { cfg.tun_name.as_str() };
+        let mut device = LinuxTunDevice::open(device_name)?;
         let tun_name = device.name().to_owned();
 
         // ── 2. Configure address + MTU ────────────────────────────────────────
@@ -87,7 +94,10 @@ impl TunStack for LinuxTunStack {
         let (udp, _write_sender) = LinuxKernelUdpSocket::from_fd(0)?;
 
         // ── 8. Spawn cleanup task ─────────────────────────────────────────────
-        tokio::spawn(async move {
+        // Handle returned to the caller so a binary can await it after
+        // cancelling and be sure teardown actually finished (see doc comment
+        // on `LinuxTunStack` above).
+        let cleanup = tokio::spawn(async move {
             cancel.cancelled().await;
             info!("LinuxTunStack cancellation received — cleaning up");
 
@@ -107,6 +117,22 @@ impl TunStack for LinuxTunStack {
 
         let metrics = Arc::new(StackMetrics::default());
 
-        Ok(StackHandle { tcp, udp, metrics })
+        Ok((StackHandle { tcp, udp, metrics }, cleanup))
+    }
+}
+
+#[async_trait]
+impl TunStack for LinuxTunStack {
+    type Device = LinuxTunDevice;
+    type Tcp = LinuxKernelTcpAcceptor;
+    type Udp = LinuxKernelUdpSocket;
+    type Error = LinuxTunError;
+
+    async fn start(
+        cfg: StackConfig,
+        cancel: CancellationToken,
+    ) -> Result<StackHandle<Self::Tcp, Self::Udp>, Self::Error> {
+        let (handle, _cleanup) = Self::start_with_cleanup(cfg, cancel).await?;
+        Ok(handle)
     }
 }

@@ -2,12 +2,17 @@
 /// process, move the PID into it, and remove it on teardown.
 ///
 /// We create the cgroup directly under the unified hierarchy
-/// (`/sys/fs/cgroup/mirage.slice/mirage-proc-<pid>.scope/`) rather than asking
+/// (`<cgroup2-root>/mirage.slice/mirage-proc-<pid>.scope/`) rather than asking
 /// systemd. Moving an *existing* PID via `systemd-run --scope` needs systemd
 /// >= 250's `--pid=` flag plus a placeholder unit; a direct mkdir is portable
 /// across systemd / non-systemd / container hosts and is sufficient for BPF
 /// cgroup-attach, which needs no controller delegation (BPF programs attach to
 /// the cgroup fd directly, independent of `cgroup.subtree_control`).
+///
+/// The cgroup2 mount root is auto-detected from `/proc/self/mountinfo` so this
+/// works whether the unified hierarchy is at `/sys/fs/cgroup` (pure v2), at
+/// `/sys/fs/cgroup/unified` (hybrid), or at a freshly-mounted path in a test
+/// container (host still on v1).
 ///
 /// All functions are synchronous (blocking). Call from `tokio::task::spawn_blocking`.
 use std::fs;
@@ -17,8 +22,23 @@ use tracing::debug;
 
 use crate::error::LinuxTunError;
 
-/// Parent slice holding all per-process Mirage scopes.
-const MIRAGE_SLICE: &str = "/sys/fs/cgroup/mirage.slice";
+/// Locate the cgroup-v2 (unified) mount point. Returns the first `cgroup2` mount
+/// in `/proc/self/mountinfo`, falling back to `/sys/fs/cgroup`.
+fn cgroup2_root() -> String {
+    if let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") {
+        for line in mountinfo.lines() {
+            // mountinfo line: "<id> <pid> <maj:min> <root> <mountpoint> ... - <fstype> <src> <opts>"
+            if let Some((pre, post)) = line.split_once(" - ") {
+                if post.split_whitespace().next() == Some("cgroup2") {
+                    if let Some(mp) = pre.split_whitespace().nth(4) {
+                        return mp.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "/sys/fs/cgroup".to_string()
+}
 
 /// Returns `true` if PID 1 is `systemd` (informational only — we use the direct
 /// path regardless). Reads `/proc/1/comm`; non-panicking, `false` on I/O error.
@@ -36,15 +56,17 @@ pub(crate) fn move_pid_to_cgroup(pid: u32) -> Result<String, LinuxTunError> {
         debug!(pid, "systemd host: creating Mirage cgroup directly (no systemd-run)");
     }
 
+    let slice = format!("{}/mirage.slice", cgroup2_root());
+
     // Ensure the parent slice exists.
-    if let Err(e) = fs::create_dir(MIRAGE_SLICE) {
+    if let Err(e) = fs::create_dir(&slice) {
         if e.kind() != io::ErrorKind::AlreadyExists {
-            return Err(LinuxTunError::Cgroup(format!("create {MIRAGE_SLICE}: {e}")));
+            return Err(LinuxTunError::Cgroup(format!("create {slice}: {e}")));
         }
     }
 
     // Create the per-PID leaf scope.
-    let scope_dir = format!("{MIRAGE_SLICE}/mirage-proc-{pid}.scope");
+    let scope_dir = format!("{slice}/mirage-proc-{pid}.scope");
     if let Err(e) = fs::create_dir(&scope_dir) {
         if e.kind() != io::ErrorKind::AlreadyExists {
             return Err(LinuxTunError::Cgroup(format!("create {scope_dir}: {e}")));
@@ -60,12 +82,13 @@ pub(crate) fn move_pid_to_cgroup(pid: u32) -> Result<String, LinuxTunError> {
 }
 
 /// Remove a cgroup directory. Any lingering PIDs are first moved back to the
-/// root cgroup (best-effort) so the now-empty directory can be removed.
+/// cgroup2 root (best-effort) so the now-empty directory can be removed.
 pub(crate) fn remove_cgroup(cgroup_path: &str) -> Result<(), LinuxTunError> {
+    let root_procs = format!("{}/cgroup.procs", cgroup2_root());
     let procs_path = format!("{cgroup_path}/cgroup.procs");
     if let Ok(content) = fs::read_to_string(&procs_path) {
         for pid_str in content.split_whitespace() {
-            let _ = fs::write("/sys/fs/cgroup/cgroup.procs", pid_str);
+            let _ = fs::write(&root_procs, pid_str);
         }
     }
 
@@ -83,5 +106,11 @@ mod tests {
     #[test]
     fn is_systemd_host_no_panic() {
         let _ = is_systemd_host();
+    }
+
+    /// `cgroup2_root()` returns a non-empty path without panicking.
+    #[test]
+    fn cgroup2_root_no_panic() {
+        assert!(!cgroup2_root().is_empty());
     }
 }

@@ -83,6 +83,38 @@ impl LinuxFirewall {
             tun_ifindex: 0,
         }
     }
+
+    /// Load the per-process eBPF egress program into this firewall (without the
+    /// coarse nft/iptables rules). `activate()` calls this internally; it is also
+    /// public so an integration driver / test can arm the per-process layer
+    /// standalone (e.g. in a container that has no nft). Requires CAP_BPF.
+    pub fn arm_ebpf(&mut self, tun_ifindex: u32) -> Result<(), LinuxTunError> {
+        self.tun_ifindex = tun_ifindex;
+        self.bpf = Some(load_bpf(tun_ifindex)?);
+        Ok(())
+    }
+
+    /// Integration hook for a TUN accept loop: attribute the flow to its process,
+    /// resolve the per-process `Plane` via the engine, and enforce it. A real
+    /// Linux data-plane driver calls this once per newly-seen connection.
+    ///
+    /// (`attribute` reads `/proc`; a production loop should wrap that part in
+    /// `spawn_blocking`. Kept inline here so the hook is a single call.)
+    pub async fn enforce_flow(
+        &mut self,
+        engine: &mirage_tun_core::plane_engine::PlaneEngine,
+        src_port: u16,
+        dst: std::net::SocketAddr,
+        proto: FlowProto,
+        domain_hint: Option<&str>,
+    ) -> Result<(), LinuxTunError> {
+        let identity = self.attribute(src_port, dst, proto);
+        let plane = engine
+            .resolve(dst.ip(), dst.port(), domain_hint, identity.as_ref())
+            .await;
+        let flow = FlowKey { src_port, dst, proto };
+        self.enforce(&plane, identity.as_ref(), &flow)
+    }
 }
 
 impl private::Sealed for LinuxFirewall {}
@@ -185,12 +217,9 @@ impl PlatformFirewall for LinuxFirewall {
         self.active = true;
 
         // ── T3: load the per-process eBPF egress program (best-effort) ──
-        self.tun_ifindex = if_nametoindex(tun_name);
-        match load_bpf(self.tun_ifindex) {
-            Ok(bpf) => {
-                self.bpf = Some(bpf);
-                info!(tun_ifindex = self.tun_ifindex, "eBPF per-process enforcement loaded");
-            }
+        let tun_ifindex = if_nametoindex(tun_name);
+        match self.arm_ebpf(tun_ifindex) {
+            Ok(()) => info!(tun_ifindex, "eBPF per-process enforcement loaded"),
             Err(e) => {
                 // Degrade to coarse-only; per-process kill-switch unavailable.
                 warn!("eBPF load failed ({e}); per-process enforcement disabled (coarse nft/iptables only)");
@@ -236,8 +265,8 @@ impl PlatformFirewall for LinuxFirewall {
 
 /// Load the eBPF object, load the egress program, and set the TUN ifindex.
 fn load_bpf(tun_ifindex: u32) -> Result<Ebpf, LinuxTunError> {
-    let mut bpf = Ebpf::load(BPF_OBJ)
-        .map_err(|e| LinuxTunError::Ebpf(format!("load object: {e}")))?;
+    let mut bpf =
+        Ebpf::load(BPF_OBJ).map_err(|e| LinuxTunError::Ebpf(format!("load object: {e}")))?;
     {
         let prog: &mut CgroupSkb = bpf
             .program_mut("mirage_egress")

@@ -1,3 +1,4 @@
+pub mod api;
 pub mod cgroup_mgr;
 pub mod dns;
 pub mod error;

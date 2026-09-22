@@ -1930,7 +1930,9 @@ name = "mirage-tun-linux"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "aya",
+ "clap 4.6.1",
  "libc",
  "mirage-tun-core",
  "serde",
@@ -1940,6 +1942,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
