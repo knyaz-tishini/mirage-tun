@@ -9,5 +9,6 @@ pub mod kernel_udp;
 pub mod routing;
 pub mod stack;
 pub mod tun_device;
+pub mod udp_socks5;
 
 pub use stack::LinuxTunStack;

@@ -24,15 +24,15 @@
 //!     declared but previously unused by any caller) so the policy-routing
 //!     table sends the tunnel's own egress out the real NIC instead of
 //!     looping back into the TUN device.
+//!   - `mirage_tun_linux::udp_socks5::relay_loop` drives `LinuxKernelUdpSocket`
+//!     the same way — the sole reader of its `recv()` half — and relays each
+//!     UDP flow (including UDP-based DNS through the tunnel) either through a
+//!     chain's SOCKS5 UDP ASSOCIATE or direct for `Bypass`, replies written
+//!     back through the `WriteSender` `LinuxTunStack::start_with_cleanup`
+//!     hands back alongside the `StackHandle`. See that module's doc comment
+//!     for the session/expiry design.
 //!
 //! What is NOT wired here (left unreachable rather than faked):
-//!   - UDP-to-SOCKS5 relay. `LinuxKernelUdpSocket` only parses raw IP/UDP
-//!     packets off the TUN fd (see `kernel_udp.rs`) — there is no SOCKS5 UDP
-//!     ASSOCIATE client in this crate (unlike `mirage-tun-windows/udp_socks5.rs`
-//!     or `mirage-tun-macos/udp_forward.rs`, both dedicated ~240-line modules).
-//!     `drain_udp_unimplemented` logs this plainly once and drops every
-//!     datagram — including UDP-based DNS through the tunnel, which will not
-//!     resolve. TCP flows are unaffected.
 //!   - Per-process plane enforcement (`PlatformExecutor::enforce_flow`,
 //!     T3 eBPF-per-cgroup kill-switch in `firewall.rs`). `LinuxFirewall::activate`
 //!     already loads and arms the eBPF program best-effort, but nothing in this
@@ -63,10 +63,9 @@ use mirage_tun_core::policy::{
     CompiledPolicy, PolicyConfigRequest, PolicyDecision, PolicyEngine, PolicyRule,
 };
 use mirage_tun_core::stack_config::{ChainDnsConfig, ChainEntry as StackChainEntry, StackConfig};
-use mirage_tun_core::traits::{TcpAcceptor, UdpSocket as CoreUdpSocket};
+use mirage_tun_core::traits::TcpAcceptor;
 use mirage_tun_linux::kernel_tcp::LinuxKernelTcpAcceptor;
-use mirage_tun_linux::kernel_udp::LinuxKernelUdpSocket;
-use mirage_tun_linux::{api, LinuxTunStack};
+use mirage_tun_linux::{api, udp_socks5, LinuxTunStack};
 
 #[derive(Parser)]
 #[command(name = "mirage2tun", version, about = "Mirage TUN adapter for Linux")]
@@ -441,29 +440,6 @@ fn build_socks5_connect(target: SocketAddr) -> Vec<u8> {
     req
 }
 
-/// Drain the UDP path so the TUN-fd reader task inside `LinuxTunStack` never
-/// stalls trying to hand off a datagram nobody reads — see the module doc
-/// comment for why UDP-to-SOCKS5 forwarding itself is not implemented.
-async fn drain_udp_unimplemented(mut udp: LinuxKernelUdpSocket, cancel: CancellationToken) {
-    tracing::warn!(
-        "UDP forwarding to a SOCKS5 chain is not implemented on Linux — intercepted UDP \
-         datagrams (including UDP-based DNS through the tunnel) are read off the TUN device \
-         and dropped; only TCP flows are forwarded"
-    );
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            datagram = udp.recv() => {
-                if datagram.is_none() {
-                    break;
-                }
-                // Dropped — no SOCKS5 UDP relay on this platform yet.
-            }
-        }
-    }
-}
-
 fn main() {
     std::panic::set_hook(Box::new(|info| {
         let location = info
@@ -582,7 +558,7 @@ async fn run(cli: Cli) {
     }
 
     match LinuxTunStack::start_with_cleanup(cfg, cancel.clone()).await {
-        Ok((handle, cleanup)) => {
+        Ok((handle, write_sender, cleanup)) => {
             let chains = Arc::new(ChainRegistry::new(chain_configs));
             let policy = Arc::new(PolicyEngine::new(compiled_policy));
 
@@ -599,7 +575,15 @@ async fn run(cli: Cli) {
                 api_key,
             ));
 
-            tokio::spawn(drain_udp_unimplemented(handle.udp, cancel.child_token()));
+            tokio::spawn(udp_socks5::relay_loop(
+                handle.udp,
+                write_sender,
+                Arc::clone(&policy),
+                Arc::clone(&chains),
+                default_chain_name.clone(),
+                Arc::clone(&handle.metrics),
+                cancel.child_token(),
+            ));
 
             tcp_forward_loop(handle.tcp, policy, chains, default_chain_name, handle.metrics, cancel.clone()).await;
 

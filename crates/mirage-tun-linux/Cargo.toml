@@ -9,7 +9,7 @@ path = "src/bin/mirage2tun.rs"
 
 [dependencies]
 mirage-tun-core = { path = "../mirage-tun-core" }
-tokio = { version = "1", features = ["net", "io-util", "process", "sync", "rt", "rt-multi-thread", "macros", "fs", "signal"] }
+tokio = { version = "1", features = ["net", "io-util", "process", "sync", "rt", "rt-multi-thread", "macros", "fs", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 tracing = "0.1"

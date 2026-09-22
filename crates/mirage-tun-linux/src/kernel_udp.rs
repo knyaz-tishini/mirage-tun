@@ -15,7 +15,11 @@ const UDP_HEADER_SIZE: usize = 8;
 /// parses out UDP datagrams, and injects reply packets back.
 ///
 /// On Linux the kernel stack handles TCP itself; UDP still travels through
-/// the TUN fd as raw IP packets, so we parse them here.
+/// the TUN fd as raw IP packets, so we parse them here. This is the lower
+/// half only — `crate::udp_socks5` is the upper half that drives `recv()`
+/// in a loop and relays each flow through SOCKS5 UDP ASSOCIATE or direct
+/// (`Bypass`), writing replies back through the `WriteSender` returned
+/// alongside this socket.
 pub struct LinuxKernelUdpSocket {
     /// Sending half: write raw IP/UDP packets back into the TUN fd.
     tun_write_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -80,7 +84,33 @@ impl LinuxKernelUdpSocket {
 }
 
 /// Cloneable handle for injecting packets into the TUN write path.
+///
+/// Handed out alongside `LinuxKernelUdpSocket` so callers that need to write
+/// replies from many concurrent tasks (e.g. `udp_socks5`'s per-flow SOCKS5
+/// sessions) don't have to fight the socket's own `&mut self` — `recv()` and
+/// `send()` both take `&mut self`, so a single owner drives `recv()` in a
+/// loop while every other task writes back through a cloned `WriteSender`.
+#[derive(Clone)]
 pub struct WriteSender(pub tokio::sync::mpsc::Sender<Vec<u8>>);
+
+impl WriteSender {
+    /// Build a reply IPv4/UDP packet from `payload` + `(src, dst)` and inject
+    /// it into the TUN write path — same packet-building path `send()` on
+    /// `LinuxKernelUdpSocket` uses, exposed here so cloned handles can reach
+    /// it without a mutable borrow of the socket itself.
+    pub async fn send_udp(
+        &self,
+        payload: &[u8],
+        src: SocketAddr,
+        dst: SocketAddr,
+    ) -> Result<(), TunError> {
+        let pkt = build_udp_ipv4_packet(payload, src, dst);
+        self.0
+            .send(pkt)
+            .await
+            .map_err(|_| TunError::Other("TUN write channel closed".into()))
+    }
+}
 
 #[async_trait]
 impl UdpSocket for LinuxKernelUdpSocket {

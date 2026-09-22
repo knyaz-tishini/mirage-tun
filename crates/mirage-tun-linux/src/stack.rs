@@ -15,7 +15,7 @@ use mirage_tun_core::traits::{
 use crate::error::LinuxTunError;
 use crate::tun_device::LinuxTunDevice;
 use crate::kernel_tcp::LinuxKernelTcpAcceptor;
-use crate::kernel_udp::LinuxKernelUdpSocket;
+use crate::kernel_udp::{LinuxKernelUdpSocket, WriteSender};
 use crate::firewall::{LinuxFirewall, DEFAULT_INTERCEPT_PORT};
 use crate::routing::LinuxRouting;
 use crate::dns::LinuxDns;
@@ -34,6 +34,13 @@ use crate::dns::LinuxDns;
 /// must guarantee clean shutdown on signal should call
 /// [`LinuxTunStack::start_with_cleanup`] instead and await the returned
 /// handle after cancelling.
+///
+/// `start_with_cleanup` also returns the `WriteSender` for the UDP lower
+/// half (see `kernel_udp.rs`) alongside `StackHandle` — the trait's own
+/// `StackHandle` has no room for it (it is shared, sealed shape across all
+/// platforms), but a caller driving `handle.udp.recv()` in a loop needs it
+/// to write per-flow replies back into the TUN fd without fighting that
+/// loop for `&mut LinuxKernelUdpSocket` (see `crate::udp_socks5`).
 pub struct LinuxTunStack;
 
 impl private::Sealed for LinuxTunStack {}
@@ -42,11 +49,15 @@ impl LinuxTunStack {
     /// Same as the `TunStack::start` trait method, but also returns the
     /// `JoinHandle` of the spawned teardown task so the caller can await it
     /// after triggering `cancel` — the only way to guarantee firewall/routing/DNS
-    /// cleanup has actually completed before the process exits.
+    /// cleanup has actually completed before the process exits — and the UDP
+    /// `WriteSender` (see the doc comment on `LinuxTunStack` above).
     pub async fn start_with_cleanup(
         cfg: StackConfig,
         cancel: CancellationToken,
-    ) -> Result<(StackHandle<LinuxKernelTcpAcceptor, LinuxKernelUdpSocket>, tokio::task::JoinHandle<()>), LinuxTunError> {
+    ) -> Result<
+        (StackHandle<LinuxKernelTcpAcceptor, LinuxKernelUdpSocket>, WriteSender, tokio::task::JoinHandle<()>),
+        LinuxTunError,
+    > {
         info!("LinuxTunStack::start — tun_name={} tun_addr={} mtu={}", cfg.tun_name, cfg.tun_addr, cfg.mtu);
 
         // ── 1. Open TUN device ────────────────────────────────────────────────
@@ -88,10 +99,10 @@ impl LinuxTunStack {
 
         // ── 7. UDP socket (raw packet parsing from TUN fd) ────────────────────
         #[cfg(target_os = "linux")]
-        let (udp, _write_sender) = LinuxKernelUdpSocket::from_fd(device.raw_fd())?;
+        let (udp, write_sender) = LinuxKernelUdpSocket::from_fd(device.raw_fd())?;
 
         #[cfg(not(target_os = "linux"))]
-        let (udp, _write_sender) = LinuxKernelUdpSocket::from_fd(0)?;
+        let (udp, write_sender) = LinuxKernelUdpSocket::from_fd(0)?;
 
         // ── 8. Spawn cleanup task ─────────────────────────────────────────────
         // Handle returned to the caller so a binary can await it after
@@ -117,7 +128,7 @@ impl LinuxTunStack {
 
         let metrics = Arc::new(StackMetrics::default());
 
-        Ok((StackHandle { tcp, udp, metrics }, cleanup))
+        Ok((StackHandle { tcp, udp, metrics }, write_sender, cleanup))
     }
 }
 
@@ -132,7 +143,7 @@ impl TunStack for LinuxTunStack {
         cfg: StackConfig,
         cancel: CancellationToken,
     ) -> Result<StackHandle<Self::Tcp, Self::Udp>, Self::Error> {
-        let (handle, _cleanup) = Self::start_with_cleanup(cfg, cancel).await?;
+        let (handle, _write_sender, _cleanup) = Self::start_with_cleanup(cfg, cancel).await?;
         Ok(handle)
     }
 }
