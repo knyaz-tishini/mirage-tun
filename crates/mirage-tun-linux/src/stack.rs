@@ -79,7 +79,14 @@ impl LinuxTunStack {
         // ── 4. Firewall (TCP REDIRECT) ────────────────────────────────────────
         // PlatformFirewall is a sync trait — call without .await.
         let mut firewall = LinuxFirewall::detect(DEFAULT_INTERCEPT_PORT);
-        firewall.activate(&cfg.relay_addrs, &tun_name, &[])?;
+        if let Err(e) = firewall.activate(&cfg.relay_addrs, &tun_name, &[]) {
+            // activate failed after policy routing was installed. The cleanup
+            // task is not spawned yet, so restore the host routes here.
+            if let Err(re) = routing.restore_routes().await {
+                warn!("routing restore after firewall failure: {re}");
+            }
+            return Err(e);
+        }
 
         // ── 5. DNS ────────────────────────────────────────────────────────────
         let mut dns = LinuxDns::detect().await;

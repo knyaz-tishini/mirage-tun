@@ -388,6 +388,17 @@ fn nft_activate_sync(
     } else {
         "    # bypass relay addresses (do not redirect)\n    ip daddr @relay_addrs accept\n".to_string()
     };
+    // Locally generated TCP is not `iifname tun`: the kernel routes it into
+    // the tun fd, and the UDP reader drops non-UDP. `nat output` redirect
+    // catches it first and re-routes onto the acceptor. Marked sockets are
+    // the tunnel's own dials; loopback is the subscriber SOCKS listener;
+    // relay addresses are the edge entrances the subscriber must reach raw.
+    let output_relay = if relay_addrs.is_empty() {
+        String::new()
+    } else {
+        "    ip daddr @relay_addrs return\n".to_string()
+    };
+    let bypass_mark = crate::routing::BYPASS_FWMARK;
 
     let script = format!(
         r#"#!/usr/sbin/nft -f
@@ -397,6 +408,13 @@ table inet mirage_redirect {{
   chain prerouting {{
     type nat hook prerouting priority dstnat;
 {relay_bypass}    iifname "{tun_name}" tcp dport != 53 redirect to :{intercept_port}
+  }}
+  chain output {{
+    # nft 1.0.6 rejects the priority name dstnat on the output hook
+    type nat hook output priority -100;
+    meta mark {bypass_mark} return
+    ip daddr 127.0.0.0/8 return
+{output_relay}    tcp dport != 53 redirect to :{intercept_port}
   }}
 }}
 "#
@@ -470,6 +488,25 @@ fn ipt_activate_sync(
         ])?;
     }
 
+    // Same local-TCP hook as the nft `output` chain. See that comment.
+    let mark = crate::routing::BYPASS_FWMARK.to_string();
+    let port = intercept_port.to_string();
+    run_ipt_sync(&["-t", "nat", "-N", "MIRAGE_OUT"])?;
+    run_ipt_sync(&["-t", "nat", "-A", "OUTPUT", "-j", "MIRAGE_OUT"])?;
+    run_ipt_sync(&["-t", "nat", "-A", "MIRAGE_OUT", "-m", "mark", "--mark", &mark, "-j", "RETURN"])?;
+    run_ipt_sync(&["-t", "nat", "-A", "MIRAGE_OUT", "-d", "127.0.0.0/8", "-j", "RETURN"])?;
+    for addr in relay_addrs {
+        run_ipt_sync(&["-t", "nat", "-A", "MIRAGE_OUT", "-d", &addr.to_string(), "-j", "RETURN"])?;
+    }
+    run_ipt_sync(&[
+        "-t", "nat", "-A", "MIRAGE_OUT", "-p", "tcp", "--dport", "1:52",
+        "-j", "REDIRECT", "--to-ports", &port,
+    ])?;
+    run_ipt_sync(&[
+        "-t", "nat", "-A", "MIRAGE_OUT", "-p", "tcp", "--dport", "54:65535",
+        "-j", "REDIRECT", "--to-ports", &port,
+    ])?;
+
     Ok(())
 }
 
@@ -482,6 +519,9 @@ fn ipt_deactivate_sync() -> Result<(), LinuxTunError> {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         warn!("iptables flush failed: {stderr}");
     }
+    let _ = StdCommand::new("iptables").args(["-t", "nat", "-D", "OUTPUT", "-j", "MIRAGE_OUT"]).output();
+    let _ = StdCommand::new("iptables").args(["-t", "nat", "-F", "MIRAGE_OUT"]).output();
+    let _ = StdCommand::new("iptables").args(["-t", "nat", "-X", "MIRAGE_OUT"]).output();
     Ok(())
 }
 
