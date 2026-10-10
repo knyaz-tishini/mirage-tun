@@ -26,7 +26,7 @@ use mirage_tcpip_stack::{udp::UdpMsg, StackBuilder};
 use mirage_tun_core::{
     chains::{ChainConfig, ChainRegistry},
     metrics::StackMetrics,
-    policy::{PolicyEngine, WireNature},
+    policy::{PolicyDecision, PolicyEngine, PolicyRule, WireNature},
     stack_config::StackConfig,
     traits::{
         private::Sealed, PlatformDns, PlatformFirewall, PlatformRouting, StackHandle,
@@ -168,8 +168,12 @@ impl MacosTunStack {
         //    the device exists. MacosFirewall/Routing have no Drop, so an early
         //    `?`-return leaves this floor in place (fail-closed, self-heals on the
         //    next start which replaces the anchor).
+        let split = matches!(cfg.policy.default_action, PolicyDecision::Bypass);
         let mut firewall = MacosFirewall::new();
         firewall.set_bypass_nets(bypass_cidr_strings.clone());
+        if split {
+            firewall.set_leak_floor(false);
+        }
         firewall.activate_prefloor(&cfg.relay_addrs, &[53])?;
 
         // 1. Open utun device
@@ -224,7 +228,12 @@ impl MacosTunStack {
             // Bypass-plane CIDRs routed via the original gateway (before the /1
             // overrides inside set_default_route) → they egress the real NIC.
             r.set_bypass_nets(bypass_cidr_strings.clone());
-            // 5. Set default route AFTER stack read loop is about to start
+            if split {
+                r.set_capture_default(false);
+                r.set_capture_cidrs(chain_cidrs(&cfg.policy.rules));
+            }
+            // 5. Set default route AFTER stack read loop is about to start.
+            //    Split keeps the physical default and routes only the chain prefixes.
             r.set_default_route(&tun_name).await?;
         }
 
@@ -576,7 +585,7 @@ impl MacosTunStack {
 
         let relay_addrs_ret = cfg.relay_addrs.clone();
         let tun_name_ret = tun_name.clone();
-        spawn_route_monitor(tun_name, Arc::clone(&routing), cancel.clone());
+        spawn_route_monitor(tun_name, Arc::clone(&routing), cancel.clone(), !split);
 
         // UDP socket consumed by forward loop above; expose noop for StackHandle.
         let udp = SmoltcpUdpSocket::noop();
@@ -876,6 +885,18 @@ fn build_socks5_connect(target: SocketAddr) -> Vec<u8> {
         }
     }
     req
+}
+
+fn chain_cidrs(rules: &[PolicyRule]) -> Vec<String> {
+    rules
+        .iter()
+        .filter_map(|rule| match rule {
+            PolicyRule::DestCidr { cidr, action, .. } if matches!(action, PolicyDecision::Chain(_)) => {
+                Some(cidr.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn derive_peer_ip(local: &str) -> String {

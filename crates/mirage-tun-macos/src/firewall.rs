@@ -33,11 +33,20 @@ pub struct MacosFirewall {
     /// Bypass-plane CIDRs that must `pass out` the real NIC even under the
     /// kill-switch (mirrors the per-relay pass rules). Set before `activate`.
     bypass_nets: Vec<String>,
+    /// Full mode drops public egress that escaped the tun. Split mode leaves
+    /// it alone: only the selected prefixes are routed into the tun.
+    leak_floor: bool,
 }
 
 impl MacosFirewall {
     pub fn new() -> Self {
-        MacosFirewall { active: false, bypass_nets: Vec::new() }
+        MacosFirewall { active: false, bypass_nets: Vec::new(), leak_floor: true }
+    }
+
+    /// `false` is split mode: public traffic that is not routed into the tun
+    /// must leave on the physical NIC, not die on the leak floor.
+    pub fn set_leak_floor(&mut self, enabled: bool) {
+        self.leak_floor = enabled;
     }
 
     /// Seed bypass-plane CIDRs (e.g. "1.0.0.1/32") — call before `activate` so
@@ -79,7 +88,7 @@ impl MacosFirewall {
         relay_addrs: &[IpAddr],
         exempt_ports: &[u16],
     ) -> Result<(), MacosTunError> {
-        let conf = build_pf_rules(relay_addrs, "", exempt_ports, &self.bypass_nets);
+        let conf = build_pf_rules(relay_addrs, "", exempt_ports, &self.bypass_nets, self.leak_floor);
         debug!("pf pre-floor rules:\n{}", conf);
         std::fs::write(PF_CONF_PATH, &conf).map_err(MacosTunError::Io)?;
         run_pfctl_sync(&["-a", ANCHOR, "-f", PF_CONF_PATH])?;
@@ -107,7 +116,7 @@ impl PlatformFirewall for MacosFirewall {
         tun_name: &str,
         exempt_ports: &[u16],
     ) -> Result<(), Self::Error> {
-        let conf = build_pf_rules(relay_addrs, tun_name, exempt_ports, &self.bypass_nets);
+        let conf = build_pf_rules(relay_addrs, tun_name, exempt_ports, &self.bypass_nets, self.leak_floor);
         debug!("pf rules:\n{}", conf);
 
         std::fs::write(PF_CONF_PATH, &conf).map_err(MacosTunError::Io)?;
@@ -150,6 +159,7 @@ fn build_pf_rules(
     tun_name: &str,
     exempt_ports: &[u16],
     bypass_nets: &[String],
+    leak_floor: bool,
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
@@ -237,8 +247,10 @@ fn build_pf_rules(
     // the `pass quick on {tun}` above exempts the captured path. The `inet6`
     // floor also closes the IPv6 capture gap: when tun_peer_v6 is unset and v6 is
     // not routed into the tun, v6 egress fails CLOSED instead of leaking.
-    lines.push("block drop out inet all".to_string());
-    lines.push("block drop out inet6 all".to_string());
+    if leak_floor {
+        lines.push("block drop out inet all".to_string());
+        lines.push("block drop out inet6 all".to_string());
+    }
 
     lines.join("\n") + "\n"
 }
@@ -283,7 +295,7 @@ mod tests {
     #[test]
     fn pf_rules_have_leak_floor_with_exemptions() {
         let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        let rules = build_pf_rules(&[relay], "utun3", &[53], &[]);
+        let rules = build_pf_rules(&[relay], "utun3", &[53], &[], true);
         // Kernel-enforced leak-floor: wire egress that escaped the tun is dropped,
         // never leaked to the real NIC (macOS equivalent of Windows WFP block-all).
         assert!(rules.contains("block drop out inet all"));
@@ -306,14 +318,14 @@ mod tests {
     fn pf_rules_v6_relay() {
         use std::net::Ipv6Addr;
         let relay_v6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-        let rules = build_pf_rules(&[relay_v6], "utun3", &[], &[]);
+        let rules = build_pf_rules(&[relay_v6], "utun3", &[], &[], true);
         assert!(rules.contains("inet6 proto {tcp, udp} to 2001:db8::1"));
     }
 
     #[test]
     fn no_rdr_in_rules() {
         let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        let rules = build_pf_rules(&[relay], "utun3", &[53], &[]);
+        let rules = build_pf_rules(&[relay], "utun3", &[53], &[], true);
         assert!(!rules.contains("rdr"));
     }
 
@@ -321,7 +333,7 @@ mod tests {
     fn bypass_cidrs_get_pass_out() {
         let relay: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         let bypass = vec!["1.0.0.1/32".to_string(), "2001:db8::/32".to_string()];
-        let rules = build_pf_rules(&[relay], "utun3", &[53], &bypass);
+        let rules = build_pf_rules(&[relay], "utun3", &[53], &bypass, true);
         // v4 bypass passes out (quick, above the floor); v6 bypass uses inet6.
         assert!(rules.contains("pass out quick proto {tcp, udp} to 1.0.0.1/32 keep state"));
         assert!(rules.contains("pass out quick inet6 proto {tcp, udp} to 2001:db8::/32 keep state"));

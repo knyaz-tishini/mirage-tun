@@ -9,7 +9,13 @@ pub fn spawn_route_monitor(
     tun_name: String,
     routing: Arc<Mutex<MacosRouting>>,
     cancel: CancellationToken,
+    capture_default: bool,
 ) {
+    // Split mode has no 0/1 override. Watching for it would reinstall the
+    // full-capture routes and then exit after five "drift" ticks.
+    if !capture_default {
+        return;
+    }
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut fail_count: u32 = 0;

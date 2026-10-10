@@ -33,6 +33,10 @@ pub struct MacosRouting {
     tun_peer_v6: Option<IpAddr>,
     /// Whether IPv6 /1 default routes have been installed.
     v6_default_set: bool,
+    /// Full mode installs 0/1 + 128/1. Split leaves the physical default and
+    /// routes only `capture_cidrs` at the tun peer.
+    capture_default: bool,
+    capture_cidrs: Vec<String>,
 }
 
 impl MacosRouting {
@@ -46,7 +50,20 @@ impl MacosRouting {
             tun_peer: None,
             tun_peer_v6: None,
             v6_default_set: false,
+            capture_default: true,
+            capture_cidrs: Vec::new(),
         }
+    }
+
+    /// `false` is split mode: do not replace the default route.
+    pub fn set_capture_default(&mut self, capture: bool) {
+        self.capture_default = capture;
+    }
+
+    /// Prefixes that enter the tun in split mode. Ignored when the default
+    /// route itself is captured.
+    pub fn set_capture_cidrs(&mut self, cidrs: Vec<String>) {
+        self.capture_cidrs = cidrs;
     }
 
     /// Set the TUN IPv4 peer IP — must be called before `set_default_route`.
@@ -162,6 +179,16 @@ impl PlatformRouting for MacosRouting {
         let peer = self.tun_peer.ok_or_else(|| MacosTunError::GatewayParse(
             "tun_peer must be set before set_default_route on macOS".into()
         ))?;
+        if !self.capture_default {
+            for cidr in self.capture_cidrs.clone() {
+                let v6 = cidr_is_v6(&cidr);
+                let _ = del_net_route(&cidr, v6).await;
+                add_net_route(&cidr, peer, v6).await?;
+                info!("split capture {cidr} via tun peer {peer}");
+            }
+            info!("split mode: default route stays on the physical NIC");
+            return Ok(());
+        }
         // Idempotent install. A prior CRASH (panic / memory-guard / SIGKILL)
         // exits without restore_routes, leaving these /1 routes behind. On
         // respawn a bare `route add` would fail with "route already in table",
@@ -272,6 +299,13 @@ impl PlatformRouting for MacosRouting {
                         Err(e) => warn!("delete host route v6 {} failed: {}", relay, e),
                     }
                 }
+            }
+        }
+
+        for cidr in self.capture_cidrs.drain(..) {
+            let v6 = cidr_is_v6(&cidr);
+            if let Err(e) = del_net_route(&cidr, v6).await {
+                warn!("delete split capture {} failed: {}", cidr, e);
             }
         }
 
