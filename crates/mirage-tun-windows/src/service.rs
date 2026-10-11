@@ -122,14 +122,6 @@ async fn autostart_activate(
     params: crate::api::TunStartParams,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::api::activate_tun_inner(&state, params).await?;
-
-    let s = state.service.lock().await;
-    if let Some(socks5) = s.socks5_addr {
-        let if_index = s.if_index;
-        let dns_upstream = s.dns_upstream;
-        drop(s);
-        crate::ipstack::dns_warmup(socks5, if_index, dns_upstream).await;
-    }
     Ok(())
 }
 

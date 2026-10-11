@@ -9,7 +9,6 @@ use crate::{
     conn_registry::{ConnectionRegistry, SharedConnRegistry},
     dns::MacosDns,
     dns_query_log::DnsQueryLog,
-    dns_route::dns_via_socks5,
     error::MacosTunError,
     firewall::MacosFirewall,
     metrics::MetricsRegistry,
@@ -76,29 +75,6 @@ impl MacosTunStack {
                 })
                 .collect(),
         ));
-
-        // Build per-chain DNS upstream map: chain_name → first server IP as SocketAddr :53.
-        // Falls back to cfg.dns_upstream when chain has no entry.
-        let chain_dns_map: HashMap<String, SocketAddr> = cfg
-            .chain_dns
-            .iter()
-            .filter_map(|c| {
-                c.servers.first().map(|ip| {
-                    let sa = match ip {
-                        IpAddr::V4(v4) => SocketAddr::from((*v4, 53)),
-                        IpAddr::V6(v6) => SocketAddr::from((*v6, 53)),
-                    };
-                    (c.chain_name.clone(), sa)
-                })
-            })
-            .collect();
-        let global_dns_upstream = cfg.dns_upstream;
-        // For the single-chain macOS stack, pick the first chain's DNS upstream.
-        let dns_upstream_for_chain: SocketAddr = cfg
-            .chains
-            .first()
-            .and_then(|c| chain_dns_map.get(&c.name).copied())
-            .unwrap_or(global_dns_upstream);
 
         // Phase 2a — bypass plane. Compile the policy and extract Bypass CIDRs.
         // These egress the real NIC directly (route via original gw + pf pass +
@@ -316,7 +292,7 @@ impl MacosTunStack {
         chain_metrics_registry.get_or_create(&chain_name);
 
         // Forward-DNS query log: maps resolved IPs → queried domain name.
-        // Populated by the DNS-intercept loop; consulted at flow-open time.
+        // Populated from UDP :53 replies; consulted at flow-open time.
         let dns_query_log = Arc::new(DnsQueryLog::new());
 
         // Per-flow connection registry: powering GET /connections.
@@ -439,32 +415,14 @@ impl MacosTunStack {
             }
         });
 
-        // Reader half: receive from smoltcp, dispatch per-flow SOCKS5 sessions.
-        // Port 53 → DNS-via-SOCKS5 TCP CONNECT (intercept before UDP ASSOCIATE).
-        // All other UDP → SOCKS5 UDP ASSOCIATE.
+        // Reader half: every UDP datagram, port 53 included, is forwarded as UDP
+        // to the destination already on the packet. A port-53 reply is parsed
+        // only to record the name→IP mapping used by later TCP policy.
         let udp_sessions: UdpProxySessionMap = Arc::new(Mutex::new(HashMap::new()));
-
-        // Phase 2c: per-channel DNS routing.
-        // One ForwardCache per wire (keyed by chain name) so cached answers for
-        // wire A are never served to a query routed through wire B (split-DNS
-        // correctness). The map is lazily populated; the default chain is seeded
-        // eagerly so the common single-chain case allocates no extra lock traffic.
-        let dns_caches: Arc<Mutex<HashMap<String, Arc<mirage_dns::ForwardCache>>>> = {
-            let mut m: HashMap<String, Arc<mirage_dns::ForwardCache>> = HashMap::new();
-            m.insert(chain_name.clone(), Arc::new(mirage_dns::ForwardCache::new(4096)));
-            Arc::new(Mutex::new(m))
-        };
 
         let udp_cancel = cancel.clone();
         let udp_metrics = Arc::clone(&chain_metrics_registry);
         let udp_chain_name = chain_name.clone();
-        // Phase 2c captures
-        let dns_policy: Arc<PolicyEngine> = Arc::clone(&policy_arc);
-        let dns_chain_socks = Arc::clone(&chain_socks_arc);
-        // Wrap chain_dns_map in an Arc so it can be moved into the spawn closure.
-        let dns_chain_dns: Arc<HashMap<String, SocketAddr>> = Arc::new(chain_dns_map);
-        let default_chain_name = chain_name.clone();
-        // DNS query log shared into the DNS-intercept closure.
         let dns_log_udp = Arc::clone(&dns_query_log);
         tokio::spawn(async move {
             let mut udp_read = udp_read;
@@ -475,99 +433,34 @@ impl MacosTunStack {
                     item = futures::StreamExt::next(&mut udp_read) => match item {
                         None => break,
                         Some((payload, src_addr, dst_addr)) => {
-                            if dst_addr.port() == 53 {
-                                // Phase 2c: per-channel DNS routing.
-                                // Route each DNS query to the wire selected by the query's
-                                // domain (policy), using that wire's SOCKS5 + DNS upstream.
-                                // dst_addr.ip() from the guest is ignored — chain DNS
-                                // overrides whatever the app asked (matches Windows semantics).
-                                use mirage_tun_core::policy::PolicyDecision;
-
-                                let domain = mirage_dns::protocol::parse_question(&payload)
-                                    .map(|(q, _)| q.qname);
-
-                                let (wire_name, dns_socks, dns_upstream) = match domain.as_deref() {
-                                    Some(d) => match dns_policy.domain_decision(d).await {
-                                        PolicyDecision::Chain(name) => {
-                                            let socks = dns_chain_socks.get(&name).copied()
-                                                .unwrap_or(socks5_addr);
-                                            let up = dns_chain_dns.get(&name).copied()
-                                                .unwrap_or(global_dns_upstream);
-                                            (name, socks, up)
-                                        }
-                                        // Bypass-domain: no direct-resolver path yet (bypass
-                                        // plane is CIDR-based today). Resolve via the default
-                                        // chain + global upstream — still tunneled, never a
-                                        // plaintext DNS leak. A true direct-NIC bypass resolver
-                                        // is a follow-up.
-                                        PolicyDecision::Bypass => {
-                                            (default_chain_name.clone(), socks5_addr, global_dns_upstream)
-                                        }
-                                    },
-                                    // Malformed / EDNS-only packet: fall back to default chain.
-                                    None => (default_chain_name.clone(), socks5_addr, dns_upstream_for_chain),
-                                };
-
-                                // Lazily create per-wire ForwardCache so a cached answer for
-                                // wire A is never served to a query routed through wire B.
-                                let fc = {
-                                    let mut caches = dns_caches.lock().await;
-                                    caches.entry(wire_name.clone())
-                                        .or_insert_with(|| Arc::new(mirage_dns::ForwardCache::new(4096)))
-                                        .clone()
-                                };
-
-                                tracing::debug!(
-                                    domain = domain.as_deref().unwrap_or("<unknown>"),
-                                    wire = %wire_name,
-                                    upstream = %dns_upstream,
-                                    "DNS routed per-channel (Phase 2c)"
-                                );
-
-                                let tx = resp_tx.clone();
-                                let q = payload.clone();
-                                let q2 = q.clone();
-                                // Clone log + domain for the spawned task.
-                                let dns_log_task = Arc::clone(&dns_log_udp);
-                                let forward_name = domain.clone();
-                                tokio::spawn(async move {
-                                    let res = fc.resolve(&q, move || async move {
-                                        dns_via_socks5(&q2, dns_socks, dns_upstream).await
-                                    }).await;
-                                    match res {
-                                        Ok(response) => {
-                                            // Populate the DNS query log with every
-                                            // A/AAAA IP from the upstream answer so
-                                            // TCP flows can resolve IP → forward name.
-                                            if let Some(ref name) = forward_name {
-                                                let ips = mirage_dns::protocol::parse_answer_ips(&response);
-                                                if !ips.is_empty() {
-                                                    dns_log_task.insert_ips(name, &ips);
-                                                }
+                            let chain_m = udp_metrics.get_or_create(&udp_chain_name);
+                            let on_reply: Option<Arc<dyn Fn(&[u8]) + Send + Sync>> =
+                                if dst_addr.port() == 53 {
+                                    let dns_log = Arc::clone(&dns_log_udp);
+                                    Some(Arc::new(move |reply: &[u8]| {
+                                        if let Some((question, _)) =
+                                            mirage_dns::protocol::parse_question(reply)
+                                        {
+                                            let ips =
+                                                mirage_dns::protocol::parse_answer_ips(reply);
+                                            if !question.qname.is_empty() && !ips.is_empty() {
+                                                dns_log.insert_ips(&question.qname, &ips);
                                             }
-                                            let _ = tx.send((response, dst_addr, src_addr));
                                         }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                wire = %wire_name,
-                                                upstream = %dns_upstream,
-                                                "DNS resolve via SOCKS5 failed: {e}"
-                                            );
-                                        }
-                                    }
-                                });
-                            } else {
-                                let chain_m = udp_metrics.get_or_create(&udp_chain_name);
-                                udp_proxy_forward(
-                                    payload,
-                                    src_addr,
-                                    dst_addr,
-                                    resp_tx.clone(),
-                                    udp_sessions.clone(),
-                                    socks5_addr,
-                                    chain_m,
-                                ).await;
-                            }
+                                    }))
+                                } else {
+                                    None
+                                };
+                            udp_proxy_forward(
+                                payload,
+                                src_addr,
+                                dst_addr,
+                                resp_tx.clone(),
+                                udp_sessions.clone(),
+                                socks5_addr,
+                                chain_m,
+                                on_reply,
+                            ).await;
                         }
                     }
                 }

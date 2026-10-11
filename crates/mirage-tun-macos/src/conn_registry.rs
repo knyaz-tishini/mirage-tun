@@ -48,7 +48,7 @@ pub struct ConnSnapshot {
     pub bytes_rx: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConnState {
     Open,

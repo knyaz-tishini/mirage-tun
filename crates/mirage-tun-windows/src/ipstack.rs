@@ -17,10 +17,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use mirage_core::dns::dns_forward_via_socks5;
-use mirage_dns::topology_stub::DnsRoutingHint;
-
-use crate::chains::{ChainEntry, ChainMap, ChainRegistry, TunRouter};
+use crate::chains::{ChainRegistry, TunRouter};
 use crate::config::TunConfig;
 use crate::dns_map::DnsMap;
 use crate::error::{Result, TunError};
@@ -44,7 +41,7 @@ impl IpStackRunner {
         if_index: u32,
         policy: Arc<PolicyEngine>,
         dns_map: Arc<DnsMap>,
-        native_dns: Option<SocketAddr>,
+        _native_dns: Option<SocketAddr>,
         process_resolver: Arc<ProcessResolver>,
         metrics: Arc<MetricsRegistry>,
         connections: Arc<crate::metrics::ConnectionRegistry>,
@@ -60,13 +57,6 @@ impl IpStackRunner {
              relay_bypass={relay_addrs:?}, if_index={if_index}",
             snap.len(),
         );
-
-        if native_dns.is_none() {
-            warn!(
-                "IpStackRunner: bypass rules active but native_dns not configured, \
-                 using 8.8.8.8 as fallback for bypass DNS"
-            );
-        }
 
         let relay_set: Arc<HashSet<IpAddr>> =
             Arc::new(relay_addrs.into_iter().collect());
@@ -97,11 +87,6 @@ impl IpStackRunner {
 
         let stats = Arc::new(PumpStats::default());
         let active_conns = Arc::new(AtomicU64::new(0));
-
-        let dns_upstream = cfg.dns_upstream;
-        let dns_cache_ttl = std::time::Duration::from_secs(cfg.dns_cache_ttl_secs);
-        let dns_cache_max = cfg.dns_cache_max;
-        let dns_concurrency = cfg.dns_concurrency;
 
         tokio::spawn(pump_wintun_to_stack(
             wintun_rx,
@@ -140,11 +125,6 @@ impl IpStackRunner {
             cancel.clone(),
             policy,
             dns_map,
-            native_dns,
-            dns_upstream,
-            dns_cache_ttl,
-            dns_cache_max,
-            dns_concurrency,
             udp_proxy_sessions,
             process_resolver2,
             connections2,
@@ -415,56 +395,6 @@ async fn tcp_accept_loop(
     }
 }
 
-// ── UDP / DNS loop ────────────────────────────────────────────────────────────
-
-struct DnsCache {
-    entries: HashMap<Vec<u8>, (Vec<u8>, Instant)>,
-    ttl: std::time::Duration,
-    max: usize,
-}
-
-impl DnsCache {
-    fn new(ttl: std::time::Duration, max: usize) -> Self {
-        Self { entries: HashMap::new(), ttl, max }
-    }
-
-    fn get(&mut self, query: &[u8]) -> Option<Vec<u8>> {
-        let key = Self::cache_key(query);
-        if let Some((resp, ts)) = self.entries.get(&key) {
-            if ts.elapsed() < self.ttl {
-                let mut cached = resp.clone();
-                // Patch transaction ID in response to match query
-                if query.len() >= 2 && cached.len() >= 2 {
-                    cached[0] = query[0];
-                    cached[1] = query[1];
-                }
-                return Some(cached);
-            }
-            self.entries.remove(&key);
-        }
-        None
-    }
-
-    fn put(&mut self, query: &[u8], response: &[u8]) {
-        if self.entries.len() >= self.max {
-            // Evict oldest
-            let oldest = self.entries.iter()
-                .min_by_key(|(_, (_, ts))| *ts)
-                .map(|(k, _)| k.clone());
-            if let Some(k) = oldest {
-                self.entries.remove(&k);
-            }
-        }
-        let key = Self::cache_key(query);
-        self.entries.insert(key, (response.to_vec(), Instant::now()));
-    }
-
-    // Cache key = query minus transaction ID (first 2 bytes)
-    fn cache_key(query: &[u8]) -> Vec<u8> {
-        if query.len() > 2 { query[2..].to_vec() } else { query.to_vec() }
-    }
-}
-
 // ── UDP bypass session map ───────────────────────────────────────────────────
 
 /// Per-session state for a UDP bypass session.
@@ -646,7 +576,7 @@ pub(crate) async fn connect_via_interface_pub(
     connect_via_interface(remote, if_index).await
 }
 
-/// Per-session verdict for non-DNS UDP flows.
+/// Per-session verdict for UDP flows, including destination port 53.
 ///
 /// Keyed by `(src_addr, dst_addr)`.  Created once at session-open and removed
 /// when either `UdpSessionMap` (bypass) or `UdpProxySessionMap` (chain) reaps
@@ -664,11 +594,6 @@ async fn udp_dns_loop(
     cancel: CancellationToken,
     policy: Arc<PolicyEngine>,
     dns_map: Arc<DnsMap>,
-    native_dns: Option<SocketAddr>,
-    dns_upstream: SocketAddr,
-    dns_cache_ttl: std::time::Duration,
-    dns_cache_max: usize,
-    dns_concurrency: usize,
     udp_proxy_sessions: crate::udp_socks5::UdpProxySessionMap,
     process_resolver: Arc<ProcessResolver>,
     connections: Arc<crate::metrics::ConnectionRegistry>,
@@ -686,18 +611,11 @@ async fn udp_dns_loop(
         }
     });
 
-    let dns_sem = Arc::new(Semaphore::new(dns_concurrency));
-    let cache = Arc::new(Mutex::new(DnsCache::new(dns_cache_ttl, dns_cache_max)));
     let udp_sessions: UdpSessionMap = Arc::new(Mutex::new(HashMap::new()));
     // Per-session verdict cache (D1): verdict + attribution decided once at session-open,
     // reused for all subsequent packets of the same (src, dst) — no per-packet Win32 cost,
     // no mid-session flip.
     let udp_verdicts: UdpVerdictMap = Arc::new(Mutex::new(HashMap::new()));
-    // D2: per-src_port DNS attribution cache.  Keyed by the querying process's
-    // UDP source port.  TTL matches PID_CACHE_TTL (30 s) — avoids a Win32 call
-    // per DNS query while still refreshing when the port is reused after 30 s.
-    let dns_attr_cache: Arc<Mutex<HashMap<u16, (crate::process_info::ProcessInfo, std::time::Instant)>>> =
-        Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -706,7 +624,7 @@ async fn udp_dns_loop(
             item = read_half.next() => match item {
                 None => break,
                 Some((payload, src_addr, dst_addr)) => {
-                    if dst_addr.port() != 53 {
+                    {
                         let dst_ip = dst_addr.ip();
 
                         // D1: look up per-session verdict.  On session-open (first packet
@@ -768,7 +686,7 @@ async fn udp_dns_loop(
                             )
                             .await;
                         } else {
-                            // Proxy non-DNS UDP through SOCKS5 UDP ASSOCIATE
+                            // Proxy UDP, including port 53, through SOCKS5 UDP ASSOCIATE.
                             let chain_snap = chain_registry.snapshot().await;
                             let socks5_addr = match &decision {
                                 PolicyDecision::Chain(name) => {
@@ -792,6 +710,20 @@ async fn udp_dns_loop(
                                         );
                                     }
                                 }
+                                let on_reply: Option<Arc<dyn Fn(&[u8]) + Send + Sync>> =
+                                    if dst_addr.port() == 53 {
+                                        let dns_log = Arc::clone(&dns_map);
+                                        Some(Arc::new(move |reply: &[u8]| {
+                                            if let Some(domain) = extract_dns_domain(reply) {
+                                                let ips = extract_dns_ips(reply);
+                                                if !ips.is_empty() {
+                                                    dns_log.insert_many(&ips, &domain);
+                                                }
+                                            }
+                                        }))
+                                    } else {
+                                        None
+                                    };
                                 crate::udp_socks5::udp_proxy_forward(
                                     payload,
                                     src_addr,
@@ -800,6 +732,7 @@ async fn udp_dns_loop(
                                     udp_proxy_sessions.clone(),
                                     socks5_addr,
                                     if_index,
+                                    on_reply,
                                 )
                                 .await;
                             } else {
@@ -819,151 +752,7 @@ async fn udp_dns_loop(
                             }
                         }
 
-                        continue;
                     }
-                    // Check cache first (no upstream query needed)
-                    {
-                        let mut c = cache.lock().await;
-                        if let Some(cached) = c.get(&payload) {
-                            let _ = resp_tx.send((cached, dst_addr, src_addr));
-                            continue;
-                        }
-                    }
-
-                    // Extract domain and check policy BEFORE spawning (no locks held).
-                    // D2: resolve querying process for app-attributed DNS routing.
-                    let src_port = src_addr.port();
-                    let dns_app_info: Option<crate::process_info::ProcessInfo> = {
-                        const DNS_ATTR_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-                        let cached = {
-                            let c = dns_attr_cache.lock().await;
-                            c.get(&src_port).and_then(|(info, ts)| {
-                                if ts.elapsed() < DNS_ATTR_TTL { Some(info.clone()) } else { None }
-                            })
-                        };
-                        if let Some(info) = cached {
-                            Some(info)
-                        } else {
-                            // Win32 call: spawn_blocking to keep async loop unblocked.
-                            let resolver = process_resolver.clone();
-                            let resolved = tokio::task::spawn_blocking(move || {
-                                resolver.resolve_udp(src_port)
-                            })
-                            .await
-                            .ok()
-                            .flatten();
-                            if let Some(ref info) = resolved {
-                                dns_attr_cache.lock().await.insert(
-                                    src_port,
-                                    (info.clone(), std::time::Instant::now()),
-                                );
-                            }
-                            resolved
-                        }
-                    };
-                    let domain = extract_dns_domain(&payload);
-                    let decision = if let Some(ref dom) = domain {
-                        let core_dns_app_info = dns_app_info.as_ref().map(|i| process_info_to_core(i.clone()));
-                        policy.domain_decision_with_app(dom, core_dns_app_info.as_ref()).await
-                    } else {
-                        PolicyDecision::default_chain()
-                    };
-
-                    let tx = resp_tx.clone();
-                    let sem = dns_sem.clone();
-                    let cache2 = cache.clone();
-                    let dns_map2 = dns_map.clone();
-
-                    if decision == PolicyDecision::Bypass {
-                        const FALLBACK_DNS: SocketAddr = SocketAddr::new(
-                            IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-                            53,
-                        );
-                        let ndns = native_dns.unwrap_or(FALLBACK_DNS);
-                        tokio::spawn(async move {
-                            let _permit = match sem.acquire().await {
-                                Ok(p) => p,
-                                Err(_) => return,
-                            };
-                            match dns_via_native(&payload, ndns, if_index).await {
-                                Ok(response) => {
-                                    if let Some(ref dom) = domain {
-                                        let ips = extract_dns_ips(&response);
-                                        if !ips.is_empty() {
-                                            dns_map2.insert_many(&ips, dom);
-                                        }
-                                    }
-                                    {
-                                        let mut c = cache2.lock().await;
-                                        c.put(&payload, &response);
-                                    }
-                                    let _ = tx.send((response, dst_addr, src_addr));
-                                }
-                                Err(e) => {
-                                    warn!("IpStackRunner: DNS via native failed: {e}");
-                                }
-                            }
-                        });
-                        continue;
-                    }
-
-                    // SOCKS5 path — only reached for Chain decisions (Bypass continues above).
-                    let chain_snap: Arc<ChainMap> = chain_registry.snapshot().await;
-                    let chain_entry: Option<ChainEntry> = match &decision {
-                        PolicyDecision::Chain(name) => {
-                            // Try the named chain first, then fall back to "default".
-                            chain_snap.get(name.as_str())
-                                .or_else(|| chain_snap.get("default"))
-                                .or_else(|| chain_snap.values().next())
-                                .cloned()
-                        }
-                        PolicyDecision::Bypass => unreachable!("bypass handled above"),
-                    };
-
-                    let chain_entry = match chain_entry {
-                        Some(entry) => entry,
-                        None => {
-                            warn!("DNS query: no chain configured — dropping");
-                            continue;
-                        }
-                    };
-
-                    // Use per-chain DNS upstream if configured; fall back to global.
-                    let chain_dns = chain_entry.dns_upstream.unwrap_or(dns_upstream);
-                    let socks5_addr = chain_entry.socks5_addr;
-                    let chain_id_tag = chain_entry.chain_id.clone();
-
-                    // Log chain-tagged dispatch intent (observability).
-                    DnsRoutingHint {
-                        chain_id: Some(chain_id_tag.clone()),
-                        name: domain.clone().unwrap_or_default(),
-                    }
-                    .log_intent();
-
-                    tokio::spawn(async move {
-                        let _permit = match sem.acquire().await {
-                            Ok(p) => p,
-                            Err(_) => return,
-                        };
-                        match dns_forward_via_socks5(&payload, socks5_addr, chain_dns).await {
-                            Ok(response) => {
-                                if let Some(ref dom) = domain {
-                                    let ips = extract_dns_ips(&response);
-                                    if !ips.is_empty() {
-                                        dns_map2.insert_many(&ips, dom);
-                                    }
-                                }
-                                {
-                                    let mut c = cache2.lock().await;
-                                    c.put(&payload, &response);
-                                }
-                                let _ = tx.send((response, dst_addr, src_addr));
-                            }
-                            Err(e) => {
-                                warn!(chain_id = %chain_id_tag, "IpStackRunner: DNS via SOCKS5 failed: {e}");
-                            }
-                        }
-                    });
                 }
             }
         }
@@ -1071,53 +860,6 @@ fn extract_dns_ips(response: &[u8]) -> Vec<IpAddr> {
         pos += rdlength;
     }
     ips
-}
-
-// ── Native DNS (bypass path) ──────────────────────────────────────────────────
-
-#[cfg(windows)]
-async fn dns_via_native(
-    query: &[u8],
-    native_dns: SocketAddr,
-    if_index: u32,
-) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    use socket2::{Domain, Protocol, Socket, Type};
-
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("static addr is valid");
-    sock.bind(&bind_addr.into())?;
-    bind_to_interface(&sock, if_index, true)?;
-    sock.set_nonblocking(true)?;
-    let std_udp: std::net::UdpSocket = sock.into();
-    let tokio_udp = tokio::net::UdpSocket::from_std(std_udp)?;
-    tokio_udp.send_to(query, native_dns).await?;
-
-    let mut buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio_udp.recv(&mut buf),
-    )
-    .await??;
-    buf.truncate(n);
-    Ok(buf)
-}
-
-#[cfg(not(windows))]
-async fn dns_via_native(
-    query: &[u8],
-    native_dns: SocketAddr,
-    _if_index: u32,
-) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-    udp.send_to(query, native_dns).await?;
-    let mut buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        udp.recv(&mut buf),
-    )
-    .await??;
-    buf.truncate(n);
-    Ok(buf)
 }
 
 // ── TCP bypass (direct via native interface) ──────────────────────────────────
@@ -1302,27 +1044,4 @@ async fn socks5_connect(
     }
 
     Ok(stream)
-}
-
-// ── DNS warmup ────────────────────────────────────────────────────────────────
-
-pub(crate) async fn dns_warmup(socks5_addr: SocketAddr, _if_index: u32, dns_upstream: SocketAddr) {
-    // Minimal A query for example.com — just to warm up the DNS-over-TCP SOCKS5 path.
-    // Uses dns_forward_via_socks5 (shared mirage-core helper) instead of the old
-    // TUN-local dns_via_socks5_inner so the two paths stay consistent.
-    let query: &[u8] = &[
-        0x00, 0x01, // txn id
-        0x01, 0x00, // standard query, recursion desired
-        0x00, 0x01, // 1 question
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // no answer/authority/additional
-        0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-        0x03, b'c', b'o', b'm',
-        0x00,       // root label
-        0x00, 0x01, // QTYPE A
-        0x00, 0x01, // QCLASS IN
-    ];
-    match dns_forward_via_socks5(query, socks5_addr, dns_upstream).await {
-        Ok(_) => info!("DNS warmup: success"),
-        Err(e) => tracing::warn!("DNS warmup: failed: {e}"),
-    }
 }

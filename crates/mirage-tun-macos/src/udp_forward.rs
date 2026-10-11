@@ -14,12 +14,19 @@ const UDP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 
 pub struct UdpSocks5Session {
     pub fwd_tx: mpsc::Sender<Vec<u8>>,
+    /// Set when the session is created. Later datagrams on the same flow
+    /// do not replace it.
+    on_reply: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
 }
 
 pub type UdpProxySessionMap = Arc<Mutex<HashMap<(SocketAddr, SocketAddr), UdpSocks5Session>>>;
 
 /// Forward one UDP datagram through SOCKS5 UDP ASSOCIATE.
 /// Creates a new session if none exists for (src_addr, dst_addr).
+///
+/// `on_reply` is stored on that new session and run on each UDP reply
+/// payload before the reply is injected back into the stack. It is not
+/// consulted again for a flow that already has a session.
 pub async fn udp_proxy_forward(
     payload: Vec<u8>,
     src_addr: SocketAddr,
@@ -28,6 +35,7 @@ pub async fn udp_proxy_forward(
     sessions: UdpProxySessionMap,
     socks5_addr: SocketAddr,
     chain_metrics: Arc<ChainMetrics>,
+    on_reply: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
 ) {
     {
         let map = sessions.lock().await;
@@ -38,9 +46,14 @@ pub async fn udp_proxy_forward(
     }
 
     let (fwd_tx, fwd_rx) = mpsc::channel::<Vec<u8>>(64);
+    let session = UdpSocks5Session {
+        fwd_tx: fwd_tx.clone(),
+        on_reply,
+    };
+    let on_reply = session.on_reply.clone();
     {
         let mut map = sessions.lock().await;
-        map.insert((src_addr, dst_addr), UdpSocks5Session { fwd_tx: fwd_tx.clone() });
+        map.insert((src_addr, dst_addr), session);
     }
     let _ = fwd_tx.try_send(payload);
     chain_metrics.connections.fetch_add(1, Ordering::Relaxed);
@@ -50,6 +63,7 @@ pub async fn udp_proxy_forward(
         match udp_proxy_session_task(
             src_addr, dst_addr, socks5_addr,
             fwd_rx, resp_tx, Arc::clone(&chain_metrics),
+            on_reply,
         ).await {
             Ok(()) => {}
             Err(e) => {
@@ -68,6 +82,7 @@ async fn udp_proxy_session_task(
     mut fwd_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: mpsc::UnboundedSender<UdpMsg>,
     chain_metrics: Arc<ChainMetrics>,
+    on_reply: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_tcp_keepalive, relay_addr) = socks5_udp_associate(socks5_addr).await?;
 
@@ -106,6 +121,9 @@ async fn udp_proxy_session_task(
                                 let payload_start = 3 + header_len;
                                 if payload_start <= n {
                                     let payload = data[payload_start..n].to_vec();
+                                    if let Some(cb) = on_reply.as_ref() {
+                                        cb(&payload);
+                                    }
                                     let payload_len = payload.len() as u64;
                                     let _ = resp_tx.send((payload, real_src, src_addr));
                                     chain_metrics.bytes_rx.fetch_add(payload_len, Ordering::Relaxed);
