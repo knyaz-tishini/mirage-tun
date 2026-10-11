@@ -309,7 +309,7 @@ impl CompiledPolicy {
 
             for (rule_path, decision, fp, wc, rule_idx) in &self.app_path_table {
                 for &p in &paths {
-                    if p == rule_path.as_str() {
+                    if app_path_hit(rule_path, p) {
                         if let Some(counter) = self.rule_hits.get(*rule_idx) {
                             counter.fetch_add(1, Ordering::Relaxed);
                         }
@@ -437,7 +437,7 @@ impl CompiledPolicy {
             // Exact path match.
             for (rule_path, decision, _fp, _wc, rule_idx) in &self.app_path_table {
                 for &p in &paths {
-                    if p == rule_path.as_str() {
+                    if app_path_hit(rule_path, p) {
                         if let Some(counter) = self.rule_hits.get(*rule_idx) {
                             counter.fetch_add(1, Ordering::Relaxed);
                         }
@@ -525,6 +525,17 @@ impl CompiledPolicy {
 
 fn normalize_app_path(p: &str) -> String {
     p.to_lowercase().replace('\\', "/")
+}
+
+/// Exact normalized path, or a bare file name against the last path component.
+fn app_path_hit(rule_path: &str, candidate: &str) -> bool {
+    if candidate == rule_path {
+        return true;
+    }
+    if !rule_path.contains('/') {
+        return candidate.rsplit('/').next() == Some(rule_path);
+    }
+    false
 }
 
 pub struct PolicyEngine {
@@ -625,6 +636,34 @@ mod tests {
     fn failure_policy_default_is_fail_closed() {
         let fp = FailurePolicy::default();
         assert_eq!(fp, FailurePolicy::FailClosed);
+    }
+
+    #[test]
+    fn bare_exe_name_matches_the_file_component() {
+        let policy = CompiledPolicy::compile(
+            vec![PolicyRule::DestAppPath {
+                path: "chrome.exe".into(),
+                action: PolicyDecision::Chain("edge".into()),
+                failure_policy: FailurePolicy::default(),
+                wire_class: WireClass::default(),
+            }],
+            PolicyDecision::Bypass,
+        );
+        let chrome = ProcessInfo {
+            pid: 1,
+            exe_path: "c:/program files/google/chrome/application/chrome.exe".into(),
+            ancestor_paths: vec![],
+        };
+        assert_eq!(
+            policy.decide(ip("1.1.1.1"), 443, None, Some(&chrome)),
+            PolicyDecision::Chain("edge".into())
+        );
+        let curl = ProcessInfo {
+            pid: 2,
+            exe_path: "c:/windows/system32/curl.exe".into(),
+            ancestor_paths: vec![],
+        };
+        assert_eq!(policy.decide(ip("1.1.1.1"), 443, None, Some(&curl)), PolicyDecision::Bypass);
     }
 
     #[test]
