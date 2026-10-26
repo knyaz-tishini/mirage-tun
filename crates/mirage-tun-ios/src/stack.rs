@@ -35,12 +35,17 @@ fn write_callback_cell() -> &'static Mutex<Option<Arc<WriteCallback>>> {
 
 /// Wraps `mirage_tcpip_stack::TcpListener` and implements `TcpAcceptor`.
 pub struct IosTcpAcceptor {
-    inner: TcpListener,
+    inner: Option<TcpListener>,
 }
 
 impl IosTcpAcceptor {
     pub(crate) fn new(inner: TcpListener) -> Self {
-        Self { inner }
+        Self { inner: Some(inner) }
+    }
+
+    /// Placeholder returned once the real listener is owned by the packet relay.
+    pub(crate) fn idle() -> Self {
+        Self { inner: None }
     }
 }
 
@@ -49,7 +54,8 @@ impl TcpAcceptor for IosTcpAcceptor {
     async fn accept(
         &mut self,
     ) -> Option<(tokio::net::TcpStream, SocketAddr, SocketAddr)> {
-        let (smol_stream, local, remote) = self.inner.next().await?;
+        let inner = self.inner.as_mut()?;
+        let (smol_stream, local, remote) = inner.next().await?;
 
         let (client, server) = tokio::io::duplex(65536);
         tokio::spawn(bridge_smoltcp_stream(smol_stream, server));
@@ -85,24 +91,32 @@ where
 
 /// Wraps the pre-split halves of `mirage_tcpip_stack::UdpSocket`.
 pub struct IosUdpSocket {
-    read: UdpReadHalf,
-    write: Arc<Mutex<UdpWriteHalf>>,
+    read: Option<UdpReadHalf>,
+    write: Option<Arc<Mutex<UdpWriteHalf>>>,
 }
 
 impl IosUdpSocket {
     pub(crate) fn from_socket(socket: UdpSocket) -> Self {
         let (read, write) = socket.split();
         Self {
-            read,
-            write: Arc::new(Mutex::new(write)),
+            read: Some(read),
+            write: Some(Arc::new(Mutex::new(write))),
         }
+    }
+
+    /// Placeholder returned once the real socket is owned by the packet relay.
+    pub(crate) fn idle() -> Self {
+        Self { read: None, write: None }
     }
 }
 
 #[async_trait]
 impl UdpSocketTrait for IosUdpSocket {
     async fn recv(&mut self) -> Option<(Vec<u8>, SocketAddr, SocketAddr)> {
-        self.read.next().await
+        match self.read.as_mut() {
+            Some(read) => read.next().await,
+            None => None,
+        }
     }
 
     async fn send(
@@ -112,8 +126,11 @@ impl UdpSocketTrait for IosUdpSocket {
         dst: SocketAddr,
     ) -> Result<(), TunError> {
         use futures::SinkExt;
+        let Some(write) = self.write.as_ref() else {
+            return Err(TunError::Io(std::io::Error::other("udp socket is idle")));
+        };
         let msg = (payload, src, dst);
-        self.write
+        write
             .lock()
             .await
             .send(msg)
@@ -191,6 +208,26 @@ impl TunStack for IosTunStack {
             tokio::spawn(r);
         }
 
+        if let Some(proxy) = cfg
+            .chains
+            .iter()
+            .find(|entry| entry.name == "default")
+            .map(|entry| entry.socks5_addr)
+        {
+            tokio::spawn(crate::relay::relay_tcp(
+                tcp_listener,
+                proxy,
+                cancel.clone(),
+            ));
+            tokio::spawn(crate::relay::relay_udp(
+                udp_socket,
+                proxy,
+                cancel.clone(),
+            ));
+        } else {
+            tracing::error!("ios: no default socks chain; packet relay not started");
+        }
+
         let (stack_sink, stack_stream) = stack.split();
 
         // inbound_rx: fed by mirage_tun_process_packet FFI (Swift → smoltcp).
@@ -221,8 +258,8 @@ impl TunStack for IosTunStack {
         ));
 
         Ok(StackHandle {
-            tcp: IosTcpAcceptor::new(tcp_listener),
-            udp: IosUdpSocket::from_socket(udp_socket),
+            tcp: IosTcpAcceptor::idle(),
+            udp: IosUdpSocket::idle(),
             metrics,
         })
     }
@@ -251,7 +288,7 @@ fn set_inbound_tx(tx: mpsc::Sender<Vec<u8>>) {
 /// Obtain a clone of the inbound sender (non-blocking).
 ///
 /// Returns `None` if the stack has not been started yet.
-pub(crate) fn clone_inbound_tx() -> Option<mpsc::Sender<Vec<u8>>> {
+pub fn clone_inbound_tx() -> Option<mpsc::Sender<Vec<u8>>> {
     inbound_tx_cell().try_lock().ok()?.clone()
 }
 

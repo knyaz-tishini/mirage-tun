@@ -248,10 +248,7 @@ pub unsafe extern "C" fn mirage_tun_update_chains(
             ctx_ref.rt_handle.block_on(async move {
                 let new_map = entries
                     .into_iter()
-                    .map(|e| (e.name, mirage_tun_core::chains::ChainEntry {
-                        socks5_addr: e.socks5_addr,
-                        dns_upstream: None,
-                    }))
+                    .map(|e| (e.chain_id.clone(), e))
                     .collect();
                 registry.update(new_map).await;
             });
@@ -337,6 +334,9 @@ fn parse_ffi_config(json: &[u8]) -> Result<StackConfig, IosTunError> {
     Ok(StackConfig {
         tun_name: "utun0".to_owned(),
         tun_addr: raw.tun_addr,
+        // The FFI config carries no IPv6 address for the tunnel interface:
+        // v4-only is the stack's backward-compatible default.
+        tun_addr_v6: None,
         mtu: raw.mtu,
         chains,
         policy: PolicyConfigRequest {
@@ -354,7 +354,7 @@ fn parse_ffi_config(json: &[u8]) -> Result<StackConfig, IosTunError> {
     })
 }
 
-fn parse_chains_json(json: &[u8]) -> Result<Vec<ChainEntry>, serde_json::Error> {
+fn parse_chains_json(json: &[u8]) -> Result<Vec<mirage_tun_core::chains::ChainEntry>, serde_json::Error> {
     #[derive(serde::Deserialize)]
     struct FfiChain {
         name: String,
@@ -368,7 +368,11 @@ fn parse_chains_json(json: &[u8]) -> Result<Vec<ChainEntry>, serde_json::Error> 
             c.socks5_addr
                 .parse()
                 .ok()
-                .map(|addr| ChainEntry { name: c.name, socks5_addr: addr, group: None, nature: Default::default() })
+                .map(|addr| mirage_tun_core::chains::ChainEntry {
+                    chain_id: c.name,
+                    socks5_addr: addr,
+                    dns_upstream: None,
+                })
         })
         .collect())
 }

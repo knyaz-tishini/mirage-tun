@@ -6,6 +6,10 @@ edition.workspace = true
 [lib]
 crate-type = ["lib"]
 
+[features]
+default = ["c-abi"]
+c-abi = []
+
 [dependencies]
 mirage-tun-core = { path = "../mirage-tun-core" }
 mirage-tcpip-stack = { path = "../mirage-tcpip-stack" }
