@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use tokio::io::AsyncReadExt;
 
 #[derive(Parser)]
 #[command(name = "mirage2tun", version, about = "Mirage TUN adapter lifecycle service")]
@@ -345,15 +346,39 @@ fn debug_run() {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
 
     rt.block_on(async move {
-        tokio::select! {
-            result = mirage_tun_windows::service::run_service_logic(None, stop_tx.clone(), stop_rx) => {
-                if let Err(e) = result {
-                    tracing::error!("debug-run error: {e}");
+        // The window owns this process. When the window closes the pipe, the
+        // device gives the routes back by itself — a killed device would leave
+        // its routes behind and the machine would lose its way out.
+        let mut stdin = tokio::io::stdin();
+        let mut buffer = [0u8; 64];
+        let logic = mirage_tun_windows::service::run_service_logic(None, stop_tx.clone(), stop_rx);
+        tokio::pin!(logic);
+        loop {
+            tokio::select! {
+                result = &mut logic => {
+                    if let Err(e) = result {
+                        tracing::error!("debug-run error: {e}");
+                    }
+                    break;
                 }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Ctrl-C received, shutting down");
-                let _ = stop_tx.send(());
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl-C received, shutting down");
+                    let _ = stop_tx.send(());
+                }
+                read = stdin.read(&mut buffer) => {
+                    match read {
+                        // The window is gone.
+                        Ok(0) => {
+                            tracing::info!("the window closed the pipe — giving the routes back");
+                            let _ = stop_tx.send(());
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "the pipe to the window broke — shutting down");
+                            let _ = stop_tx.send(());
+                        }
+                    }
+                }
             }
         }
     });
