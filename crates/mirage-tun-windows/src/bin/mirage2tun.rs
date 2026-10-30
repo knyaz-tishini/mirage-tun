@@ -334,7 +334,7 @@ fn debug_run() {
         .with_writer(std::io::stdout)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mirage2tun::ipstack=debug,mirage_tcpip_stack=debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mirage_tun_windows::ipstack=info")),
         )
         .init();
 
