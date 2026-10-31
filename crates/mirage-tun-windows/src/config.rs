@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunConfig {
@@ -166,6 +166,9 @@ fn default_mtu() -> u16 {
 ///
 /// The tunnel carries whole IP packets, so the client gets an address in
 /// this network and the box masquerades it (NAT66) towards the internet.
+///
+/// The prefix is a NAME here: the address is written by [`Ipv6Addr`], so
+/// the last group is hex, exactly as IPv6 writes it.
 pub const IPV6_PREFIX: &str = "fd77::";
 
 /// The prefix length of the tunnel's IPv6 network.
@@ -198,7 +201,12 @@ pub fn derive_ipv6_addr(tun_addr: &str) -> Option<String> {
     if host == 0 || host == 255 {
         return None;
     }
-    Some(format!("{IPV6_PREFIX}{host}/{IPV6_PREFIX_LEN}"))
+    // The host number becomes the LAST GROUP of the IPv6 address, and the
+    // address is written the way IPv6 writes it -- in hex. The box computes
+    // the same address the same way, so the two ends agree without telling
+    // each other anything: "10.77.0.10" is "fd77::a", NOT "fd77::10".
+    let address = Ipv6Addr::new(0xfd77, 0, 0, 0, 0, 0, 0, u16::from(host));
+    Some(format!("{address}/{IPV6_PREFIX_LEN}"))
 }
 
 impl Default for TunConfig {
@@ -282,7 +290,26 @@ mod tests {
         // The box's own address follows the same rule.
         assert_eq!(
             derive_ipv6_addr("10.77.0.254/24").as_deref(),
-            Some("fd77::254/64")
+            Some("fd77::fe/64")
+        );
+    }
+
+    /// The last group of an IPv6 address is hex, not decimal: the client
+    /// and the box must write the SAME address, or the box drops the
+    /// client's IPv6 packets as coming from a stranger.
+    #[test]
+    fn the_host_number_is_written_in_hex() {
+        assert_eq!(
+            derive_ipv6_addr("10.77.0.10/24").as_deref(),
+            Some("fd77::a/64")
+        );
+        assert_eq!(
+            derive_ipv6_addr("10.77.0.16/24").as_deref(),
+            Some("fd77::10/64")
+        );
+        assert_eq!(
+            derive_ipv6_addr("10.77.0.253/24").as_deref(),
+            Some("fd77::fd/64")
         );
     }
 
