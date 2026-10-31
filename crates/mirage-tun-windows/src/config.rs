@@ -64,6 +64,39 @@ pub struct TunConfig {
     /// set to a less distinctive string at deploy time.
     #[serde(default = "default_tunnel_type")]
     pub tunnel_type: String,
+    /// Datapath mode.
+    ///
+    /// `"stack"` (default) terminates TCP/UDP in userspace and hands byte
+    /// streams to the client over a SOCKS5 proxy.  `"raw_ip"` forwards whole
+    /// IP packets to the client: the client tunnels them over QUIC and the
+    /// box is a plain L3 forwarder.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Adapter MTU in bytes.
+    ///
+    /// Applied to the Wintun interface with `netsh`.  In raw-IP mode a
+    /// packet larger than this is dropped - it cannot fit into a QUIC
+    /// datagram on the far side.
+    #[serde(default = "default_mtu")]
+    pub mtu: u16,
+    /// Direct-egress bypass list.
+    ///
+    /// Not applied in raw-IP mode: there the box is a full L3 exit, so
+    /// nothing is bypassed.  The runner logs one warning at startup when
+    /// the list is not empty.
+    #[serde(default)]
+    pub bypass: BypassConfig,
+}
+
+/// Direct-egress bypass list (`bypass` object in tun.json).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BypassConfig {
+    /// CIDRs that must not enter the tunnel.
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+    /// Domains that must not enter the tunnel.
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 fn default_api_bind() -> SocketAddr {
@@ -114,6 +147,14 @@ fn default_tunnel_type() -> String {
     "Mirage".to_owned()
 }
 
+fn default_mode() -> String {
+    "stack".to_owned()
+}
+
+fn default_mtu() -> u16 {
+    1500
+}
+
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
@@ -134,11 +175,19 @@ impl Default for TunConfig {
             tcp_recv_buffer_size: default_tcp_recv_buffer_size(),
             direct_dns: None,
             tunnel_type: default_tunnel_type(),
+            mode: default_mode(),
+            mtu: default_mtu(),
+            bypass: BypassConfig::default(),
         }
     }
 }
 
 impl TunConfig {
+    /// True when the raw-IP datapath is selected.
+    pub fn is_raw_ip(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("raw_ip")
+    }
+
     /// Load from a JSON object that may contain a `"config"` key.
     /// If the file is absent or the key is missing, defaults are used.
     pub fn load_from_tun_json(path: &std::path::Path) -> Self {

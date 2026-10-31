@@ -9,13 +9,17 @@ use tokio::sync::RwLock;
 
 /// Transport protocol used by a chain.
 ///
-/// Only `Socks5` is implemented; other variants are recognised in config
-/// but will return an error at connection time.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+/// `Socks5` is the legacy byte-stream protocol: the TUN terminates TCP/UDP
+/// in userspace and hands byte streams to the client over a SOCKS5 proxy.
+/// `RawIp` carries whole IP packets: the TUN forwards them to the client
+/// untouched, the client tunnels them over QUIC and the box is a plain L3
+/// forwarder.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChainProtocol {
     #[default]
     Socks5,
+    RawIp,
 }
 
 /// Single chain configuration as sent in JSON.
@@ -43,6 +47,19 @@ pub struct ChainEntry {
     pub dns_upstream: Option<SocketAddr>,
 }
 
+/// A chain entry together with its transport protocol.
+///
+/// The protocol lives beside the entry rather than inside `ChainEntry` so
+/// the entry struct stays source-compatible for the platform crates that
+/// build it by hand.
+#[derive(Debug, Clone)]
+pub struct ResolvedChain {
+    /// The resolved chain entry.
+    pub entry: ChainEntry,
+    /// Transport protocol spoken by the chain.
+    pub protocol: ChainProtocol,
+}
+
 /// Resolved map: chain name → ChainEntry.
 pub type ChainMap = HashMap<String, ChainEntry>;
 
@@ -56,6 +73,11 @@ pub struct ChainRegistry {
     map: RwLock<Arc<ChainMap>>,
     /// Ordered chain names (insertion order from `/chains/update`).
     ordered: RwLock<Vec<String>>,
+    /// Transport protocol per chain id.
+    ///
+    /// Kept in a side map so `ChainEntry` stays source-compatible for the
+    /// platform crates that construct it by hand.
+    protocols: RwLock<HashMap<String, ChainProtocol>>,
 }
 
 impl ChainRegistry {
@@ -64,6 +86,7 @@ impl ChainRegistry {
     pub fn new(configs: Vec<ChainConfig>) -> Self {
         let mut map = ChainMap::new();
         let mut ordered = Vec::with_capacity(configs.len());
+        let mut protocols = HashMap::with_capacity(configs.len());
         for cfg in configs {
             match cfg.socks5_addr.parse::<SocketAddr>() {
                 Ok(socks5_addr) => {
@@ -77,6 +100,7 @@ impl ChainRegistry {
                         }).ok()
                     });
                     ordered.push(cfg.name.clone());
+                    protocols.insert(cfg.name.clone(), cfg.protocol.clone());
                     map.insert(cfg.name.clone(), ChainEntry { chain_id: cfg.name, socks5_addr, dns_upstream });
                 }
                 Err(e) => {
@@ -91,6 +115,7 @@ impl ChainRegistry {
         Self {
             map: RwLock::new(Arc::new(map)),
             ordered: RwLock::new(ordered),
+            protocols: RwLock::new(protocols),
         }
     }
 
@@ -99,6 +124,7 @@ impl ChainRegistry {
         Self {
             map: RwLock::new(Arc::new(ChainMap::new())),
             ordered: RwLock::new(Vec::new()),
+            protocols: RwLock::new(HashMap::new()),
         }
     }
 
@@ -112,11 +138,49 @@ impl ChainRegistry {
         self.ordered.read().await.clone()
     }
 
+    /// Transport protocol of a chain. Unknown chains default to `Socks5`.
+    pub async fn protocol_for(&self, chain_id: &str) -> ChainProtocol {
+        self.protocols.read().await.get(chain_id).cloned().unwrap_or_default()
+    }
+
+    /// Chain entries with their transport protocol, in priority order.
+    ///
+    /// The order matches `ordered_names` (config/supervisor priority); chains
+    /// that are not in the ordered list are appended.
+    pub async fn resolved_snapshot(&self) -> Vec<ResolvedChain> {
+        let snap = self.map.read().await.clone();
+        let ordered = self.ordered.read().await.clone();
+        let protocols = self.protocols.read().await.clone();
+
+        let mut out = Vec::with_capacity(snap.len());
+        for name in &ordered {
+            if let Some(entry) = snap.get(name) {
+                out.push(ResolvedChain {
+                    entry: entry.clone(),
+                    protocol: protocols.get(name).cloned().unwrap_or_default(),
+                });
+            }
+        }
+        for (name, entry) in snap.iter() {
+            if !ordered.contains(name) {
+                out.push(ResolvedChain {
+                    entry: entry.clone(),
+                    protocol: protocols.get(name).cloned().unwrap_or_default(),
+                });
+            }
+        }
+        out
+    }
+
     /// Replace the entire map atomically, preserving insertion order.
     ///
     /// `new_map` keys are reordered to match the original insertion order
     /// of `new_ordered`. Any key in `new_map` not present in `new_ordered`
     /// is appended at the end.
+    ///
+    /// Protocol markings survive the update: a chain that keeps its id keeps
+    /// its protocol, a new chain starts as `Socks5`. Use
+    /// [`ChainRegistry::update_with_protocols`] to change the markings.
     pub async fn update(&self, new_map: ChainMap) {
         // Derive ordering from current map's insertion order, extended with
         // any new keys.
@@ -141,12 +205,40 @@ impl ChainRegistry {
         let mut ord_guard = self.ordered.write().await;
         *map_guard = Arc::new(new_map);
         *ord_guard = new_ordered;
+
+        // Keep the protocol markings of the chains that survived the update.
+        let mut prot_guard = self.protocols.write().await;
+        let mut new_protocols = HashMap::with_capacity(map_guard.len());
+        for name in map_guard.keys() {
+            let protocol = prot_guard.get(name).cloned().unwrap_or_default();
+            new_protocols.insert(name.clone(), protocol);
+        }
+        *prot_guard = new_protocols;
+    }
+
+    /// Replace the map and the protocol markings in one shot.
+    ///
+    /// Chains that are not listed in `protocols` keep their current marking
+    /// (or fall back to `Socks5`).
+    pub async fn update_with_protocols(
+        &self,
+        new_map: ChainMap,
+        protocols: HashMap<String, ChainProtocol>,
+    ) {
+        self.update(new_map).await;
+        let mut prot_guard = self.protocols.write().await;
+        for (name, protocol) in protocols {
+            if prot_guard.contains_key(&name) {
+                prot_guard.insert(name, protocol);
+            }
+        }
     }
 
     /// Update from an ordered list of configs (preserves config-file order).
     pub async fn update_ordered(&self, configs: Vec<ChainConfig>) {
         let mut map = ChainMap::new();
         let mut ordered = Vec::with_capacity(configs.len());
+        let mut protocols = HashMap::with_capacity(configs.len());
         for cfg in configs {
             match cfg.socks5_addr.parse::<SocketAddr>() {
                 Ok(socks5_addr) => {
@@ -154,6 +246,7 @@ impl ChainRegistry {
                         d.parse::<SocketAddr>().ok()
                     });
                     ordered.push(cfg.name.clone());
+                    protocols.insert(cfg.name.clone(), cfg.protocol.clone());
                     map.insert(cfg.name.clone(), ChainEntry { chain_id: cfg.name, socks5_addr, dns_upstream });
                 }
                 Err(_) => {}
@@ -161,20 +254,21 @@ impl ChainRegistry {
         }
         let mut map_guard = self.map.write().await;
         let mut ord_guard = self.ordered.write().await;
+        let mut prot_guard = self.protocols.write().await;
         *map_guard = Arc::new(map);
         *ord_guard = ordered;
+        *prot_guard = protocols;
     }
 
     /// Reconstruct Vec<ChainConfig> from current map (for API responses).
     pub async fn to_configs(&self) -> Vec<ChainConfig> {
-        self.map
-            .read()
-            .await
-            .iter()
+        let map = self.map.read().await;
+        let protocols = self.protocols.read().await;
+        map.iter()
             .map(|(name, entry)| ChainConfig {
                 name: name.clone(),
                 socks5_addr: entry.socks5_addr.to_string(),
-                protocol: ChainProtocol::Socks5,
+                protocol: protocols.get(name).cloned().unwrap_or_default(),
                 dns_upstream: entry.dns_upstream.map(|a| a.to_string()),
             })
             .collect()

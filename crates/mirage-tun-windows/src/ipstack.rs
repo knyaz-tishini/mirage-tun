@@ -948,7 +948,7 @@ async fn socks5_connect_with_semaphore(
 // ── Interface-bound TCP connect ───────────────────────────────────────────────
 
 #[cfg(windows)]
-async fn connect_via_interface(
+pub(crate) async fn connect_via_interface(
     remote: SocketAddr,
     if_index: u32,
 ) -> std::io::Result<TcpStream> {
@@ -965,7 +965,7 @@ async fn connect_via_interface(
 }
 
 #[cfg(not(windows))]
-async fn connect_via_interface(
+pub(crate) async fn connect_via_interface(
     remote: SocketAddr,
     _if_index: u32,
 ) -> std::io::Result<TcpStream> {

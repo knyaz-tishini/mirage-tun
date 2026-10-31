@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::net::{IpAddr, SocketAddr};
 use axum::{
@@ -22,8 +23,12 @@ use crate::config::TunConfig;
 use crate::error::TunError;
 use crate::ipstack::IpStackRunner;
 use crate::metrics::MetricsRegistry;
+use crate::rawip::RawIpRunner;
 use crate::routing::Routing;
 use crate::state::{ServiceState, TunPhase};
+
+/// DNS server used in raw-IP mode when the configured upstream is unusable.
+const FALLBACK_DNS: &str = "1.1.1.1";
 
 #[derive(Serialize, Deserialize)]
 pub struct TunStartParams {
@@ -239,7 +244,19 @@ pub async fn activate_tun_inner(
 
     // Point adapter DNS at the configured upstream so Windows sends DNS queries
     // into TUN (our udp_dns_loop intercepts them and forwards via SOCKS5).
-    let dns_ip = state.config.dns_upstream.ip().to_string();
+    //
+    // In raw-IP mode DNS leaves as an ordinary UDP packet, so the adapter
+    // needs a resolver that is reachable through the tunnel.
+    let raw_ip_mode = state.config.is_raw_ip();
+    let dns_ip = if raw_ip_mode && !is_usable_dns(state.config.dns_upstream) {
+        warn!(
+            "raw_ip mode: dns_upstream {} is not usable - using {FALLBACK_DNS}",
+            state.config.dns_upstream
+        );
+        FALLBACK_DNS.to_owned()
+    } else {
+        state.config.dns_upstream.ip().to_string()
+    };
     let _ = tokio::process::Command::new("netsh")
         .args(["interface", "ip", "set", "dns", &tun_name, "static", &dns_ip])
         .output()
@@ -273,6 +290,18 @@ pub async fn activate_tun_inner(
         .as_ref()
         .map(|p| p.bypass_cidrs_v6())
         .unwrap_or_default();
+
+    // In raw-IP mode the box is a full L3 exit: bypass CIDRs have nothing
+    // to bypass.  Warn once at startup and continue.
+    if raw_ip_mode {
+        let cfg_bypass = state.config.bypass.cidrs.len();
+        let policy_bypass = bypass_cidrs_for_wfp.len() + bypass_cidrs_v6_for_wfp.len();
+        if cfg_bypass + policy_bypass > 0 {
+            warn!(
+                "raw_ip mode: bypass CIDRs are not applied (config={cfg_bypass}, policy={policy_bypass}) - the box is a full L3 exit"
+            );
+        }
+    }
 
     // Activate WFP kill-switch (needs if_index for native bypass permit).
     // TUN interface index was resolved via spawn_blocking before taking the mutex.
@@ -308,27 +337,45 @@ pub async fn activate_tun_inner(
         let dns_upstream = c.dns_upstream.as_ref().and_then(|d| d.parse::<SocketAddr>().ok());
         Some((c.name.clone(), ChainEntry { chain_id: c.name.clone(), socks5_addr, dns_upstream }))
     }).collect();
-    state.chains.update(new_map).await;
+    let protocols: HashMap<String, ChainProtocol> = chain_configs
+        .iter()
+        .map(|c| (c.name.clone(), c.protocol.clone()))
+        .collect();
+    state.chains.update_with_protocols(new_map, protocols).await;
 
     let bypass_addrs_store = relay_ips.clone();
-    let device = crate::wintun::WintunDevice::new(s.wintun.as_ref().unwrap());
-    let runner = IpStackRunner::start(
-        device,
-        Arc::clone(&state.chains),
-        cancel.clone(),
-        relay_ips,
-        if_index,
-        Arc::clone(&state.policy),
-        Arc::clone(&state.dns_map),
-        native_dns,
-        process_resolver,
-        Arc::clone(&state.metrics),
-        Arc::clone(&state.connections),
-        &state.config,
-    )
-    .await?;
-
-    s.active_conns = Some(runner.active_conns);
+    let wintun = s.wintun.as_ref().ok_or(TunError::AdapterNotReady)?;
+    let device = crate::wintun::WintunDevice::new(wintun);
+    if raw_ip_mode {
+        // Raw-IP mode: whole IP packets go to the client and come back the
+        // same way.  Nothing is terminated on this side.
+        let runner = RawIpRunner::start(
+            device,
+            Arc::clone(&state.chains),
+            cancel.clone(),
+            if_index,
+            &state.config,
+        )
+        .await?;
+        s.active_conns = Some(runner.active_conns);
+    } else {
+        let runner = IpStackRunner::start(
+            device,
+            Arc::clone(&state.chains),
+            cancel.clone(),
+            relay_ips,
+            if_index,
+            Arc::clone(&state.policy),
+            Arc::clone(&state.dns_map),
+            native_dns,
+            process_resolver,
+            Arc::clone(&state.metrics),
+            Arc::clone(&state.connections),
+            &state.config,
+        )
+        .await?;
+        s.active_conns = Some(runner.active_conns);
+    }
     s.drain_timeout_secs = state.config.drain_timeout_secs;
     s.dns_upstream = state.config.dns_upstream;
     s.ipstack_cancel = Some(cancel);
@@ -541,14 +588,24 @@ async fn post_chains_update(
         let dns_upstream = c.dns_upstream.as_ref().and_then(|d| d.parse::<SocketAddr>().ok());
         Some((c.name.clone(), ChainEntry { chain_id: c.name.clone(), socks5_addr, dns_upstream }))
     }).collect();
+    let protocols: HashMap<String, ChainProtocol> = params
+        .chains
+        .iter()
+        .map(|c| (c.name.clone(), c.protocol.clone()))
+        .collect();
 
     let count = new_map.len();
-    state.chains.update(new_map).await;
+    state.chains.update_with_protocols(new_map, protocols).await;
     info!("Chains updated via API: {count} chains");
 
     // Best-effort persist — failure is logged inside, never fails the response.
     crate::service::save_chains_to_config(&params.chains);
     StatusCode::OK
+}
+
+/// True when the address can be used as a DNS server.
+fn is_usable_dns(addr: SocketAddr) -> bool {
+    !addr.ip().is_unspecified() && addr.port() != 0
 }
 
 async fn discover_native_dns(if_index: u32) -> Option<SocketAddr> {

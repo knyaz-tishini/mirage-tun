@@ -9,6 +9,7 @@ pub mod ipstack;
 pub mod metrics;
 pub mod process_info;
 pub mod proxy;
+pub mod rawip;
 pub mod routing;
 pub mod runtime_guard;
 pub mod service;

@@ -14,8 +14,6 @@ use crate::routing::cleanup_stale_routes;
 
 static STOP_TX: OnceLock<watch::Sender<()>> = OnceLock::new();
 
-const TUN_MTU: u16 = 1500;
-
 pub(crate) fn find_config() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         let beside_exe = exe
@@ -207,6 +205,8 @@ pub async fn run_service_logic(
     let tun_name = tun_cfg.tun_name.clone();
     let tun_addr = tun_cfg.tun_addr.clone();
     let api_bind = tun_cfg.api_bind;
+    let tun_mtu = tun_cfg.mtu;
+    info!("TUN mode: {}, mtu={tun_mtu}", tun_cfg.mode);
 
     // ── Memory guard ──────────────────────────────────────────────────────────
     // TUN runs as a Windows service; on fatal pressure exit(0) so the SCM /
@@ -223,7 +223,7 @@ pub async fn run_service_logic(
     cleanup_stale_routes(&tun_name).await;
     crate::proxy::clear_system_proxy().await;
 
-    let wintun = match WintunHandle::create(&tun_name, &tun_addr, tun_cfg.tun_addr_v6.as_deref(), TUN_MTU, Some(&tun_cfg.tunnel_type)).await {
+    let wintun = match WintunHandle::create(&tun_name, &tun_addr, tun_cfg.tun_addr_v6.as_deref(), tun_mtu, Some(&tun_cfg.tunnel_type)).await {
         Ok(w) => {
             info!("Wintun adapter '{tun_name}' ready");
             Some(w)
