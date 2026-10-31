@@ -262,8 +262,40 @@ pub async fn activate_tun_inner(
         .output()
         .await;
 
+    // The adapter's IPv6 address: the tunnel carries whole IP packets, so
+    // the host's IPv6 has to ride it as well.  The address is the one the
+    // config names, or the one derived from the IPv4 address
+    // (10.77.0.N -> fd77::N/64).
+    //
+    // Only the raw-IP mode forwards packets at L3: in the stack mode the
+    // userspace TCP/IP stack terminates IPv4 alone, and IPv6 handed to it
+    // would be dropped on the way.
+    let ipv6_addr = tunnel_ipv6_addr(state.config.as_ref());
+    let mut ipv6_enabled = false;
+    if let Some(addr) = ipv6_addr.as_deref() {
+        let name = tun_name.clone();
+        let addr_cidr = addr.to_owned();
+        let assigned = tokio::task::spawn_blocking(move || {
+            crate::wintun::assign_ipv6_address(&name, &addr_cidr)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(TunError::Wintun(format!("spawn_blocking panicked: {e}")))
+        });
+        match assigned {
+            Ok(()) => {
+                ipv6_enabled = true;
+                info!(addr = %addr, "activate: IPv6 address assigned");
+            }
+            Err(e) => warn!("activate: IPv6 address {addr} was not assigned: {e}"),
+        }
+    }
+
     // Routes AFTER adapter exists — otherwise they vanish with destroyed interface
     let mut routing = Routing::new(&tun_name);
+    // The IPv6 half-routes go in only when the adapter has an IPv6 address:
+    // a route into an adapter without one would black-hole the host's IPv6.
+    routing.set_ipv6_enabled(ipv6_enabled);
     routing.set_default_route().await?;
     info!("activate: set_default_route = {}ms", t0.elapsed().as_millis());
 
@@ -470,9 +502,40 @@ async fn post_tun_stop(
                 .output(),
             tokio::process::Command::new("netsh")
                 .args(["interface", "ipv4", "delete", "route", "128.0.0.0/1", &iface, "store=active"])
-                .output()
+                .output(),
         );
         s.tun_default_set = false;
+    }
+
+    // The IPv6 half-routes go with the IPv4 ones: a route left behind
+    // would point the host's IPv6 into an adapter that no longer carries
+    // an IPv6 address.  The IPv6 address of the adapter goes with the
+    // routes: an address left behind would make the host pick it as the
+    // source of traffic that has nowhere to go.
+    if let Some(addr) = tunnel_ipv6_addr(state.config.as_ref()) {
+        let iface = format!("interface={tun_name}");
+        let (_, _) = tokio::join!(
+            tokio::process::Command::new("netsh")
+                .args(["interface", "ipv6", "delete", "route", "::/1", &iface, "store=active"])
+                .output(),
+            tokio::process::Command::new("netsh")
+                .args(["interface", "ipv6", "delete", "route", "8000::/1", &iface, "store=active"])
+                .output(),
+        );
+
+        let name = tun_name.clone();
+        let addr_cidr = addr.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            crate::wintun::remove_ipv6_address(&name, &addr_cidr)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(TunError::Wintun(format!("spawn_blocking panicked: {e}")))
+        });
+        match removed {
+            Ok(()) => info!(addr = %addr, "TUN stop: IPv6 address removed"),
+            Err(e) => warn!("TUN stop: IPv6 address {addr} was not removed: {e}"),
+        }
     }
 
     // Remove bypass routes — use same netsh family as add_bypass in routing.rs
@@ -606,6 +669,20 @@ async fn post_chains_update(
 /// True when the address can be used as a DNS server.
 fn is_usable_dns(addr: SocketAddr) -> bool {
     !addr.ip().is_unspecified() && addr.port() != 0
+}
+
+/// The IPv6 address the adapter must carry, if any.
+///
+/// Only the raw-IP mode forwards packets at L3: in the stack mode the
+/// userspace TCP/IP stack terminates IPv4 alone, and an IPv6 address on
+/// the adapter would pull the host's IPv6 into a stack that cannot carry
+/// it.  The address is the one the config names explicitly, or the one
+/// derived from the IPv4 address of the tunnel (10.77.0.N -> fd77::N/64).
+fn tunnel_ipv6_addr(config: &TunConfig) -> Option<String> {
+    if !config.is_raw_ip() {
+        return None;
+    }
+    config.effective_ipv6_addr()
 }
 
 async fn discover_native_dns(if_index: u32) -> Option<SocketAddr> {

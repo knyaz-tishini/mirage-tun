@@ -147,6 +147,10 @@ pub struct RawIpStats {
     pub malformed: AtomicU64,
     /// Reconnect attempts after a broken socket.
     pub reconnects: AtomicU64,
+    /// Writes into the Wintun adapter that failed.
+    pub write_errors: AtomicU64,
+    /// Socket reads and writes that failed.
+    pub io_errors: AtomicU64,
 }
 
 /// Raw-IP runner: forwards whole IP packets between Wintun and the client.
@@ -215,12 +219,14 @@ impl RawIpRunner {
                     _ = tokio::time::sleep(STATS_INTERVAL) => {
                         let s = &stats3;
                         info!(
-                            "rawip stats: to_client={} from_client={} dropped_oversize={} malformed={} reconnects={}",
+                            "rawip stats: to_client={} from_client={} dropped_oversize={} malformed={} reconnects={} write_errors={} io_errors={}",
                             s.to_client.load(Ordering::Relaxed),
                             s.from_client.load(Ordering::Relaxed),
                             s.dropped_oversize.load(Ordering::Relaxed),
                             s.malformed.load(Ordering::Relaxed),
                             s.reconnects.load(Ordering::Relaxed),
+                            s.write_errors.load(Ordering::Relaxed),
+                            s.io_errors.load(Ordering::Relaxed),
                         );
                     }
                 }
@@ -458,8 +464,16 @@ async fn pump_wintun_to_socket(
             continue;
         }
         let frame = encode_frame(&packet);
-        writer.write_all(&frame).await?;
-        writer.flush().await?;
+        if let Err(e) = writer.write_all(&frame).await {
+            stats.io_errors.fetch_add(1, Ordering::Relaxed);
+            warn!(error = %e, "rawip: the socket write failed");
+            return Err(e);
+        }
+        if let Err(e) = writer.flush().await {
+            stats.io_errors.fetch_add(1, Ordering::Relaxed);
+            warn!(error = %e, "rawip: the socket flush failed");
+            return Err(e);
+        }
         stats.to_client.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
@@ -474,10 +488,20 @@ async fn pump_socket_to_wintun(
 ) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(4096);
     loop {
-        match read_frame(reader, &mut buf, mtu).await? {
+        let frame = match read_frame(reader, &mut buf, mtu).await {
+            Ok(frame) => frame,
+            Err(e) => {
+                stats.io_errors.fetch_add(1, Ordering::Relaxed);
+                warn!(error = %e, "rawip: the socket read failed");
+                return Err(e);
+            }
+        };
+        match frame {
             Some(Frame::Packet(packet)) => {
                 stats.from_client.fetch_add(1, Ordering::Relaxed);
                 if wintun_tx.send(packet).await.is_err() {
+                    stats.write_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!("rawip: the wintun adapter refused the packet");
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "wintun tx channel closed",

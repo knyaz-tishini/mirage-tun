@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunConfig {
@@ -13,6 +13,13 @@ pub struct TunConfig {
     /// None = v4-only (backward-compat default).
     #[serde(default)]
     pub tun_addr_v6: Option<String>,
+    /// Optional IPv6 address for the TUN interface, in CIDR form.
+    ///
+    /// This is the canonical name; [`TunConfig::tun_addr_v6`] is the older
+    /// spelling and is still honoured.  When neither is set, the address is
+    /// derived from `tun_addr` by [`derive_ipv6_addr`].
+    #[serde(default)]
+    pub ipv6_addr: Option<String>,
     #[serde(default = "default_dns_upstream")]
     pub dns_upstream: SocketAddr,
     #[serde(default = "default_dns_cache_ttl_secs")]
@@ -155,6 +162,45 @@ fn default_mtu() -> u16 {
     1500
 }
 
+/// The IPv6 prefix of the tunnel network: `fd77::/64`.
+///
+/// The tunnel carries whole IP packets, so the client gets an address in
+/// this network and the box masquerades it (NAT66) towards the internet.
+pub const IPV6_PREFIX: &str = "fd77::";
+
+/// The prefix length of the tunnel's IPv6 network.
+pub const IPV6_PREFIX_LEN: u8 = 64;
+
+/// Derive the IPv6 address of the tunnel from its IPv4 address.
+///
+/// The rule is fixed and shared with the box side: the IPv4 address
+/// `10.77.0.N` becomes the IPv6 address `fd77::N/64`.  The last octet of
+/// the IPv4 address is the host number; everything else is fixed.
+///
+/// Returns `None` when `tun_addr` is not a usable IPv4 address in CIDR
+/// form, or when its host number does not fit the rule.
+pub fn derive_ipv6_addr(tun_addr: &str) -> Option<String> {
+    let (addr_str, prefix_str) = tun_addr.split_once('/')?;
+    // The IPv4 side must be a well-formed CIDR: the prefix is not used, but
+    // an address the adapter cannot take has no derived address either.
+    let prefix: u8 = prefix_str.trim().parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let v4: Ipv4Addr = addr_str.trim().parse().ok()?;
+    let octets = v4.octets();
+    // The rule only covers the tunnel's own IPv4 network 10.77.0.0/24.
+    if octets[0] != 10 || octets[1] != 77 || octets[2] != 0 {
+        return None;
+    }
+    let host = octets[3];
+    // 10.77.0.0 (network) and 10.77.0.255 (broadcast) are not hosts.
+    if host == 0 || host == 255 {
+        return None;
+    }
+    Some(format!("{IPV6_PREFIX}{host}/{IPV6_PREFIX_LEN}"))
+}
+
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
@@ -162,6 +208,7 @@ impl Default for TunConfig {
             tun_name: default_tun_name(),
             tun_addr: default_tun_addr(),
             tun_addr_v6: None,
+            ipv6_addr: None,
             dns_upstream: default_dns_upstream(),
             dns_cache_ttl_secs: default_dns_cache_ttl_secs(),
             dns_cache_max: default_dns_cache_max(),
@@ -188,6 +235,19 @@ impl TunConfig {
         self.mode.eq_ignore_ascii_case("raw_ip")
     }
 
+    /// The IPv6 address the TUN interface must carry, if any.
+    ///
+    /// The explicit [`TunConfig::ipv6_addr`] wins, then the legacy
+    /// [`TunConfig::tun_addr_v6`], and finally the address derived from
+    /// `tun_addr` by [`derive_ipv6_addr`].  `None` means the adapter stays
+    /// IPv4-only.
+    pub fn effective_ipv6_addr(&self) -> Option<String> {
+        self.ipv6_addr
+            .clone()
+            .or_else(|| self.tun_addr_v6.clone())
+            .or_else(|| derive_ipv6_addr(&self.tun_addr))
+    }
+
     /// Load from a JSON object that may contain a `"config"` key.
     /// If the file is absent or the key is missing, defaults are used.
     pub fn load_from_tun_json(path: &std::path::Path) -> Self {
@@ -200,5 +260,76 @@ impl TunConfig {
         // Support both top-level config fields and a nested `"config"` object.
         let cfg_value = obj.get("config").cloned().unwrap_or(obj);
         serde_json::from_value(cfg_value).unwrap_or_default()
+    }
+}
+
+// --- Tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tunnel_address_becomes_fd77() {
+        assert_eq!(
+            derive_ipv6_addr("10.77.0.7/24").as_deref(),
+            Some("fd77::7/64")
+        );
+        assert_eq!(
+            derive_ipv6_addr("10.77.0.2/24").as_deref(),
+            Some("fd77::2/64")
+        );
+        // The box's own address follows the same rule.
+        assert_eq!(
+            derive_ipv6_addr("10.77.0.254/24").as_deref(),
+            Some("fd77::254/64")
+        );
+    }
+
+    #[test]
+    fn an_address_outside_the_tunnel_network_derives_nothing() {
+        assert_eq!(derive_ipv6_addr("10.0.85.1/24"), None);
+        assert_eq!(derive_ipv6_addr("192.168.1.5/24"), None);
+        assert_eq!(derive_ipv6_addr("fd00::1/64"), None);
+    }
+
+    #[test]
+    fn a_malformed_address_derives_nothing() {
+        assert_eq!(derive_ipv6_addr(""), None);
+        assert_eq!(derive_ipv6_addr("10.77.0.7"), None);
+        assert_eq!(derive_ipv6_addr("not-an-address/24"), None);
+        assert_eq!(derive_ipv6_addr("10.77.0.7/"), None);
+        assert_eq!(derive_ipv6_addr("10.77.0.7/x"), None);
+        assert_eq!(derive_ipv6_addr("10.77.0.7/64"), None);
+    }
+
+    #[test]
+    fn the_network_and_broadcast_addresses_derive_nothing() {
+        assert_eq!(derive_ipv6_addr("10.77.0.0/24"), None);
+        assert_eq!(derive_ipv6_addr("10.77.0.255/24"), None);
+    }
+
+    #[test]
+    fn the_explicit_address_wins_over_the_derived_one() {
+        let mut cfg = TunConfig {
+            tun_addr: "10.77.0.7/24".to_owned(),
+            ..Default::default()
+        };
+        // With nothing set the address is derived.
+        assert_eq!(cfg.effective_ipv6_addr().as_deref(), Some("fd77::7/64"));
+
+        // An explicit address wins.
+        cfg.ipv6_addr = Some("fd77::99/64".to_owned());
+        assert_eq!(cfg.effective_ipv6_addr().as_deref(), Some("fd77::99/64"));
+    }
+
+    #[test]
+    fn the_legacy_field_is_still_honoured() {
+        let cfg = TunConfig {
+            tun_addr: "10.77.0.7/24".to_owned(),
+            tun_addr_v6: Some("fd00:7::2/64".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_ipv6_addr().as_deref(), Some("fd00:7::2/64"));
     }
 }

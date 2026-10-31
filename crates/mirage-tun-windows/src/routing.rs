@@ -11,6 +11,12 @@ pub struct Routing {
     bypass_v6_routes: Vec<String>,
     tun_default_set: bool,
     tun_v6_default_set: bool,
+    /// Whether the adapter carries an IPv6 address of its own.
+    ///
+    /// The IPv6 half-routes point the host's IPv6 into the adapter, so
+    /// they belong only to an adapter that has an IPv6 address: a route
+    /// into an adapter without one would black-hole that traffic.
+    ipv6_enabled: bool,
     tun_name: String,
 }
 
@@ -25,8 +31,14 @@ impl Routing {
             bypass_v6_routes: Vec::new(),
             tun_default_set: false,
             tun_v6_default_set: false,
+            ipv6_enabled: false,
             tun_name: tun_name.into(),
         }
+    }
+
+    /// Say whether the adapter carries an IPv6 address.
+    pub fn set_ipv6_enabled(&mut self, enabled: bool) {
+        self.ipv6_enabled = enabled;
     }
 
     pub fn original_gateway(&self) -> Option<&str> {
@@ -86,8 +98,11 @@ impl Routing {
         self.tun_default_set = true;
         info!(tun_name, "Routing: IPv4 default route set via TUN");
 
-        // IPv6 half-routes (best-effort — no error if v6 not available)
-        if self.original_v6_gateway.is_some() || self.original_v6_interface_idx.is_some() {
+        // IPv6 half-routes (best-effort - the host may have no IPv6 at all).
+        // They go in only when the adapter carries an IPv6 address: a
+        // route into an adapter without one would black-hole the host's
+        // IPv6.  route.exe has no IPv6 mode, so netsh is the only way.
+        if self.ipv6_enabled {
             let args2 = ["interface", "ipv6", "add", "route", "::/1", iface.as_str(), "metric=1", "store=active"];
             let args3 = ["interface", "ipv6", "add", "route", "8000::/1", iface.as_str(), "metric=1", "store=active"];
             match tokio::try_join!(run_netsh_route(&args2), run_netsh_route(&args3)) {
@@ -95,8 +110,12 @@ impl Routing {
                     self.tun_v6_default_set = true;
                     info!(tun_name, "Routing: IPv6 default route set via TUN");
                 }
-                Err(e) => warn!("Routing: IPv6 default route failed (non-fatal): {e}"),
+                Err(e) => warn!(
+                    "Routing: IPv6 default route via TUN failed (non-fatal, the host keeps its native IPv6 routes): {e}"
+                ),
             }
+        } else {
+            debug!("Routing: IPv6 half-routes skipped - the adapter carries no IPv6 address");
         }
 
         Ok(())

@@ -460,7 +460,7 @@ fn prefix_to_netmask(prefix_len: u8) -> String {
 }
 
 fn assign_ip6_address(tun_name: &str, tun_addr_v6: &str) -> Result<()> {
-    // tun_addr_v6 is "fd00:7::2/64" — split into addr + prefix.
+    // tun_addr_v6 is "fd77::7/64" - split into addr + prefix.
     let (addr_str, prefix_str) = tun_addr_v6
         .split_once('/')
         .ok_or_else(|| TunError::Wintun(format!(
@@ -477,6 +477,59 @@ fn assign_ip6_address(tun_name: &str, tun_addr_v6: &str) -> Result<()> {
     Ok(())
 }
 
+/// Set the IPv6 address of the adapter.
+///
+/// The address is given in CIDR form ("fd77::7/64").  The command is
+/// `netsh interface ipv6 add address <name> <addr>/<prefix>`: the prefix
+/// length rides on the address itself, and the interface is named
+/// positionally - `name=` is not a valid argument for this command.
+///
+/// An address that is already there is removed first, so the call is
+/// idempotent: the same address can be set again after the tunnel stopped
+/// and started.
+pub fn assign_ipv6_address(tun_name: &str, addr_cidr: &str) -> Result<()> {
+    let (addr_str, prefix_str) = addr_cidr
+        .split_once('/')
+        .ok_or_else(|| TunError::Wintun(format!(
+            "IPv6 address '{}' is not in CIDR notation",
+            addr_cidr
+        )))?;
+
+    // A leftover address from an earlier run would make the add fail.
+    // Not having one is the normal case, so its failure is not an error.
+    if let Err(e) = remove_ipv6_address(tun_name, addr_str) {
+        debug!(name = tun_name, addr = addr_str, "no IPv6 address to remove: {e}");
+    }
+
+    run_netsh(&[
+        "interface", "ipv6", "add", "address",
+        tun_name, &format!("{addr_str}/{prefix_str}"),
+        "store=persistent",
+    ])?;
+
+    info!(name = tun_name, addr = addr_str, prefix = prefix_str, "IPv6 address assigned");
+    Ok(())
+}
+
+/// Remove the IPv6 address of the adapter.
+///
+/// The address is given in CIDR form ("fd77::7/64"); the delete command
+/// takes the address alone.
+pub fn remove_ipv6_address(tun_name: &str, addr_cidr: &str) -> Result<()> {
+    let addr_str = addr_cidr
+        .split_once('/')
+        .map(|(addr, _prefix)| addr)
+        .unwrap_or(addr_cidr);
+
+    run_netsh(&[
+        "interface", "ipv6", "delete", "address",
+        tun_name, addr_str,
+    ])?;
+
+    info!(name = tun_name, addr = addr_str, "IPv6 address removed");
+    Ok(())
+}
+
 fn run_netsh(args: &[&str]) -> Result<()> {
     let label = format!("netsh {}", args.join(" "));
     debug!(cmd = %label, "WintunHandle: running netsh");
@@ -486,12 +539,14 @@ fn run_netsh(args: &[&str]) -> Result<()> {
         .output()
         .map_err(|e| TunError::Io { source: e })?;
 
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    debug!(cmd = %label, stdout = %stdout, stderr = %stderr, "WintunHandle: netsh finished");
+
     if out.status.success() {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     Err(TunError::Wintun(format!(
         "netsh failed ({label}): {stdout}{stderr}"
     )))
