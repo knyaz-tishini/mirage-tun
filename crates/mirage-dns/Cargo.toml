@@ -1,9 +1,11 @@
 [package]
+license = "MIT"
 name = "mirage-dns"
 version.workspace = true
 edition.workspace = true
 description = "DNS resolver with DoH upstream and TTL-aware cache"
-
+repository = "https://github.com/knyaz-tishini/mirage2tun"
+homepage = "https://github.com/knyaz-tishini/mirage2tun"
 [dependencies]
 lru = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }

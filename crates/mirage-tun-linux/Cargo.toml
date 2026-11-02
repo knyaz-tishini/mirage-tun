@@ -1,8 +1,10 @@
 [package]
+license = "MIT"
 name = "mirage-tun-linux"
 version = "0.1.0"
 edition = "2021"
-
+repository = "https://github.com/knyaz-tishini/mirage2tun"
+homepage = "https://github.com/knyaz-tishini/mirage2tun"
 [[bin]]
 name = "mirage2tun"
 path = "src/bin/mirage2tun.rs"

@@ -1,9 +1,11 @@
 [package]
+license = "MIT"
 name = "mirage-wfp"
 version.workspace = true
 edition.workspace = true
 description = "Windows Filtering Platform (WFP) safe wrapper"
-
+repository = "https://github.com/knyaz-tishini/mirage2tun"
+homepage = "https://github.com/knyaz-tishini/mirage2tun"
 [dependencies]
 tracing = "0.1"
 

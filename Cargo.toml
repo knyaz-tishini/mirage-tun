@@ -19,9 +19,11 @@ exclude = [
 ]
 
 [workspace.package]
+license = "MIT"
 version = "0.1.0"
 edition = "2021"
-
+repository = "https://github.com/knyaz-tishini/mirage2tun"
+homepage = "https://github.com/knyaz-tishini/mirage2tun"
 [profile.release]
 opt-level = 3
 strip = "symbols"

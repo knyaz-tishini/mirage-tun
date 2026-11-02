@@ -14,7 +14,7 @@ description = """
 A netstack for the special purpose of turning packets from/to a TUN interface
 into TCP streams and UDP packets. Self-contained fork of smoltcp-rs.
 """
-homepage = "https://github.com/cavivie/netstack-smoltcp"
+homepage = "https://github.com/knyaz-tishini/mirage2tun"
 documentation = "https://docs.rs/netstack-smoltcp"
 readme = "README.md"
 keywords = [
@@ -25,9 +25,8 @@ keywords = [
     "tun",
 ]
 categories = ["network-programming"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/cavivie/netstack-smoltcp"
-
+license = "MIT"
+repository = "https://github.com/knyaz-tishini/mirage2tun"
 [lib]
 name = "mirage_tcpip_stack"
 path = "src/lib.rs"

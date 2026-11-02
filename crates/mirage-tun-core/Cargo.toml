@@ -1,9 +1,11 @@
 [package]
+license = "MIT"
 name = "mirage-tun-core"
 version.workspace = true
 edition.workspace = true
 description = "TUN device abstractions: traits, NAT table, packet parser"
-
+repository = "https://github.com/knyaz-tishini/mirage2tun"
+homepage = "https://github.com/knyaz-tishini/mirage2tun"
 [dependencies]
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "net", "time"] }

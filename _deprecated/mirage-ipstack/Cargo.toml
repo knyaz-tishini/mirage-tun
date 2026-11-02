@@ -1,9 +1,11 @@
 [package]
+license = "MIT"
 name = "mirage-ipstack"
 version.workspace = true
 edition.workspace = true
 description = "Async userspace TCP/IP stack for TUN devices"
-
+repository = "https://github.com/knyaz-tishini/mirage2tun"
+homepage = "https://github.com/knyaz-tishini/mirage2tun"
 [dependencies]
 ahash = { version = "0.8", default-features = false, features = ["std"] }
 etherparse = { version = "0.19", default-features = false, features = ["std"] }
