@@ -1,0 +1,15 @@
+[package]
+license = "MIT"
+name = "mirage-ipstack"
+version.workspace = true
+edition.workspace = true
+description = "Async userspace TCP/IP stack for TUN devices"
+repository = "https://github.com/knyaz-tishini/mirage-tun"
+homepage = "https://github.com/knyaz-tishini/mirage-tun"
+[dependencies]
+ahash = { version = "0.8", default-features = false, features = ["std"] }
+etherparse = { version = "0.19", default-features = false, features = ["std"] }
+log = { version = "0.4", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["small_rng", "std", "std_rng"] }
+thiserror = { version = "2.0", default-features = false }
+tokio = { version = "1", default-features = false, features = ["sync","rt","time","io-util","macros","rt-multi-thread"] }

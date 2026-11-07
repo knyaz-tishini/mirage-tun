@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mirage-tun-core",
+    "crates/mirage-tun-windows",
+    "crates/mirage-tun-windows/crates/mirage-wfp",
+    "crates/mirage-dns",
+    "crates/mirage-tcpip-stack",
+    "crates/mirage-tun-linux",
+    "crates/mirage-tun-macos",
+    "crates/mirage-tun-android",
+    "crates/mirage-tun-ios",
+]
+# bpf-progs holds the eBPF program as C source (mirage_bpf.c), compiled to a BPF
+# object by mirage-tun-linux/build.rs via `clang -target bpf`. It is NOT a cargo
+# crate; excluded so cargo never tries to treat it as a workspace member.
+exclude = [
+    "crates/mirage-tun-linux/bpf-progs",
+]
+
+[workspace.package]
+license = "MIT"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/knyaz-tishini/mirage-tun"
+homepage = "https://github.com/knyaz-tishini/mirage-tun"
+[profile.release]
+opt-level = 3
+strip = "symbols"

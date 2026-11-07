@@ -1,0 +1,35 @@
+name: cargo-audit
+
+# The audit watches the lockfile: a new advisory in a dependency we already
+# pin is found by the daily run, a change in the lockfile is found at once.
+on:
+  push:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+  schedule:
+    # Daily, at 06:17 UTC -- not on the hour, so the run does not join the
+    # crowd that everyone else schedules for midnight.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # The action writes its findings as a check run; without this the check
+  # cannot be created and the job fails with a permission error instead of
+  # with the finding.
+  checks: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The action is pinned by commit: a tag can be moved, a commit cannot.
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

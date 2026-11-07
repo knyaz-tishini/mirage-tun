@@ -1,0 +1,20 @@
+{
+  "socks5_addr": "127.0.0.1:19480",
+  "relay_addrs": ["203.0.113.16", "203.0.113.17"],
+  "chains": [
+    {"name": "default", "socks5_addr": "127.0.0.1:19480", "dns_upstream": "8.8.8.8:53"},
+    {"name": "classic-direct", "socks5_addr": "127.0.0.1:19482", "dns_upstream": "8.8.4.4:53"},
+    {"name": "crypto-relay-classic", "socks5_addr": "127.0.0.1:19483", "dns_upstream": "1.1.1.1:53"},
+    {"name": "three-hop-onion", "socks5_addr": "127.0.0.1:19484", "dns_upstream": "1.0.0.1:53"},
+    {"name": "three-hop-telescopic", "socks5_addr": "127.0.0.1:19486", "dns_upstream": "9.9.9.9:53"}
+  ],
+  "policy": {
+    "rules": [
+      {"type": "dest_app_dir", "dir": "C:\\path\\to\\app\\", "action": "bypass"},
+      {"type": "dest_domain", "domain": ".ru", "action": "bypass"},
+      {"type": "dest_domain", "domain": ".рф", "action": "bypass"},
+      {"type": "dest_domain", "domain": ".xn--p1ai", "action": "bypass"}
+    ],
+    "default_action": "mirage"
+  }
+}

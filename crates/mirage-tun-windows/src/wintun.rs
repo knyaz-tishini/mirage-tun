@@ -1,0 +1,582 @@
+use std::{
+    ffi::OsStr,
+    os::windows::ffi::OsStrExt,
+    process::Command,
+    ptr,
+    sync::Arc,
+};
+use libloading::{Library, Symbol};
+use tracing::{debug, info, warn};
+use windows_sys::Win32::{
+    Foundation::HANDLE,
+    System::Threading::WaitForSingleObject,
+};
+use crate::error::{Result, TunError};
+
+// ── Wintun opaque handle types ─────────────────────────────────────────────
+
+/// Opaque Wintun adapter handle (`WINTUN_ADAPTER_HANDLE` in wintun.h).
+#[repr(transparent)]
+struct WintunAdapter(*mut std::ffi::c_void);
+unsafe impl Send for WintunAdapter {}
+unsafe impl Sync for WintunAdapter {}
+
+/// Opaque Wintun session handle (`WINTUN_SESSION_HANDLE` in wintun.h).
+#[repr(transparent)]
+struct WintunSession(*mut std::ffi::c_void);
+unsafe impl Send for WintunSession {}
+unsafe impl Sync for WintunSession {}
+
+// ── Function pointer types (wintun.h) ─────────────────────────────────────
+
+type FnCreateAdapter = unsafe extern "C" fn(
+    name: *const u16,
+    tunnel_type: *const u16,
+    requested_guid: *const std::ffi::c_void,
+) -> *mut std::ffi::c_void;
+
+type FnOpenAdapter = unsafe extern "C" fn(name: *const u16) -> *mut std::ffi::c_void;
+
+type FnCloseAdapter = unsafe extern "C" fn(adapter: *mut std::ffi::c_void);
+
+type FnStartSession = unsafe extern "C" fn(
+    adapter: *mut std::ffi::c_void,
+    capacity: u32,
+) -> *mut std::ffi::c_void;
+
+type FnEndSession = unsafe extern "C" fn(session: *mut std::ffi::c_void);
+
+type FnReceivePacket = unsafe extern "C" fn(
+    session: *mut std::ffi::c_void,
+    packet_size: *mut u32,
+) -> *mut u8;
+
+type FnReleaseReceivePacket =
+    unsafe extern "C" fn(session: *mut std::ffi::c_void, packet: *mut u8);
+
+type FnAllocateSendPacket = unsafe extern "C" fn(
+    session: *mut std::ffi::c_void,
+    packet_size: u32,
+) -> *mut u8;
+
+type FnSendPacket =
+    unsafe extern "C" fn(session: *mut std::ffi::c_void, packet: *mut u8);
+
+type FnGetReadWaitEvent =
+    unsafe extern "C" fn(session: *mut std::ffi::c_void) -> HANDLE;
+
+// ── Ring buffer capacity ───────────────────────────────────────────────────
+
+/// Wintun ring buffer size: 0x20000 (131072 bytes, minimum 0x20000, max 0x4000000).
+const WINTUN_RING_CAPACITY: u32 = 0x0020_0000; // 2 MiB
+
+// ── WintunShared ─────────────────────────────────────────────────────────────
+
+pub(crate) struct WintunShared {
+    /// Loaded wintun.dll — must outlive adapter and session handles.
+    _lib: Library,
+    adapter: WintunAdapter,
+    session: WintunSession,
+    fn_receive: FnReceivePacket,
+    fn_release: FnReleaseReceivePacket,
+    fn_alloc_send: FnAllocateSendPacket,
+    fn_send: FnSendPacket,
+    fn_get_event: FnGetReadWaitEvent,
+    fn_end_session: FnEndSession,
+    fn_close_adapter: FnCloseAdapter,
+}
+
+// Safety: Wintun receive and send ring buffers are independent and thread-safe.
+unsafe impl Send for WintunShared {}
+unsafe impl Sync for WintunShared {}
+
+impl Drop for WintunShared {
+    fn drop(&mut self) {
+        // Safety: handles are valid until Drop runs; library outlives them
+        // because `_lib` is the last field dropped.
+        unsafe {
+            (self.fn_end_session)(self.session.0);
+            (self.fn_close_adapter)(self.adapter.0);
+        }
+        info!("Wintun session and adapter closed");
+    }
+}
+
+// ── WintunReader ──────────────────────────────────────────────────────────────
+
+/// Read-only half of a Wintun device (used internally by WintunDevice).
+pub struct WintunReader {
+    pub(crate) shared: Arc<WintunShared>,
+}
+
+// Safety: the underlying Wintun API is thread-safe for concurrent read/write.
+unsafe impl Send for WintunReader {}
+
+impl WintunReader {
+    /// Spawn a dedicated OS thread that reads packets from Wintun in a blocking
+    /// loop and sends them over an mpsc channel.  Returns the receiving half.
+    ///
+    /// The thread exits when the WintunShared is dropped (session closed → recv
+    /// returns NULL) or when the channel receiver is dropped.
+    pub fn start_reader_thread(&self) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+        let shared = Arc::clone(&self.shared);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+
+        std::thread::Builder::new()
+            .name("wintun-reader".into())
+            .spawn(move || {
+                let event = unsafe { (shared.fn_get_event)(shared.session.0) };
+                info!(
+                    "wintun-reader thread: session=0x{:x} event=0x{:x}",
+                    shared.session.0 as usize, event as usize
+                );
+
+                loop {
+                    let wait_result = unsafe { WaitForSingleObject(event, 5000) };
+                    // WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258
+                    if wait_result != 0 && wait_result != 258 {
+                        warn!("wintun-reader: WaitForSingleObject returned {wait_result}, exiting");
+                        break;
+                    }
+
+                    // Drain all available packets before going back to wait.
+                    loop {
+                        let mut pkt_size: u32 = 0;
+                        let pkt_ptr = unsafe { (shared.fn_receive)(shared.session.0, &mut pkt_size) };
+                        if pkt_ptr.is_null() {
+                            break; // ring empty
+                        }
+                        let len = pkt_size as usize;
+                        let data = unsafe { std::slice::from_raw_parts(pkt_ptr, len).to_vec() };
+                        unsafe { (shared.fn_release)(shared.session.0, pkt_ptr) };
+
+                        if tx.blocking_send(data).is_err() {
+                            info!("wintun-reader: channel closed, exiting");
+                            return;
+                        }
+                    }
+                }
+                info!("wintun-reader thread exiting");
+            })
+            .expect("wintun-reader thread spawn failed: OS thread limit reached or name contains NUL");
+
+        rx
+    }
+}
+
+
+impl WintunShared {
+    /// Spawn a dedicated OS thread that writes packets to Wintun from a channel.
+    /// Returns the sender half; drop it to shut down the writer thread.
+    fn start_writer_thread(self: &Arc<Self>) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+        let shared = Arc::clone(self);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+
+        std::thread::Builder::new()
+            .name("wintun-writer".into())
+            .spawn(move || {
+                while let Some(packet) = rx.blocking_recv() {
+                    let pkt_len = packet.len() as u32;
+                    let send_buf = unsafe { (shared.fn_alloc_send)(shared.session.0, pkt_len) };
+                    if !send_buf.is_null() {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(packet.as_ptr(), send_buf, packet.len());
+                            (shared.fn_send)(shared.session.0, send_buf);
+                        }
+                    }
+                }
+                info!("wintun-writer thread exiting");
+            })
+            .expect("wintun-writer thread spawn failed");
+
+        tx
+    }
+}
+
+// ── WintunHandle ──────────────────────────────────────────────────────────
+
+/// Owns the Wintun adapter + session. Call `split()` to obtain reader/writer halves.
+pub struct WintunHandle {
+    shared: Arc<WintunShared>,
+}
+
+impl WintunHandle {
+    /// Create or open a Wintun adapter.
+    ///
+    /// `tunnel_type` is the type string shown in Device Manager (defaults to
+    /// "Mirage" when `None`).  Pass `Some(s)` from TunConfig::tunnel_type to
+    /// make it configurable (D9).
+    pub async fn create(
+        tun_name: &str,
+        tun_addr: &str,
+        tun_addr_v6: Option<&str>,
+        mtu: u16,
+        tunnel_type: Option<&str>,
+    ) -> Result<Self> {
+        let name = tun_name.to_owned();
+        let addr = tun_addr.to_owned();
+        let addr_v6 = tun_addr_v6.map(str::to_owned);
+        let tt = tunnel_type.unwrap_or("Mirage").to_owned();
+        let shared = tokio::task::spawn_blocking(move || {
+            create_wintun_shared(&name, &addr, addr_v6.as_deref(), mtu, &tt)
+        })
+        .await
+        .map_err(|e| TunError::Wintun(format!("spawn_blocking panicked: {e}")))??;
+        info!(name = tun_name, addr = tun_addr, ?tun_addr_v6, mtu, "WintunHandle created");
+        Ok(Self { shared: Arc::new(shared) })
+    }
+
+    fn reader(&self) -> WintunReader {
+        WintunReader { shared: Arc::clone(&self.shared) }
+    }
+}
+
+// ── WintunDevice ─────────────────────────────────────────────────────────────
+
+/// Combined read/write device wrapping Wintun.
+///
+/// Use `take_channels()` to obtain raw mpsc channels for integration with
+/// `netstack-smoltcp` pump loops.
+pub struct WintunDevice {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    write_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl WintunDevice {
+    /// Create from a WintunHandle. Starts reader and writer threads internally.
+    pub fn new(handle: &WintunHandle) -> Self {
+        let reader = handle.reader();
+        let rx = reader.start_reader_thread();
+        let write_tx = handle.shared.start_writer_thread();
+        Self { rx, write_tx }
+    }
+
+    /// Extract the raw channels for use with pump loops.
+    pub fn take_channels(
+        self,
+    ) -> (
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) {
+        (self.rx, self.write_tx)
+    }
+}
+
+// ── Wintun initialisation (blocking) ──────────────────────────────────────
+
+fn create_wintun_shared(
+    tun_name: &str,
+    tun_addr: &str,
+    tun_addr_v6: Option<&str>,
+    mtu: u16,
+    tunnel_type: &str,
+) -> Result<WintunShared> {
+    // Dynamically load wintun.dll.
+    // Safety: we validate all function pointers immediately after loading.
+    let lib = unsafe { Library::new("wintun.dll") }.map_err(|e| {
+        TunError::Wintun(format!(
+            "failed to load wintun.dll: {e}. \
+             Place wintun.dll next to the executable or on PATH."
+        ))
+    })?;
+
+    // Load all required function pointers.
+    let fn_create: Symbol<FnCreateAdapter> = unsafe { lib.get(b"WintunCreateAdapter\0") }
+        .map_err(|e| TunError::Wintun(format!("WintunCreateAdapter not found: {e}")))?;
+    let fn_open: Symbol<FnOpenAdapter> = unsafe { lib.get(b"WintunOpenAdapter\0") }
+        .map_err(|e| TunError::Wintun(format!("WintunOpenAdapter not found: {e}")))?;
+    let fn_close: Symbol<FnCloseAdapter> = unsafe { lib.get(b"WintunCloseAdapter\0") }
+        .map_err(|e| TunError::Wintun(format!("WintunCloseAdapter not found: {e}")))?;
+    let fn_start: Symbol<FnStartSession> = unsafe { lib.get(b"WintunStartSession\0") }
+        .map_err(|e| TunError::Wintun(format!("WintunStartSession not found: {e}")))?;
+    let fn_end_session: Symbol<FnEndSession> = unsafe { lib.get(b"WintunEndSession\0") }
+        .map_err(|e| TunError::Wintun(format!("WintunEndSession not found: {e}")))?;
+    let fn_receive: Symbol<FnReceivePacket> =
+        unsafe { lib.get(b"WintunReceivePacket\0") }
+            .map_err(|e| TunError::Wintun(format!("WintunReceivePacket not found: {e}")))?;
+    let fn_release: Symbol<FnReleaseReceivePacket> =
+        unsafe { lib.get(b"WintunReleaseReceivePacket\0") }.map_err(|e| {
+            TunError::Wintun(format!("WintunReleaseReceivePacket not found: {e}"))
+        })?;
+    let fn_alloc_send: Symbol<FnAllocateSendPacket> =
+        unsafe { lib.get(b"WintunAllocateSendPacket\0") }.map_err(|e| {
+            TunError::Wintun(format!("WintunAllocateSendPacket not found: {e}"))
+        })?;
+    let fn_send: Symbol<FnSendPacket> = unsafe { lib.get(b"WintunSendPacket\0") }
+        .map_err(|e| TunError::Wintun(format!("WintunSendPacket not found: {e}")))?;
+    let fn_get_event: Symbol<FnGetReadWaitEvent> =
+        unsafe { lib.get(b"WintunGetReadWaitEvent\0") }.map_err(|e| {
+            TunError::Wintun(format!("WintunGetReadWaitEvent not found: {e}"))
+        })?;
+
+    // Convert the adapter name to a wide (UTF-16) string.
+    let name_wide = to_wide(tun_name);
+    // D9: tunnel_type is configurable from TunConfig::tunnel_type (default "Mirage").
+    let tunnel_type_wide = to_wide(tunnel_type);
+
+    // Try to open an existing adapter first; create one if not found.
+    let adapter_ptr = unsafe { fn_open(name_wide.as_ptr()) };
+    let adapter_ptr = if adapter_ptr.is_null() {
+        debug!(name = tun_name, "no existing Wintun adapter, creating");
+        let p = unsafe { fn_create(name_wide.as_ptr(), tunnel_type_wide.as_ptr(), ptr::null()) };
+        if p.is_null() {
+            return Err(TunError::Wintun(format!(
+                "WintunCreateAdapter failed for '{}' (check admin privileges and driver install)",
+                tun_name
+            )));
+        }
+        p
+    } else {
+        debug!(name = tun_name, "opened existing Wintun adapter");
+        adapter_ptr
+    };
+
+    let adapter = WintunAdapter(adapter_ptr);
+
+    // Assign IPv4 address via netsh before starting the session.
+    assign_ip_address(tun_name, tun_addr, mtu)?;
+
+    // Optionally assign IPv6 address.
+    if let Some(v6) = tun_addr_v6 {
+        if let Err(e) = assign_ip6_address(tun_name, v6) {
+            warn!("failed to assign IPv6 address {v6} to {tun_name} (non-fatal): {e}");
+        }
+    }
+
+    // Wait for the adapter to stabilize.
+    wait_interface_ready(tun_name);
+
+    // Start the Wintun session.
+    let session_ptr = unsafe { fn_start(adapter.0, WINTUN_RING_CAPACITY) };
+    if session_ptr.is_null() {
+        unsafe { fn_close(adapter.0) };
+        return Err(TunError::Wintun(
+            "WintunStartSession failed (ring buffer too large or driver error?)".to_owned(),
+        ));
+    }
+
+    let session = WintunSession(session_ptr);
+
+    // Copy function pointers out of the Symbol wrappers (which borrow `lib`).
+    // Safety: the functions remain valid as long as `lib` is alive.
+    let fn_receive = *fn_receive;
+    let fn_release = *fn_release;
+    let fn_alloc_send = *fn_alloc_send;
+    let fn_send = *fn_send;
+    let fn_get_event = *fn_get_event;
+    let fn_end_session = *fn_end_session;
+    let fn_close_adapter = *fn_close;
+
+    Ok(WintunShared {
+        _lib: lib,
+        adapter,
+        session,
+        fn_receive,
+        fn_release,
+        fn_alloc_send,
+        fn_send,
+        fn_get_event,
+        fn_end_session,
+        fn_close_adapter,
+    })
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+fn assign_ip_address(tun_name: &str, tun_addr: &str, mtu: u16) -> Result<()> {
+    let (addr_str, prefix_str) = tun_addr
+        .split_once('/')
+        .ok_or_else(|| TunError::Wintun(format!(
+            "tun_addr '{}' is not in CIDR notation",
+            tun_addr
+        )))?;
+
+    let prefix_len: u8 = prefix_str.parse().map_err(|_| {
+        TunError::Wintun(format!(
+            "invalid prefix length in tun_addr '{}'",
+            tun_addr
+        ))
+    })?;
+
+    let netmask = prefix_to_netmask(prefix_len);
+
+    // Run set address and set MTU in parallel — they're independent.
+    // MTU thread spawned first; address (the slow one) runs on current thread.
+    let mtu_str = format!("mtu={mtu}");
+    let tun_for_mtu = tun_name.to_owned();
+    let mtu_handle = std::thread::spawn(move || {
+        run_netsh(&[
+            "interface", "ipv4", "set", "subinterface",
+            &tun_for_mtu, &mtu_str, "store=persistent",
+        ])
+    });
+
+    run_netsh(&[
+        "interface", "ip", "set", "address",
+        tun_name, "static", addr_str, &netmask,
+    ])?;
+
+    if let Err(e) = mtu_handle.join().unwrap_or_else(|_| Err(TunError::Wintun("MTU thread panicked".to_owned()))) {
+        warn!("failed to set MTU (non-fatal): {e}");
+    }
+
+    info!(name = tun_name, addr = addr_str, mask = %netmask, mtu, "IP address assigned");
+    Ok(())
+}
+
+fn wait_interface_ready(tun_name: &str) {
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if let Ok(out) = Command::new("netsh")
+            .args(["interface", "ipv4", "show", "interfaces"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if line.contains(tun_name) && line.to_lowercase().contains("connected") {
+                    info!("Wintun interface '{tun_name}' ready after {attempt} polls");
+                    return;
+                }
+            }
+        }
+    }
+    warn!("Wintun interface '{tun_name}' not confirmed ready after 300ms, proceeding anyway");
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn prefix_to_netmask(prefix_len: u8) -> String {
+    let bits = if prefix_len == 0 {
+        0u32
+    } else {
+        !0u32 << (32 - prefix_len.min(32))
+    };
+    let [a, b, c, d] = bits.to_be_bytes();
+    format!("{a}.{b}.{c}.{d}")
+}
+
+fn assign_ip6_address(tun_name: &str, tun_addr_v6: &str) -> Result<()> {
+    // tun_addr_v6 is "fd77::7/64" - split into addr + prefix.
+    let (addr_str, prefix_str) = tun_addr_v6
+        .split_once('/')
+        .ok_or_else(|| TunError::Wintun(format!(
+            "tun_addr_v6 '{}' is not in CIDR notation",
+            tun_addr_v6
+        )))?;
+
+    run_netsh(&[
+        "interface", "ipv6", "add", "address",
+        tun_name, &format!("{addr_str}/{prefix_str}"),
+    ])?;
+
+    info!(name = tun_name, addr = tun_addr_v6, "IPv6 address assigned");
+    Ok(())
+}
+
+/// Set the IPv6 address of the adapter.
+///
+/// The address is given in CIDR form ("fd77::7/64").  The command is
+/// `netsh interface ipv6 add address <name> <addr>/<prefix>`: the prefix
+/// length rides on the address itself, and the interface is named
+/// positionally - `name=` is not a valid argument for this command.
+///
+/// An address that is already there is removed first, so the call is
+/// idempotent: the same address can be set again after the tunnel stopped
+/// and started.
+pub fn assign_ipv6_address(tun_name: &str, addr_cidr: &str) -> Result<()> {
+    let (addr_str, prefix_str) = addr_cidr
+        .split_once('/')
+        .ok_or_else(|| TunError::Wintun(format!(
+            "IPv6 address '{}' is not in CIDR notation",
+            addr_cidr
+        )))?;
+
+    // A leftover address from an earlier run would make the add fail.
+    // Not having one is the normal case, so its failure is not an error.
+    if let Err(e) = remove_ipv6_address(tun_name, addr_str) {
+        debug!(name = tun_name, addr = addr_str, "no IPv6 address to remove: {e}");
+    }
+
+    run_netsh(&[
+        "interface", "ipv6", "add", "address",
+        tun_name, &format!("{addr_str}/{prefix_str}"),
+        "store=persistent",
+    ])?;
+
+    info!(name = tun_name, addr = addr_str, prefix = prefix_str, "IPv6 address assigned");
+    Ok(())
+}
+
+/// Remove the IPv6 address of the adapter.
+///
+/// The address is given in CIDR form ("fd77::7/64"); the delete command
+/// takes the address alone.
+pub fn remove_ipv6_address(tun_name: &str, addr_cidr: &str) -> Result<()> {
+    let addr_str = addr_cidr
+        .split_once('/')
+        .map(|(addr, _prefix)| addr)
+        .unwrap_or(addr_cidr);
+
+    run_netsh(&[
+        "interface", "ipv6", "delete", "address",
+        tun_name, addr_str,
+    ])?;
+
+    info!(name = tun_name, addr = addr_str, "IPv6 address removed");
+    Ok(())
+}
+
+fn run_netsh(args: &[&str]) -> Result<()> {
+    let label = format!("netsh {}", args.join(" "));
+    debug!(cmd = %label, "WintunHandle: running netsh");
+
+    let out = Command::new("netsh")
+        .args(args)
+        .output()
+        .map_err(|e| TunError::Io { source: e })?;
+
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    debug!(cmd = %label, stdout = %stdout, stderr = %stderr, "WintunHandle: netsh finished");
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    Err(TunError::Wintun(format!(
+        "netsh failed ({label}): {stdout}{stderr}"
+    )))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn netmask_24() {
+        assert_eq!(prefix_to_netmask(24), "255.255.255.0");
+    }
+
+    #[test]
+    fn netmask_16() {
+        assert_eq!(prefix_to_netmask(16), "255.255.0.0");
+    }
+
+    #[test]
+    fn netmask_0() {
+        assert_eq!(prefix_to_netmask(0), "0.0.0.0");
+    }
+
+    #[test]
+    fn wide_null_terminated() {
+        let w = to_wide("hi");
+        assert_eq!(w.last(), Some(&0u16));
+        assert_eq!(w.len(), 3); // 'h', 'i', NUL
+    }
+}

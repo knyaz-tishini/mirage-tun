@@ -1,0 +1,18 @@
+[package]
+license = "MIT"
+name = "mirage-tun-core"
+version.workspace = true
+edition.workspace = true
+description = "TUN device abstractions: traits, NAT table, packet parser"
+repository = "https://github.com/knyaz-tishini/mirage-tun"
+homepage = "https://github.com/knyaz-tishini/mirage-tun"
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "net", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+serde_json = "1"

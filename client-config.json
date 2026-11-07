@@ -1,0 +1,162 @@
+{
+  "client_id": "stend-client",
+  "private_key": "0000000000000000000000000000000000000000000000000000000000000000",
+  "chains": [
+    {
+      "chain_id": "classic-direct",
+      "socks5_bind": "127.0.0.1:19482",
+      "l1": {
+        "addr": "203.0.113.16:4700",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "l2": {
+        "addr": "203.0.113.17:4700",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "l1_transparent": true,
+      "hops": [],
+      "handshake": "ephemeral",
+      "reply": "raw",
+      "protocol": "Mirage",
+      "priority": 10,
+      "shaping": "none",
+      "camouflage": "raw"
+    },
+    {
+      "chain_id": "byte-cipher-classic",
+      "l1": {
+        "addr": "203.0.113.16:4702",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "l2": {
+        "addr": "203.0.113.17:4700",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "l1_transparent": false,
+      "hops": [],
+      "handshake": "ephemeral",
+      "reply": "raw",
+      "protocol": "MirageTls",
+      "priority": 10,
+      "shaping": "none",
+      "camouflage": "raw"
+    },
+    {
+      "chain_id": "crypto-relay-classic",
+      "socks5_bind": "127.0.0.1:19483",
+      "l1": {
+        "addr": "203.0.113.16:4703",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "l2": {
+        "addr": "203.0.113.17:4700",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "l1_transparent": false,
+      "hops": [],
+      "handshake": "ephemeral",
+      "reply": "raw",
+      "protocol": "Mirage",
+      "priority": 10,
+      "shaping": "none",
+      "camouflage": "raw"
+    },
+    {
+      "chain_id": "three-hop-onion",
+      "socks5_bind": "127.0.0.1:19484",
+      "l1": null,
+      "l2": {
+        "addr": "203.0.113.17:4701",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "hops": [
+        {
+          "addr": "203.0.113.16:4701",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "sni": null,
+          "role": "entry"
+        },
+        {
+          "addr": "203.0.113.16:4710",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "sni": null,
+          "role": "middle"
+        },
+        {
+          "addr": "203.0.113.17:4701",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "sni": null,
+          "role": "exit"
+        }
+      ],
+      "handshake": "ephemeral",
+      "reply": "onion",
+      "protocol": "Mirage",
+      "priority": 0,
+      "shaping": "none",
+      "camouflage": "raw"
+    },
+    {
+      "chain_id": "three-hop-telescopic",
+      "socks5_bind": "127.0.0.1:19486",
+      "l1": null,
+      "l2": {
+        "addr": "203.0.113.17:4701",
+        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sni": null
+      },
+      "hops": [
+        {
+          "addr": "203.0.113.16:4701",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "sni": null,
+          "role": "entry"
+        },
+        {
+          "addr": "203.0.113.16:4710",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "sni": null,
+          "role": "middle"
+        },
+        {
+          "addr": "203.0.113.17:4701",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "sni": null,
+          "role": "exit"
+        }
+      ],
+      "handshake": "telescopic",
+      "reply": "onion",
+      "protocol": "Mirage",
+      "priority": 0,
+      "shaping": "none",
+      "camouflage": "raw"
+    }
+  ],
+  "routing": {
+    "default_chain": "byte-cipher-classic",
+    "rules": [],
+    "direct_cidrs": [],
+    "blocked_domains": [],
+    "direct_domains": []
+  },
+  "pool": {
+    "pool_size": 200
+  },
+  "http_proxy": {
+    "enabled": true,
+    "bind_addr": "127.0.0.1:19481"
+  },
+  "psk": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
+  "management_key": "64afbef069ea4efabcfc7b336fd445dc58ef3fc4805e256afae96b0aabf23678",
+  "management_addr": "0.0.0.0:4498",
+  "use_mux": true,
+  "monitor_url": "http://127.0.0.1:19410"
+}

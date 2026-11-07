@@ -1,0 +1,2 @@
+// Re-exported from mirage-tun-core — identical implementation.
+pub use mirage_tun_core::dns_map::DnsMap;

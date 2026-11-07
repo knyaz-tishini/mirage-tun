@@ -1,0 +1,198 @@
+[package]
+edition = "2021"
+rust-version = "1.75.0"
+name = "mirage-tcpip-stack"
+version = "0.2.2"
+authors = ["cavivie <cavivie@gmail.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = """
+A netstack for the special purpose of turning packets from/to a TUN interface
+into TCP streams and UDP packets. Self-contained fork of smoltcp-rs.
+"""
+homepage = "https://github.com/knyaz-tishini/mirage-tun"
+documentation = "https://docs.rs/netstack-smoltcp"
+readme = "README.md"
+keywords = [
+    "netstack",
+    "smoltcp",
+    "network",
+    "ip",
+    "tun",
+]
+categories = ["network-programming"]
+license = "MIT"
+repository = "https://github.com/knyaz-tishini/mirage-tun"
+[lib]
+name = "mirage_tcpip_stack"
+path = "src/lib.rs"
+
+[[example]]
+name = "forward"
+path = "examples/forward.rs"
+
+[[example]]
+name = "forward-offload-linux"
+path = "examples/forward-offload-linux.rs"
+
+[[test]]
+name = "regression"
+path = "tests/regression.rs"
+
+# ── smoltcp inlined deps ────────────────────────────────────────────────────
+[dependencies.bitflags]
+version = "1.0"
+default-features = false
+
+[dependencies.byteorder]
+version = "1.0"
+default-features = false
+
+[dependencies.cfg-if]
+version = "1.0"
+
+[dependencies.heapless]
+version = "0.8"
+
+[dependencies.log]
+version = "0.4"
+optional = true
+default-features = false
+
+[dependencies.managed]
+version = "0.8"
+default-features = false
+features = ["map", "std"]
+
+# ── wrapper deps ─────────────────────────────────────────────────────────────
+[dependencies.futures]
+version = "0.3"
+
+[dependencies.rand]
+version = "0.8"
+
+[dependencies.tokio]
+version = "1"
+features = [
+    "sync",
+    "time",
+    "rt",
+    "macros",
+]
+
+[dependencies.tokio-util]
+version = "0.7.10"
+
+[dependencies.tracing]
+version = "0.1"
+features = ["std"]
+default-features = false
+
+[dev-dependencies.socket2]
+version = "0.5.6"
+
+[dev-dependencies.socket2-ext]
+version = "0.1"
+
+[dev-dependencies.structopt]
+version = "0.3"
+
+[dev-dependencies.tokio]
+version = "1"
+features = [
+    "rt",
+    "macros",
+    "rt-multi-thread",
+    "io-util",
+]
+
+[dev-dependencies.tracing]
+version = "0.1"
+features = ["std"]
+default-features = false
+
+[dev-dependencies.tracing-subscriber]
+version = "0.3.18"
+
+[dev-dependencies.tun-rs]
+version = "2"
+features = [
+    "async",
+    "async_framed",
+]
+
+[dev-dependencies.tun2]
+version = "3"
+features = ["async"]
+
+# ── smoltcp-style features (always enabled via defaults) ────────────────────
+[features]
+default = [
+    "std",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-icmp",
+    "socket-udp",
+    "socket-tcp",
+]
+
+std = ["managed/std", "alloc"]
+alloc = ["managed/alloc"]
+log = ["dep:log"]
+
+# medium
+medium-ip = ["socket"]
+medium-ethernet = ["socket"]
+medium-ieee802154 = ["socket", "proto-sixlowpan"]
+
+# proto
+proto-ipv4 = []
+proto-ipv4-fragmentation = ["proto-ipv4", "_proto-fragmentation"]
+proto-dhcpv4 = ["proto-ipv4"]
+proto-ipv6 = []
+proto-ipv6-hbh = ["proto-ipv6"]
+proto-ipv6-fragmentation = ["proto-ipv6", "_proto-fragmentation"]
+proto-ipv6-routing = ["proto-ipv6"]
+proto-rpl = ["proto-ipv6-hbh", "proto-ipv6-routing"]
+proto-sixlowpan = ["proto-ipv6"]
+proto-sixlowpan-fragmentation = ["proto-sixlowpan", "_proto-fragmentation"]
+proto-dns = []
+proto-ipsec = ["proto-ipsec-ah", "proto-ipsec-esp"]
+proto-ipsec-ah = []
+proto-ipsec-esp = []
+_proto-fragmentation = []
+
+# phy
+phy-raw_socket = ["std"]
+phy-tuntap_interface = ["std", "medium-ethernet"]
+
+# socket
+socket = []
+socket-raw = ["socket"]
+socket-udp = ["socket"]
+socket-tcp = ["socket"]
+socket-icmp = ["socket"]
+socket-dhcpv4 = ["socket", "medium-ethernet", "proto-dhcpv4"]
+socket-dns = ["socket", "proto-dns"]
+socket-mdns = ["socket-dns"]
+socket-tcp-cubic = []
+socket-tcp-reno = []
+
+# misc
+multicast = []
+packetmeta-id = []
+async = []
+verbose = []
+
+# config size features (smoltcp pattern, kept for compat)
+iface-max-addr-count-8 = []
+iface-neighbor-cache-count-8 = []
+iface-max-route-count-4 = []
+reassembly-buffer-count-4 = []
+assembler-max-segment-count-4 = []

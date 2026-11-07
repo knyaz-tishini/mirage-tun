@@ -1,0 +1,14 @@
+[package]
+license = "MIT"
+name = "mirage-dns"
+version.workspace = true
+edition.workspace = true
+description = "DNS resolver with DoH upstream and TTL-aware cache"
+repository = "https://github.com/knyaz-tishini/mirage-tun"
+homepage = "https://github.com/knyaz-tishini/mirage-tun"
+[dependencies]
+lru = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "net", "rt-multi-thread", "macros", "io-util"] }
+tracing = "0.1"
