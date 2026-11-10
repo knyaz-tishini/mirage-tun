@@ -2,6 +2,22 @@ use std::net::{IpAddr, Ipv6Addr};
 use tracing::{debug, info, warn};
 use crate::error::{Result, TunError};
 
+/// A hole in the routing: a prefix that leaves the machine the way it
+/// always did, while the tunnel holds the default route.
+///
+/// The hole is a route, not a rule: the prefix points at the gateway the
+/// machine had before the tunnel took the default, so the packets of that
+/// prefix never reach the adapter at all.
+#[derive(Debug, Clone)]
+pub struct BypassHole {
+    /// The prefix, in CIDR form.
+    pub cidr: String,
+    /// The interface the hole points at.
+    pub if_index: u32,
+    /// The gateway the hole points at, when there is one.
+    pub gateway: Option<String>,
+}
+
 pub struct Routing {
     original_gateway: Option<String>,
     original_interface_idx: Option<u32>,
@@ -9,6 +25,9 @@ pub struct Routing {
     original_v6_interface_idx: Option<u32>,
     bypass_routes: Vec<String>,
     bypass_v6_routes: Vec<String>,
+    /// The holes the person asked for: the prefixes whose route points at
+    /// the real gateway.
+    bypass_holes: Vec<BypassHole>,
     tun_default_set: bool,
     tun_v6_default_set: bool,
     /// Whether the adapter carries an IPv6 address of its own.
@@ -29,6 +48,7 @@ impl Routing {
             original_v6_interface_idx: None,
             bypass_routes: Vec::new(),
             bypass_v6_routes: Vec::new(),
+            bypass_holes: Vec::new(),
             tun_default_set: false,
             tun_v6_default_set: false,
             ipv6_enabled: false,
@@ -122,6 +142,13 @@ impl Routing {
     }
 
     pub fn restore_routes_sync(&mut self) {
+        // Close the holes: the prefixes the person excluded go back to the
+        // tunnel.  The hole was drilled through the real interface, so it is
+        // closed the same way.
+        for hole in self.bypass_holes.drain(..) {
+            close_hole_sync(&hole);
+        }
+
         // Remove IPv4 bypass host routes
         for addr in self.bypass_routes.drain(..) {
             let _ = std::process::Command::new("route")
@@ -167,11 +194,43 @@ impl Routing {
         info!("Routing: routes restored (sync)");
     }
 
-    pub async fn add_bypass(&mut self, addr: IpAddr) -> Result<()> {
-        match addr {
+    pub async fn add_bypass(&mut self, addr: IpAddr) -> Result<()> {        match addr {
             IpAddr::V4(_) => self.add_bypass_v4(addr).await,
             IpAddr::V6(_) => self.add_bypass_v6(addr).await,
         }
+    }
+
+    /// A hole for a whole network: every address in the prefix leaves the
+    /// machine the way it always did.
+    ///
+    /// The adapter takes every packet when the tunnel is up, so the only way
+    /// out for the destinations the person excluded is a ROUTE — the prefix
+    /// points at the gateway the machine had before the tunnel took the
+    /// default, and those packets never reach the adapter at all.
+    ///
+    /// A bare address is a host route: the same hole, one address wide.
+    pub async fn add_bypass_cidr(&mut self, cidr: &str) -> Result<()> {
+        let cidr = cidr.trim();
+        if cidr.is_empty() {
+            return Ok(());
+        }
+        let gateway = match self.original_gateway.clone() {
+            Some(gw) => gw,
+            None => {
+                warn!(cidr, "Routing: no original IPv4 gateway; bypass hole NOT added");
+                return Ok(());
+            }
+        };
+        let if_index = self.original_interface_idx.unwrap_or(0);
+        let hole = drill_hole(cidr, Some(&gateway), if_index).await?;
+        info!(cidr = %hole.cidr, gateway = %gateway, if_index, "Routing: IPv4 bypass hole added");
+        self.bypass_holes.push(hole);
+        Ok(())
+    }
+
+    /// The holes that were drilled, as they stand.
+    pub fn bypass_holes(&self) -> Vec<BypassHole> {
+        self.bypass_holes.clone()
     }
 
     async fn add_bypass_v4(&mut self, addr: IpAddr) -> Result<()> {
@@ -263,6 +322,203 @@ impl Drop for Routing {
             self.restore_routes_sync();
         }
     }
+}
+
+/// The address and the prefix length of a CIDR.
+///
+/// A bare address is a host route: its prefix is the whole address space.
+pub fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8)> {
+    let cidr = cidr.trim();
+    let (addr, prefix) = match cidr.split_once('/') {
+        Some((addr, prefix)) => {
+            let prefix = prefix.trim().parse::<u8>().map_err(|e| {
+                TunError::Routing(format!("bad prefix length in '{cidr}': {e}"))
+            })?;
+            (addr.trim(), prefix)
+        }
+        None => {
+            let ip = cidr.parse::<IpAddr>().map_err(|e| {
+                TunError::Routing(format!("bad address in '{cidr}': {e}"))
+            })?;
+            let length = if ip.is_ipv4() { 32 } else { 128 };
+            return Ok((ip, length));
+        }
+    };
+    let ip = addr.parse::<IpAddr>().map_err(|e| {
+        TunError::Routing(format!("bad address in '{cidr}': {e}"))
+    })?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        return Err(TunError::Routing(format!(
+            "prefix length {prefix} does not fit '{cidr}'"
+        )));
+    }
+    Ok((ip, prefix))
+}
+
+/// The mask of a prefix length, as route.exe wants it.
+fn v4_mask(prefix: u8) -> String {
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix.min(32))
+    };
+    format!(
+        "{}.{}.{}.{}",
+        (mask >> 24) & 0xFF,
+        (mask >> 16) & 0xFF,
+        (mask >> 8) & 0xFF,
+        mask & 0xFF
+    )
+}
+
+/// Drill a hole: the prefix leaves the machine through the real gateway.
+///
+/// This is the whole bypass: a route that is more specific than the
+/// tunnel's default, so the packets of that prefix never reach the
+/// adapter.  The application sees the machine it has always seen, and the
+/// destination sees the application itself.
+pub async fn drill_hole(
+    cidr: &str,
+    gateway: Option<&str>,
+    if_index: u32,
+) -> Result<BypassHole> {
+    let (addr, prefix) = parse_cidr(cidr)?;
+    match addr {
+        IpAddr::V4(_) => {
+            let Some(gw) = gateway else {
+                warn!(cidr, "Routing: no IPv4 gateway; the hole was NOT drilled");
+                return Err(TunError::Routing(format!(
+                    "no IPv4 gateway for the hole of {cidr}"
+                )));
+            };
+            let prefix_text = format!("{addr}/{prefix}");
+            if if_index > 0 {
+                let idx = if_index.to_string();
+                let result = run_netsh_route(&[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    &prefix_text,
+                    &format!("interface={idx}"),
+                    &format!("nexthop={gw}"),
+                    "metric=1",
+                    "store=active",
+                ])
+                .await;
+                if let Err(e) = result {
+                    warn!(cidr, error = %e, "Routing: netsh refused the hole; trying route.exe");
+                    let mask = v4_mask(prefix);
+                    run_route(&[
+                        "add",
+                        &addr.to_string(),
+                        "mask",
+                        &mask,
+                        gw,
+                        "METRIC",
+                        "1",
+                        "IF",
+                        &idx,
+                    ])
+                    .await?;
+                }
+            } else {
+                let mask = v4_mask(prefix);
+                run_route(&[
+                    "add",
+                    &addr.to_string(),
+                    "mask",
+                    &mask,
+                    gw,
+                    "METRIC",
+                    "1",
+                ])
+                .await?;
+            }
+            info!(cidr = %prefix_text, gateway = %gw, if_index, "Routing: the hole is drilled");
+            Ok(BypassHole {
+                cidr: prefix_text,
+                if_index,
+                gateway: Some(gw.to_owned()),
+            })
+        }
+        IpAddr::V6(_) => {
+            let prefix_text = format!("{addr}/{prefix}");
+            let Some(gw) = gateway else {
+                warn!(cidr, "Routing: no IPv6 gateway; the hole was NOT drilled");
+                return Err(TunError::Routing(format!(
+                    "no IPv6 gateway for the hole of {cidr}"
+                )));
+            };
+            let idx = if_index.to_string();
+            run_netsh_route(&[
+                "interface",
+                "ipv6",
+                "add",
+                "route",
+                &prefix_text,
+                &format!("interface={idx}"),
+                &format!("nexthop={gw}"),
+                "metric=1",
+                "store=active",
+            ])
+            .await?;
+            info!(cidr = %prefix_text, gateway = %gw, if_index, "Routing: the IPv6 hole is drilled");
+            Ok(BypassHole {
+                cidr: prefix_text,
+                if_index,
+                gateway: Some(gw.to_owned()),
+            })
+        }
+    }
+}
+
+/// Close a hole: the prefix goes back to the tunnel.
+pub fn close_hole(hole: &BypassHole) {
+    close_hole_sync(hole);
+}
+
+/// Close a hole without the async runtime.
+pub fn close_hole_sync(hole: &BypassHole) {
+    let Ok((addr, prefix)) = parse_cidr(&hole.cidr) else {
+        return;
+    };
+    let idx = hole.if_index.to_string();
+    let interface = format!("interface={idx}");
+    match addr {
+        IpAddr::V4(_) => {
+            let _ = std::process::Command::new("netsh")
+                .args([
+                    "interface",
+                    "ipv4",
+                    "delete",
+                    "route",
+                    &hole.cidr,
+                    &interface,
+                    "store=active",
+                ])
+                .output();
+            let mask = v4_mask(prefix);
+            let _ = std::process::Command::new("route")
+                .args(["delete", &addr.to_string(), "mask", &mask])
+                .output();
+        }
+        IpAddr::V6(_) => {
+            let _ = std::process::Command::new("netsh")
+                .args([
+                    "interface",
+                    "ipv6",
+                    "delete",
+                    "route",
+                    &hole.cidr,
+                    &interface,
+                    "store=active",
+                ])
+                .output();
+        }
+    }
+    info!(cidr = %hole.cidr, "Routing: the hole is closed");
 }
 
 /// Stateless host-route bypass — used by the peer-LM watcher to additively

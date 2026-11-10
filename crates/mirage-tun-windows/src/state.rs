@@ -19,6 +19,10 @@ pub struct ServiceState {
     pub proxy_active: Option<String>,
     pub ipstack_cancel: Option<CancellationToken>,
     pub bypass_addrs: Vec<IpAddr>,
+    /// The holes the person asked for: the prefixes whose route points at
+    /// the real gateway, so their packets never reach the adapter.  Closed
+    /// when the tunnel stops.
+    pub bypass_holes: Vec<crate::routing::BypassHole>,
     pub original_gateway: Option<String>,
     pub tun_default_set: bool,
     pub socks5_addr: Option<SocketAddr>,
@@ -43,6 +47,7 @@ impl ServiceState {
             proxy_active: None,
             ipstack_cancel: None,
             bypass_addrs: Vec::new(),
+            bypass_holes: Vec::new(),
             original_gateway: None,
             tun_default_set: false,
             socks5_addr: None,

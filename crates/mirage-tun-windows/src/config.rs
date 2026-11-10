@@ -88,11 +88,19 @@ pub struct TunConfig {
     pub mtu: u16,
     /// Direct-egress bypass list.
     ///
-    /// Not applied in raw-IP mode: there the box is a full L3 exit, so
-    /// nothing is bypassed.  The runner logs one warning at startup when
-    /// the list is not empty.
+    /// The destinations the person excluded from the tunnel.  In the raw-IP
+    /// mode the box is a full L3 exit, so the exclusion is not a rule in the
+    /// datapath: it is a HOLE in the routing, drilled through the gateway
+    /// the machine had before the tunnel took the default.
     #[serde(default)]
     pub bypass: BypassConfig,
+    /// How often the excluded names are resolved again, in seconds.
+    ///
+    /// The addresses of a CDN change under it, so the holes follow the
+    /// names: the longer this is, the longer a name may point at an address
+    /// that has no hole.
+    #[serde(default = "default_bypass_refresh_secs")]
+    pub bypass_refresh_secs: u64,
 }
 
 /// Direct-egress bypass list (`bypass` object in tun.json).
@@ -120,6 +128,10 @@ fn default_tun_addr() -> String {
 
 fn default_dns_upstream() -> SocketAddr {
     "8.8.8.8:53".parse().expect("static addr is valid")
+}
+
+fn default_bypass_refresh_secs() -> u64 {
+    30
 }
 
 fn default_dns_cache_ttl_secs() -> u64 {
@@ -233,6 +245,7 @@ impl Default for TunConfig {
             mode: default_mode(),
             mtu: default_mtu(),
             bypass: BypassConfig::default(),
+            bypass_refresh_secs: default_bypass_refresh_secs(),
         }
     }
 }

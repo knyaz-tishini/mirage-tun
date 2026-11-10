@@ -1,4 +1,5 @@
 pub mod api;
+pub mod bypass;
 pub mod chains;
 pub mod config;
 pub mod monitor_link;
