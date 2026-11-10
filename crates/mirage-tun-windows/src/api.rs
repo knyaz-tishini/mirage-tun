@@ -327,41 +327,6 @@ pub async fn activate_tun_inner(
     plan.merge(crate::bypass::BypassPlan::from_config(&state.config.bypass));
     crate::bypass::log_plan(&plan);
 
-    // The resolver the adapter asks.
-    //
-    // When the person excluded names, the names must be answered the way
-    // they answered before the tunnel: the application then takes the
-    // addresses the hole covers, and the question itself does not have to
-    // go through the tunnel.  The machine's own resolver is the one that
-    // answers that way.
-    let dns_ip = if !plan.domains.is_empty() {
-        match native_dns {
-            Some(dns) if is_usable_dns(dns) => {
-                info!(
-                    resolver = %dns.ip(),
-                    "activate: the names are answered by the machine's own resolver"
-                );
-                dns.ip().to_string()
-            }
-            _ => {
-                warn!("activate: the machine's own resolver is unknown; the names go through the tunnel");
-                state.config.dns_upstream.ip().to_string()
-            }
-        }
-    } else if raw_ip_mode && !is_usable_dns(state.config.dns_upstream) {
-        warn!(
-            "raw_ip mode: dns_upstream {} is not usable - using {FALLBACK_DNS}",
-            state.config.dns_upstream
-        );
-        FALLBACK_DNS.to_owned()
-    } else {
-        state.config.dns_upstream.ip().to_string()
-    };
-    let _ = tokio::process::Command::new("netsh")
-        .args(["interface", "ip", "set", "dns", &tun_name, "static", &dns_ip])
-        .output()
-        .await;
-
     // The resolver the machine had before the tunnel gets a hole too: the
     // names must be answered the way the person sees them, or the addresses
     // the application uses are not the addresses the hole covers.
@@ -414,6 +379,39 @@ pub async fn activate_tun_inner(
             "activate: the bypass holes are in place"
         );
     }
+
+    // The resolver the adapter asks.
+    //
+    // When the person excluded names, the names must be answered the way
+    // they answered before the tunnel: the application then takes the
+    // addresses the hole covers, and the question itself does not have to
+    // go through the tunnel.  The machine's own resolver is the one that
+    // answers that way -- but only if it answers at all: a resolver that
+    // stays silent would leave the machine without names.
+    let dns_ip = if !plan.domains.is_empty() && !domain_ips.is_empty() {
+        match native_dns {
+            Some(dns) if is_usable_dns(dns) => {
+                info!(
+                    resolver = %dns.ip(),
+                    "activate: the names are answered by the machine's own resolver"
+                );
+                dns.ip().to_string()
+            }
+            _ => state.config.dns_upstream.ip().to_string(),
+        }
+    } else if raw_ip_mode && !is_usable_dns(state.config.dns_upstream) {
+        warn!(
+            "raw_ip mode: dns_upstream {} is not usable - using {FALLBACK_DNS}",
+            state.config.dns_upstream
+        );
+        FALLBACK_DNS.to_owned()
+    } else {
+        state.config.dns_upstream.ip().to_string()
+    };
+    let _ = tokio::process::Command::new("netsh")
+        .args(["interface", "ip", "set", "dns", &tun_name, "static", &dns_ip])
+        .output()
+        .await;
 
     // WFP: the holes must be permitted, or the kill-switch would cut the
     // very traffic they exist for.
@@ -528,6 +526,7 @@ pub async fn activate_tun_inner(
             gateway,
             if_index,
             plan.cidrs.clone(),
+            domain_ips.clone(),
             cancel.clone(),
         );
     }
@@ -595,11 +594,12 @@ fn spawn_bypass_watcher(
     gateway: Option<String>,
     if_index: u32,
     plan_cidrs: Vec<String>,
+    known: BTreeSet<IpAddr>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     let interval = Duration::from_secs(state.config.bypass_refresh_secs.max(5));
     tokio::spawn(async move {
-        let mut known: BTreeSet<IpAddr> = BTreeSet::new();
+        let mut known = known;
         info!(
             names = domains.len(),
             every = interval.as_secs(),
@@ -960,12 +960,24 @@ async fn discover_native_dns(if_index: u32) -> Option<SocketAddr> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
         let trimmed = line.trim();
-        if let Ok(ip) = trimmed.parse::<std::net::Ipv4Addr>() {
-            return Some(SocketAddr::new(IpAddr::V4(ip), 53));
+        // The servers come as a sentence, not as a bare address:
+        //   "DNS servers configured through DHCP:  8.8.8.8"
+        // A line that is only an address is taken as it is.
+        let tail = match trimmed.split_once(':') {
+            Some((_, tail)) => tail,
+            None => trimmed,
+        };
+        for token in tail.split_whitespace() {
+            if let Ok(ip) = token.parse::<std::net::Ipv4Addr>() {
+                return Some(SocketAddr::new(IpAddr::V4(ip), 53));
+            }
         }
     }
-    // Fallback to Cloudflare DNS
-    Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 53))
+    // The guess must be one this network answers.  A resolver that stays
+    // silent would leave the machine without names -- and the names are
+    // what the holes follow.
+    info!("native_dns: the interface names no resolver; falling back to 8.8.8.8");
+    Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 53))
 }
 
 async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

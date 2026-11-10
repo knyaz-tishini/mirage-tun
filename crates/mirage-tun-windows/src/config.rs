@@ -131,7 +131,10 @@ fn default_dns_upstream() -> SocketAddr {
 }
 
 fn default_bypass_refresh_secs() -> u64 {
-    30
+    // The addresses of a CDN live under a short TTL -- the ones we watch
+    // answer in seconds.  A hole that follows a name has to follow it
+    // faster than the name changes.
+    10
 }
 
 fn default_dns_cache_ttl_secs() -> u64 {
