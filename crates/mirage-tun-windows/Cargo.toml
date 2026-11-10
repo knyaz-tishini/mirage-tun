@@ -21,7 +21,14 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Rpc",
+    "Win32_System_Services",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
 ] }
 socket2 = { version = "0.5", features = ["all"] }
 mirage-wfp = { path = "crates/mirage-wfp" }

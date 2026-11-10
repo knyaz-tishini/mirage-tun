@@ -101,6 +101,25 @@ pub struct TunConfig {
     /// that has no hole.
     #[serde(default = "default_bypass_refresh_secs")]
     pub bypass_refresh_secs: u64,
+    /// The applications that leave the tunnel.
+    ///
+    /// The bypass above is about DESTINATIONS; this is about APPLICATIONS:
+    /// the listed images keep using the physical interface while everything
+    /// else goes through the tunnel.  It needs the Mullvad split-tunnel
+    /// driver (`mullvad-split-tunnel.sys`), which must be installed and
+    /// running; without it the list is ignored.
+    ///
+    /// Each entry is an image name (`node.exe`) or a full path.
+    #[serde(default)]
+    pub split_tunnel_apps: Vec<String>,
+    /// The policy, as it was written into tun.json.
+    ///
+    /// The device reads the application rules from it: an application that
+    /// the policy sends around the tunnel should leave the tunnel BY
+    /// APPLICATION, not only by network.  Whoever writes tun.json may or may
+    /// not fill in `split_tunnel_apps`; the policy is the fallback.
+    #[serde(default)]
+    pub policy: Option<mirage_tun_core::policy::PolicyConfigRequest>,
 }
 
 /// Direct-egress bypass list (`bypass` object in tun.json).
@@ -238,6 +257,8 @@ impl Default for TunConfig {
             dns_concurrency: default_dns_concurrency(),
             socks5_concurrency: default_socks5_concurrency(),
             drain_timeout_secs: default_drain_timeout_secs(),
+            split_tunnel_apps: Vec::new(),
+            policy: None,
             monitor_url: None,
             monitor_api_key: None,
             api_key: None,

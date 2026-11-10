@@ -235,7 +235,18 @@ pub async fn run_service_logic(
         }
     };
 
-    let policy = Arc::new(mirage_tun_core::policy::PolicyEngine::mirage_only());
+    // The preset is beside the device: its domains, networks and
+    // applications go around the tunnel from the very first moment, even
+    // before anyone pushes a policy.
+    let preset_rules = crate::preset::Preset::get()
+        .map(|preset| preset.policy_rules())
+        .unwrap_or_default();
+    let policy = Arc::new(mirage_tun_core::policy::PolicyEngine::new(
+        mirage_tun_core::policy::CompiledPolicy::compile(
+            preset_rules,
+            mirage_tun_core::policy::PolicyDecision::default_chain(),
+        ),
+    ));
     let dns_map = Arc::new(crate::dns_map::DnsMap::new());
     let chains = Arc::new(crate::chains::ChainRegistry::empty());
     let metrics = Arc::new(MetricsRegistry::new());

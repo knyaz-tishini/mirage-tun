@@ -14,6 +14,8 @@ pub mod rawip;
 pub mod routing;
 pub mod runtime_guard;
 pub mod service;
+pub mod preset;
+pub mod split_tunnel;
 pub mod stack;
 pub mod state;
 pub mod tcp_acceptor;

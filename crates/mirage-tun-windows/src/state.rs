@@ -28,6 +28,9 @@ pub struct ServiceState {
     pub socks5_addr: Option<SocketAddr>,
     pub tun_name: String,
     pub killswitch: Option<crate::firewall::WfpKillSwitch>,
+    /// The applications that leave the tunnel, if the split-tunnel driver
+    /// took them.
+    pub split_tunnel: Option<crate::split_tunnel::SplitTunnel>,
     pub if_index: u32,
     pub dns_map: Arc<crate::dns_map::DnsMap>,
     pub chains: Arc<crate::chains::ChainRegistry>,
@@ -53,6 +56,7 @@ impl ServiceState {
             socks5_addr: None,
             tun_name,
             killswitch: None,
+            split_tunnel: None,
             if_index: 0,
             dns_map: Arc::new(crate::dns_map::DnsMap::new()),
             chains: Arc::new(crate::chains::ChainRegistry::empty()),

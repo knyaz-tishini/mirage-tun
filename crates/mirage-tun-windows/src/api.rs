@@ -334,6 +334,13 @@ pub async fn activate_tun_inner(
     // again while the tunnel is up and the holes follow.
     let mut plan = crate::bypass::BypassPlan::from_policy(initial_policy.as_ref());
     plan.merge(crate::bypass::BypassPlan::from_config(&state.config.bypass));
+    // The networks of the preset are not drilled: a hole is a route in the
+    // routing table, and the list of a country is thousands of prefixes.
+    // They stay in the policy, and the data plane walks out with them.
+    if let Some(preset) = crate::preset::Preset::get() {
+        let preset_cidrs = preset.cidr_strings();
+        plan.cidrs.retain(|cidr| !preset_cidrs.contains(&cidr.trim().to_ascii_lowercase()));
+    }
     crate::bypass::log_plan(&plan);
 
     // The networks: a hole each.
@@ -419,6 +426,69 @@ pub async fn activate_tun_inner(
     killswitch.set_bypass_cidrs_v6(bypass_cidrs_v6_for_wfp);
     if let Err(e) = killswitch.activate(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate (non-fatal): {e}");
+    }
+
+    // The applications that leave the tunnel.
+    //
+    // The bypass above is about destinations; this is about the images: the
+    // listed applications keep using the physical interface while everything
+    // else goes through the tunnel.  The work is done by the split-tunnel
+    // driver — if it is not there, the tunnel goes on without it.
+    //
+    // The list comes from two places: the explicit `split_tunnel_apps`, and
+    // the application rules of the policy (an application the policy sends
+    // around the tunnel should leave it BY APPLICATION as well).  Whoever
+    // writes tun.json may fill in one and not the other.
+    let mut applications = state.config.split_tunnel_apps.clone();
+    if let Some(preset) = crate::preset::Preset::get() {
+        for app in &preset.apps {
+            let app = app.trim();
+            if !app.is_empty() && !applications.iter().any(|a| a.eq_ignore_ascii_case(app)) {
+                applications.push(app.to_owned());
+            }
+        }
+    }
+    if let Some(policy) = state.config.policy.as_ref() {
+        for rule in &policy.rules {
+            if let mirage_tun_core::policy::PolicyRule::DestAppPath { path, action, .. } = rule {
+                if matches!(action, mirage_tun_core::policy::PolicyDecision::Bypass)
+                    && !applications.iter().any(|a| a.eq_ignore_ascii_case(path))
+                {
+                    applications.push(path.clone());
+                }
+            }
+        }
+    }
+    if !applications.is_empty() {
+        let tunnel_ip = state
+            .config
+            .tun_addr
+            .split('/')
+            .next()
+            .and_then(|a| a.trim().parse::<std::net::Ipv4Addr>().ok());
+        let internet_ip = gateway
+            .as_ref()
+            .and_then(|g| g.parse::<std::net::IpAddr>().ok())
+            .and_then(crate::split_tunnel::local_address_for);
+        match (tunnel_ip, internet_ip) {
+            (Some(tunnel), Some(internet)) => {
+                let engaged = tokio::task::spawn_blocking(move || {
+                    crate::split_tunnel::SplitTunnel::engage(tunnel, internet, &applications)
+                })
+                .await;
+                match engaged {
+                    Ok(Ok(split)) => {
+                        info!("activate: the split-tunnel is engaged");
+                        s.split_tunnel = Some(split);
+                    }
+                    Ok(Err(e)) => warn!("activate: the split-tunnel did not engage (non-fatal): {e}"),
+                    Err(e) => warn!("activate: the split-tunnel panicked (non-fatal): {e}"),
+                }
+            }
+            _ => warn!(
+                "activate: the split-tunnel needs the tunnel address and the physical address; it was not engaged"
+            ),
+        }
     }
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -772,6 +842,13 @@ async fn post_tun_stop(
 
     let mut s = state.service.lock().await;
 
+    // The applications come back into the tunnel: the driver takes its
+    // filters down and its device is closed.
+    if let Some(split) = s.split_tunnel.take() {
+        drop(split);
+        info!("TUN stop: the split-tunnel is disengaged");
+    }
+
     if let Some(mut ks) = s.killswitch.take() {
         let _ = ks.deactivate();
     }
@@ -891,9 +968,19 @@ async fn post_admin_restart(
 
 async fn get_policy(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let config = state.policy.get_config().await;
+    // The preset's rules are not shown: they are not the person's rules, and
+    // a client that read them and wrote them back would double them.
+    let preset_len = crate::preset::Preset::get()
+        .map(|preset| preset.policy_rules().len())
+        .unwrap_or(0);
+    let rules = if preset_len > 0 && config.rules.len() >= preset_len {
+        config.rules[..config.rules.len() - preset_len].to_vec()
+    } else {
+        config.rules.clone()
+    };
     Json(serde_json::json!({
         "default_action": config.default_action,
-        "rules": config.rules,
+        "rules": rules,
     }))
 }
 
@@ -901,9 +988,29 @@ async fn set_policy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<mirage_tun_core::policy::PolicyConfigRequest>,
 ) -> StatusCode {
-    let compiled = mirage_tun_core::policy::CompiledPolicy::compile(req.rules.clone(), req.default_action.clone());
-    let new_bypass_cidrs = compiled.bypass_cidrs();
-    let new_bypass_cidrs_v6 = compiled.bypass_cidrs_v6();
+    // The preset's rules go after the ones of whoever pushed the policy:
+    // the person's own rule must not be overruled by the preset.
+    let mut rules = req.rules.clone();
+    if let Some(preset) = crate::preset::Preset::get() {
+        rules.extend(preset.policy_rules());
+    }
+    let compiled = mirage_tun_core::policy::CompiledPolicy::compile(rules, req.default_action.clone());
+    // The networks of the preset are NOT permits and NOT holes: a hole is a
+    // route, and the list of a country is thousands of prefixes.  They stay
+    // in the policy, and the data plane walks out of the tunnel with them.
+    let (preset_v4, preset_v6) = crate::preset::Preset::get()
+        .map(|preset| preset.cidr_pairs())
+        .unwrap_or_default();
+    let new_bypass_cidrs: Vec<(u32, u32)> = compiled
+        .bypass_cidrs()
+        .into_iter()
+        .filter(|pair| !preset_v4.contains(pair))
+        .collect();
+    let new_bypass_cidrs_v6: Vec<(u128, u128)> = compiled
+        .bypass_cidrs_v6()
+        .into_iter()
+        .filter(|pair| !preset_v6.contains(pair))
+        .collect();
     state.policy.update(compiled).await;
     info!("Policy updated via API");
 
