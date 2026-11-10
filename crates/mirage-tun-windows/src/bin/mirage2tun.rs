@@ -353,6 +353,9 @@ fn debug_run() {
         let mut buffer = [0u8; 64];
         let logic = mirage_tun_windows::service::run_service_logic(None, stop_tx.clone(), stop_rx);
         tokio::pin!(logic);
+        // Once the pipe is closed it stays closed: reading it again would
+        // only repeat the same line until the service winds down.
+        let mut pipe_closed = false;
         loop {
             tokio::select! {
                 result = &mut logic => {
@@ -365,17 +368,25 @@ fn debug_run() {
                     tracing::info!("Ctrl-C received, shutting down");
                     let _ = stop_tx.send(());
                 }
-                read = stdin.read(&mut buffer) => {
+                read = async {
+                    if pipe_closed {
+                        std::future::pending::<std::io::Result<usize>>().await
+                    } else {
+                        stdin.read(&mut buffer).await
+                    }
+                } => {
                     match read {
                         // The window is gone.
                         Ok(0) => {
                             tracing::info!("the window closed the pipe — giving the routes back");
                             let _ = stop_tx.send(());
+                            pipe_closed = true;
                         }
                         Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, "the pipe to the window broke — shutting down");
                             let _ = stop_tx.send(());
+                            pipe_closed = true;
                         }
                     }
                 }

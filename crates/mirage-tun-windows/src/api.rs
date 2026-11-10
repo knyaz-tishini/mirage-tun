@@ -186,6 +186,7 @@ async fn get_status(
 pub async fn activate_tun_inner(
     state: &Arc<AppState>,
     params: TunStartParams,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), TunError> {
     // Resolve TUN interface index via spawn_blocking BEFORE taking the mutex so
     // we don't block the async executor with a sync subprocess call while holding
@@ -243,6 +244,14 @@ pub async fn activate_tun_inner(
     s.tun_phase = TunPhase::Transitioning;
 
     let tun_name = s.tun_name.clone();
+
+    // The device was asked to stop while it was starting: the routes must
+    // not go up behind the back of the shutdown.  A device that is killed
+    // mid-start leaves its routes behind, and the machine loses its way out.
+    if cancel.is_cancelled() {
+        s.tun_phase = TunPhase::AdapterReady;
+        return Err(TunError::Other("the device was asked to stop while starting".to_owned()));
+    }
 
     let t0 = std::time::Instant::now();
 
@@ -327,19 +336,11 @@ pub async fn activate_tun_inner(
     plan.merge(crate::bypass::BypassPlan::from_config(&state.config.bypass));
     crate::bypass::log_plan(&plan);
 
-    // The resolver the machine had before the tunnel gets a hole too: the
-    // names must be answered the way the person sees them, or the addresses
-    // the application uses are not the addresses the hole covers.
-    if let Some(dns) = native_dns {
-        if needs_hole(dns.ip()) {
-            let cidr = format!("{}/{}", dns.ip(), host_prefix(dns.ip()));
-            if let Err(e) = routing.add_bypass_cidr(&cidr).await {
-                warn!(cidr, "activate: the hole for the resolver was refused: {e}");
-            }
-        }
-    }
-
     // The networks: a hole each.
+    //
+    // The NAMES are not drilled here: a name is a question to a resolver,
+    // and the answer must not hold the tunnel hostage while it comes.  The
+    // watcher drills those holes right after the device is up.
     let tunnel_addr = state
         .config
         .tun_addr
@@ -355,63 +356,31 @@ pub async fn activate_tun_inner(
             warn!(cidr, "activate: the bypass hole was refused: {e}");
         }
     }
-
-    // The names: a hole for every address the name points at.
-    let mut domain_ips: BTreeSet<IpAddr> = BTreeSet::new();
-    for domain in &plan.domains {
-        let ips = crate::bypass::resolve_both(native_dns, None, domain, RESOLVE_TIMEOUT).await;
-        if ips.is_empty() {
-            warn!(domain, "activate: the name has no address yet; the hole follows it later");
-        }
-        domain_ips.extend(ips);
-    }
-    for ip in &domain_ips {
-        let cidr = format!("{ip}/{}", host_prefix(*ip));
-        if let Err(e) = routing.add_bypass_cidr(&cidr).await {
-            warn!(cidr, "activate: the bypass hole was refused: {e}");
-        }
-    }
-    if !plan.cidrs.is_empty() || !plan.domains.is_empty() {
-        info!(
-            networks = plan.cidrs.len(),
-            names = plan.domains.len(),
-            addresses = domain_ips.len(),
-            "activate: the bypass holes are in place"
-        );
+    if !plan.cidrs.is_empty() {
+        info!(networks = plan.cidrs.len(), "activate: the bypass holes are in place");
     }
 
     // The resolver the adapter asks.
     //
-    // When the person excluded names, the names must be answered the way
-    // they answered before the tunnel: the application then takes the
-    // addresses the hole covers, and the question itself does not have to
-    // go through the tunnel.  The machine's own resolver is the one that
-    // answers that way -- but only if it answers at all: a resolver that
-    // stays silent would leave the machine without names.
-    let dns_ip = if !plan.domains.is_empty() && !domain_ips.is_empty() {
-        match native_dns {
-            Some(dns) if is_usable_dns(dns) => {
-                info!(
-                    resolver = %dns.ip(),
-                    "activate: the names are answered by the machine's own resolver"
-                );
-                dns.ip().to_string()
-            }
-            _ => state.config.dns_upstream.ip().to_string(),
-        }
-    } else if raw_ip_mode && !is_usable_dns(state.config.dns_upstream) {
-        warn!(
-            "raw_ip mode: dns_upstream {} is not usable - using {FALLBACK_DNS}",
-            state.config.dns_upstream
-        );
-        FALLBACK_DNS.to_owned()
-    } else {
-        state.config.dns_upstream.ip().to_string()
-    };
-    let _ = tokio::process::Command::new("netsh")
-        .args(["interface", "ip", "set", "dns", &tun_name, "static", &dns_ip])
-        .output()
-        .await;
+    // With no excluded names, the names go through the tunnel: the adapter
+    // asks the upstream of the tunnel.  With excluded names the watcher
+    // takes the adapter over -- it points the adapter at the machine's own
+    // resolver as soon as that resolver has answered a question.
+    if plan.domains.is_empty() {
+        let dns_ip = if raw_ip_mode && !is_usable_dns(state.config.dns_upstream) {
+            warn!(
+                "raw_ip mode: dns_upstream {} is not usable - using {FALLBACK_DNS}",
+                state.config.dns_upstream
+            );
+            FALLBACK_DNS.to_owned()
+        } else {
+            state.config.dns_upstream.ip().to_string()
+        };
+        let _ = tokio::process::Command::new("netsh")
+            .args(["interface", "ip", "set", "dns", &tun_name, "static", &dns_ip])
+            .output()
+            .await;
+    }
 
     // WFP: the holes must be permitted, or the kill-switch would cut the
     // very traffic they exist for.
@@ -436,6 +405,11 @@ pub async fn activate_tun_inner(
 
     // Activate WFP kill-switch (needs if_index for native bypass permit).
     // TUN interface index was resolved via spawn_blocking before taking the mutex.
+    if cancel.is_cancelled() {
+        // The routes are up and nobody wants them: the routing gives them
+        // back on the way out.
+        return Err(TunError::Other("the device was asked to stop while starting".to_owned()));
+    }
     let mut killswitch = crate::firewall::WfpKillSwitch::new();
     killswitch.set_native_if_index(if_index);
     if let Some(tun_idx) = pre_resolved_tun_idx {
@@ -526,7 +500,7 @@ pub async fn activate_tun_inner(
             gateway,
             if_index,
             plan.cidrs.clone(),
-            domain_ips.clone(),
+            BTreeSet::new(),
             cancel.clone(),
         );
     }
@@ -600,12 +574,33 @@ fn spawn_bypass_watcher(
     let interval = Duration::from_secs(state.config.bypass_refresh_secs.max(5));
     tokio::spawn(async move {
         let mut known = known;
+        let mut resolver_holed = false;
+        let mut dns_answered = false;
         info!(
             names = domains.len(),
             every = interval.as_secs(),
             "bypass: the watcher is watching the names"
         );
         loop {
+            // The resolver's own hole: the question must not go through the
+            // tunnel, or the answer would be the other side's addresses.
+            if !resolver_holed {
+                if let Some(dns) = native_dns {
+                    if needs_hole(dns.ip()) {
+                        let cidr = format!("{}/{}", dns.ip(), host_prefix(dns.ip()));
+                        match crate::routing::drill_hole(&cidr, gateway.as_deref(), if_index).await {
+                            Ok(hole) => {
+                                info!(cidr = %hole.cidr, "bypass: the resolver has a hole");
+                                remember_hole(&state, hole, &plan_cidrs).await;
+                            }
+                            Err(e) => warn!(cidr, error = %e, "bypass: the hole for the resolver was refused"),
+                        }
+                    }
+                    resolver_holed = true;
+                }
+            }
+
+            let mut fresh: Vec<IpAddr> = Vec::new();
             for domain in &domains {
                 // Two answers: the one the machine's own resolver gives and
                 // the one the tunnel's resolver gives.  The hole covers both,
@@ -619,34 +614,53 @@ fn spawn_bypass_watcher(
                 )
                 .await;
                 for ip in ips {
-                    if !known.insert(ip) {
-                        continue;
-                    }
-                    let cidr = format!("{ip}/{}", host_prefix(ip));
-                    match crate::routing::drill_hole(&cidr, gateway.as_deref(), if_index).await {
-                        Ok(hole) => {
-                            info!(cidr = %hole.cidr, domain, "bypass: the hole follows the name");
-                            let mut s = state.service.lock().await;
-                            s.bypass_holes.push(hole);
-                            let permits = wfp_permits(&plan_cidrs, &s.bypass_holes);
-                            let relay_ips: Vec<IpAddr> = s.bypass_addrs.clone();
-                            let tun_name = s.tun_name.clone();
-                            if let Some(ks) = s.killswitch.as_mut() {
-                                if let Err(e) = ks.update_bypass_cidrs(
-                                    permits.0,
-                                    permits.1,
-                                    &relay_ips,
-                                    &tun_name,
-                                    &[],
-                                ) {
-                                    warn!("WFP bypass permit update failed (non-fatal): {e}");
-                                }
-                            }
-                        }
-                        Err(e) => warn!(cidr, error = %e, "bypass: the hole was refused"),
+                    if known.insert(ip) {
+                        fresh.push(ip);
                     }
                 }
             }
+            for ip in &fresh {
+                let cidr = format!("{ip}/{}", host_prefix(*ip));
+                match crate::routing::drill_hole(&cidr, gateway.as_deref(), if_index).await {
+                    Ok(hole) => {
+                        info!(cidr = %hole.cidr, "bypass: the hole follows the name");
+                        remember_hole(&state, hole, &plan_cidrs).await;
+                    }
+                    Err(e) => warn!(cidr, error = %e, "bypass: the hole was refused"),
+                }
+            }
+
+            // The adapter's resolver: the machine's own, once that resolver
+            // has answered a question.  A resolver that stays silent would
+            // take the names of the whole machine away.
+            if !dns_answered && !known.is_empty() {
+                if let Some(dns) = native_dns {
+                    if is_usable_dns(dns) {
+                        dns_answered = true;
+                        let tun_name = {
+                            let s = state.service.lock().await;
+                            s.tun_name.clone()
+                        };
+                        info!(
+                            resolver = %dns.ip(),
+                            "bypass: the names are answered by the machine's own resolver"
+                        );
+                        let _ = tokio::process::Command::new("netsh")
+                            .args([
+                                "interface",
+                                "ip",
+                                "set",
+                                "dns",
+                                &tun_name,
+                                "static",
+                                &dns.ip().to_string(),
+                            ])
+                            .output()
+                            .await;
+                    }
+                }
+            }
+
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(interval) => {}
@@ -654,6 +668,24 @@ fn spawn_bypass_watcher(
         }
         info!("bypass: the watcher stopped");
     });
+}
+
+/// Remember a hole: it is the device's own, and it goes when the tunnel goes.
+async fn remember_hole(
+    state: &Arc<AppState>,
+    hole: crate::routing::BypassHole,
+    plan_cidrs: &[String],
+) {
+    let mut s = state.service.lock().await;
+    s.bypass_holes.push(hole);
+    let permits = wfp_permits(plan_cidrs, &s.bypass_holes);
+    let relay_ips: Vec<IpAddr> = s.bypass_addrs.clone();
+    let tun_name = s.tun_name.clone();
+    if let Some(ks) = s.killswitch.as_mut() {
+        if let Err(e) = ks.update_bypass_cidrs(permits.0, permits.1, &relay_ips, &tun_name, &[]) {
+            warn!("WFP bypass permit update failed (non-fatal): {e}");
+        }
+    }
 }
 
 /// The addresses the kill-switch must let through: the networks the person
@@ -687,7 +719,9 @@ async fn post_tun_start(
     State(state): State<Arc<AppState>>,
     Json(params): Json<TunStartParams>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    activate_tun_inner(&state, params).await.map_err(map_err)?;
+    activate_tun_inner(&state, params, tokio_util::sync::CancellationToken::new())
+        .await
+        .map_err(map_err)?;
     Ok(StatusCode::OK)
 }
 

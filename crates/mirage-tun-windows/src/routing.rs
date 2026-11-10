@@ -372,6 +372,16 @@ fn v4_mask(prefix: u8) -> String {
     )
 }
 
+/// The route is already there: the hole is drilled, whoever drilled it.
+///
+/// A device that was killed instead of stopped leaves its holes in the
+/// routing.  The next device must take them over -- otherwise the hole is
+/// never tracked, never permitted by the kill-switch and never closed.
+fn already_exists(err: &TunError) -> bool {
+    let text = err.to_string().to_lowercase();
+    text.contains("already exists") || text.contains("object already exists")
+}
+
 /// Drill a hole: the prefix leaves the machine through the real gateway.
 ///
 /// This is the whole bypass: a route that is more specific than the
@@ -408,24 +418,35 @@ pub async fn drill_hole(
                 ])
                 .await;
                 if let Err(e) = result {
-                    warn!(cidr, error = %e, "Routing: netsh refused the hole; trying route.exe");
-                    let mask = v4_mask(prefix);
-                    run_route(&[
-                        "add",
-                        &addr.to_string(),
-                        "mask",
-                        &mask,
-                        gw,
-                        "METRIC",
-                        "1",
-                        "IF",
-                        &idx,
-                    ])
-                    .await?;
+                    if already_exists(&e) {
+                        info!(cidr = %prefix_text, "Routing: the hole was already there");
+                    } else {
+                        warn!(cidr, error = %e, "Routing: netsh refused the hole; trying route.exe");
+                        let mask = v4_mask(prefix);
+                        let fallback = run_route(&[
+                            "add",
+                            &addr.to_string(),
+                            "mask",
+                            &mask,
+                            gw,
+                            "METRIC",
+                            "1",
+                            "IF",
+                            &idx,
+                        ])
+                        .await;
+                        if let Err(e) = fallback {
+                            if already_exists(&e) {
+                                info!(cidr = %prefix_text, "Routing: the hole was already there");
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
             } else {
                 let mask = v4_mask(prefix);
-                run_route(&[
+                let result = run_route(&[
                     "add",
                     &addr.to_string(),
                     "mask",
@@ -434,7 +455,13 @@ pub async fn drill_hole(
                     "METRIC",
                     "1",
                 ])
-                .await?;
+                .await;
+                if let Err(e) = result {
+                    if !already_exists(&e) {
+                        return Err(e);
+                    }
+                    info!(cidr = %prefix_text, "Routing: the hole was already there");
+                }
             }
             info!(cidr = %prefix_text, gateway = %gw, if_index, "Routing: the hole is drilled");
             Ok(BypassHole {
@@ -452,7 +479,7 @@ pub async fn drill_hole(
                 )));
             };
             let idx = if_index.to_string();
-            run_netsh_route(&[
+            let result = run_netsh_route(&[
                 "interface",
                 "ipv6",
                 "add",
@@ -463,7 +490,13 @@ pub async fn drill_hole(
                 "metric=1",
                 "store=active",
             ])
-            .await?;
+            .await;
+            if let Err(e) = result {
+                if !already_exists(&e) {
+                    return Err(e);
+                }
+                info!(cidr = %prefix_text, "Routing: the hole was already there");
+            }
             info!(cidr = %prefix_text, gateway = %gw, if_index, "Routing: the IPv6 hole is drilled");
             Ok(BypassHole {
                 cidr: prefix_text,

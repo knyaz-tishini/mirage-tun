@@ -118,8 +118,9 @@ pub(crate) fn save_chains_to_config(chains: &[crate::chains::ChainConfig]) {
 async fn autostart_activate(
     state: Arc<crate::api::AppState>,
     params: crate::api::TunStartParams,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    crate::api::activate_tun_inner(&state, params).await?;
+    crate::api::activate_tun_inner(&state, params, cancel).await?;
     Ok(())
 }
 
@@ -281,8 +282,15 @@ pub async fn run_service_logic(
     info!("Management API listening on {api_bind}");
 
     // Autostart TUN if config exists
-    {
+    //
+    // The startup has its own cancel: the device may be asked to stop while
+    // it is still coming up (the adapter alone takes seconds), and a startup
+    // that goes on after the stop leaves the routes behind -- the machine
+    // loses its way out.
+    let startup_cancel = tokio_util::sync::CancellationToken::new();
+    let startup_task = {
         let autostart_state = Arc::clone(&app_state);
+        let autostart_cancel = startup_cancel.clone();
         tokio::spawn(async move {
             if let Some(config_path) = find_config() {
                 info!("Autostart: found config at {}", config_path.display());
@@ -290,7 +298,7 @@ pub async fn run_service_logic(
                     Ok(contents) => {
                         match serde_json::from_str::<crate::api::TunStartParams>(&contents) {
                             Ok(params) => {
-                                match autostart_activate(autostart_state, params).await {
+                                match autostart_activate(autostart_state, params, autostart_cancel).await {
                                     Ok(()) => info!("Autostart: TUN activated successfully"),
                                     Err(e) => tracing::warn!("Autostart: TUN activation failed: {e}"),
                                 }
@@ -303,8 +311,8 @@ pub async fn run_service_logic(
             } else {
                 info!("Autostart: no tun.json found, waiting for API call");
             }
-        });
-    }
+        })
+    };
 
     // Report Running to SCM after successful bind
     if let Some(ref handle) = status_handle {
@@ -332,6 +340,14 @@ pub async fn run_service_logic(
         }
     }
 
+    // The startup must not go on: the device is going down.
+    startup_cancel.cancel();
+    // Wait for it: a startup that sets the routes after the shutdown would
+    // leave the machine without its way out.  The adapter takes seconds, so
+    // the wait is generous -- the window kills the device only after its own
+    // patience is out.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), startup_task).await;
+
     // Graceful shutdown
     {
         let mut s = svc_state.lock().await;
@@ -346,6 +362,14 @@ pub async fn run_service_logic(
             let _ = std::process::Command::new("netsh")
                 .args(["interface", "ipv4", "delete", "route", "128.0.0.0/1", &format!("interface={name}"), "store=active"])
                 .output();
+        }
+        // The holes the device drilled are the device's own: they go with it.
+        let holes: Vec<crate::routing::BypassHole> = s.bypass_holes.drain(..).collect();
+        for hole in &holes {
+            crate::routing::close_hole(hole);
+        }
+        if !holes.is_empty() {
+            info!(holes = holes.len(), "the bypass holes are closed");
         }
         if s.proxy_active.is_some() {
             crate::proxy::clear_system_proxy().await;
