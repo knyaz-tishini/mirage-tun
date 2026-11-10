@@ -70,6 +70,23 @@ type FnGetReadWaitEvent =
 /// Wintun ring buffer size: 0x20000 (131072 bytes, minimum 0x20000, max 0x4000000).
 const WINTUN_RING_CAPACITY: u32 = 0x0020_0000; // 2 MiB
 
+/// How often the reader had to wait for the plane.
+static QUEUE_STALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long the reader waited, in milliseconds.
+static STALLED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The counters of the queue between the adapter and the plane.
+///
+/// The adapter drops the packets that do not fit into its ring, and it does
+/// it silently. These counters are how one sees it coming.
+pub fn queue_stats() -> (u64, u64) {
+    (
+        QUEUE_STALLS.load(std::sync::atomic::Ordering::Relaxed),
+        STALLED_MS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 // ── WintunShared ─────────────────────────────────────────────────────────────
 
 pub(crate) struct WintunShared {
@@ -120,7 +137,13 @@ impl WintunReader {
     /// returns NULL) or when the channel receiver is dropped.
     pub fn start_reader_thread(&self) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
         let shared = Arc::clone(&self.shared);
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        // The queue is a thousand packets deep: with a path MTU of 1280 that
+        // is over a megabyte of slack between the adapter and the plane. When
+        // the queue is full the reader waits, and the adapter's own ring
+        // fills up -- and the adapter DROPS the packets that do not fit,
+        // silently. The waiting is counted, so a stall of the plane is
+        // visible in the log instead of being a mystery.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
 
         std::thread::Builder::new()
             .name("wintun-reader".into())
@@ -150,9 +173,26 @@ impl WintunReader {
                         let data = unsafe { std::slice::from_raw_parts(pkt_ptr, len).to_vec() };
                         unsafe { (shared.fn_release)(shared.session.0, pkt_ptr) };
 
+                        // The wait is the tell: a queue that is full means the
+                        // plane was slow, and the adapter is about to drop
+                        // packets without telling anybody.
+                        let began = std::time::Instant::now();
                         if tx.blocking_send(data).is_err() {
                             info!("wintun-reader: channel closed, exiting");
                             return;
+                        }
+                        let waited = began.elapsed();
+                        if waited > std::time::Duration::from_millis(20) {
+                            let stalls = QUEUE_STALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            let total = STALLED_MS.fetch_add(
+                                waited.as_millis() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            warn!(
+                                stalls,
+                                total_ms = total,
+                                "wintun-reader: the queue was full -- the plane was slow"
+                            );
                         }
                     }
                 }
@@ -421,6 +461,30 @@ fn assign_ip_address(tun_name: &str, tun_addr: &str, mtu: u16) -> Result<()> {
     }
 
     info!(name = tun_name, addr = addr_str, mask = %netmask, mtu, "IP address assigned");
+    Ok(())
+}
+
+/// Give the adapter another IPv4 address, without taking it down.
+///
+/// The command replaces the address that is there. The routes (the halves of
+/// the address space) stay on the interface, so the machine keeps its way out
+/// while the address changes -- which is the whole point: a device that is
+/// torn down and brought up again costs the machine a minute of its way out.
+pub fn set_adapter_address(tun_name: &str, tun_addr: &str) -> Result<()> {
+    let (addr_str, prefix_str) = tun_addr
+        .split_once('/')
+        .ok_or_else(|| TunError::Wintun(format!(
+            "tun_addr '{tun_addr}' is not in CIDR notation"
+        )))?;
+    let prefix_len: u8 = prefix_str.trim().parse().map_err(|_| {
+        TunError::Wintun(format!("invalid prefix length in tun_addr '{tun_addr}'"))
+    })?;
+    let netmask = prefix_to_netmask(prefix_len);
+    run_netsh(&[
+        "interface", "ip", "set", "address",
+        tun_name, "static", addr_str, &netmask,
+    ])?;
+    info!(name = tun_name, addr = addr_str, mask = %netmask, "IP address changed");
     Ok(())
 }
 

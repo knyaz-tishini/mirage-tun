@@ -46,7 +46,7 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWPM_SUBLAYER0,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+use windows_sys::Win32::Storage::FileSystem::{CreateFileW, QueryDosDeviceW};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -451,12 +451,28 @@ impl SplitTunnel {
         // The images the driver matches are NT device paths
         // (`\Device\HarddiskVolumeN\...`), so the names have to be resolved
         // against the processes that are running right now.
+        //
+        // One name that cannot be resolved is not a reason to give the whole
+        // list up: the applications that ARE known still leave the tunnel.
+        // A bare name ("node.exe") that is not running right now cannot be
+        // resolved at all -- the driver gets it when the process shows up.
         let running = running_processes();
         let mut excluded: Vec<Vec<u16>> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
         for wanted in applications {
-            let path = resolve_application(wanted, &running)
-                .ok_or_else(|| SplitTunnelError::NoSuchApplication(wanted.clone()))?;
-            excluded.push(wide(&path));
+            match resolve_application(wanted, &running) {
+                Some(path) => excluded.push(wide(&path)),
+                None => missing.push(wanted.clone()),
+            }
+        }
+        if excluded.is_empty() {
+            return Err(SplitTunnelError::NoSuchApplication(missing.join(", ")));
+        }
+        if !missing.is_empty() {
+            tracing::info!(
+                missing = %missing.join(", "),
+                "split-tunnel: these names are not running now; the rest of the list leaves the tunnel"
+            );
         }
 
         // The sublayers must exist before the driver is initialized: the
@@ -529,14 +545,26 @@ impl SplitTunnel {
         ioctl(device.0, IOCTL_SET_CONFIGURATION, Some(&configuration), &mut out)?;
 
         // The events: the driver says who started and who stopped.
+        //
+        // The driver tells about every process on the machine, so the log
+        // only carries the names the person asked about.
+        let watched: Vec<String> = excluded
+            .iter()
+            .filter_map(|path| {
+                let text = String::from_utf16_lossy(path);
+                text.rsplit('\\').next().map(|name| name.to_lowercase())
+            })
+            .filter(|name| !name.is_empty())
+            .collect();
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let events = {
             let stop = Arc::clone(&stop);
+            let watched = watched.clone();
             thread::Builder::new()
                 .name("mirage-split-tunnel".into())
                 .spawn(move || {
-                    event_loop(device, stop);
+                    event_loop(device, stop, watched);
                     let _ = done_tx.send(());
                 })
                 .ok()
@@ -566,10 +594,15 @@ impl SplitTunnel {
         }
         let running = running_processes();
         let mut excluded: Vec<Vec<u16>> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
         for wanted in applications {
-            let path = resolve_application(wanted, &running)
-                .ok_or_else(|| SplitTunnelError::NoSuchApplication(wanted.clone()))?;
-            excluded.push(wide(&path));
+            match resolve_application(wanted, &running) {
+                Some(path) => excluded.push(wide(&path)),
+                None => missing.push(wanted.clone()),
+            }
+        }
+        if excluded.is_empty() {
+            return Err(SplitTunnelError::NoSuchApplication(missing.join(", ")));
         }
         let configuration = pack_configuration(&excluded);
         let mut out: [u8; 0] = [];
@@ -701,7 +734,12 @@ fn guids_bytes(guids: &SublayerGuids) -> [u8; 32] {
 }
 
 /// The events: who started and who stopped being out of the tunnel.
-fn event_loop(device: SharedHandle, stop: Arc<AtomicBool>) {
+///
+/// The driver tells about EVERY process on the machine -- it has to, it is
+/// the one that decides who leaves the tunnel. So the log only carries the
+/// names the person asked about; the rest is a debug line. A log that grows
+/// by megabytes a minute is a log nobody reads.
+fn event_loop(device: SharedHandle, stop: Arc<AtomicBool>, watched: Vec<String>) {
     let mut buffer = vec![0u8; 4096];
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -746,11 +784,19 @@ fn event_loop(device: SharedHandle, stop: Arc<AtomicBool>) {
         match event_id {
             EVENT_START_SPLITTING => {
                 let name = event_name(&buffer[16..returned.min(16 + size)]);
-                tracing::info!(application = %name, "split-tunnel: the application left the tunnel");
+                if watched.iter().any(|watched| name.to_lowercase().contains(watched)) {
+                    tracing::info!(application = %name, "split-tunnel: the application left the tunnel");
+                } else {
+                    tracing::debug!(application = %name, "split-tunnel: an application left the tunnel");
+                }
             }
             EVENT_STOP_SPLITTING => {
                 let name = event_name(&buffer[16..returned.min(16 + size)]);
-                tracing::info!(application = %name, "split-tunnel: the application came back into the tunnel");
+                if watched.iter().any(|watched| name.to_lowercase().contains(watched)) {
+                    tracing::info!(application = %name, "split-tunnel: the application came back into the tunnel");
+                } else {
+                    tracing::debug!(application = %name, "split-tunnel: an application came back into the tunnel");
+                }
             }
             _ => {
                 tracing::debug!(event_id, "split-tunnel: an event from the driver");
@@ -823,6 +869,14 @@ fn resolve_application(wanted: &str, running: &[(u32, u32, Vec<u16>)]) -> Option
     if wanted.is_empty() {
         return None;
     }
+    // A full path the person wrote ("E:\MU\main.exe") is translated into the
+    // device path of its own accord -- the drive alone says which volume it
+    // is on. The application does NOT have to be running for that: the driver
+    // takes the list of images and excludes them when they show up. Only a
+    // bare name ("node.exe") needs a running process to say where it lives.
+    if let Some(path) = device_path_from_dos(wanted) {
+        return Some(path);
+    }
     let wanted_file = wanted
         .rsplit(|c| c == '/' || c == '\\')
         .next()
@@ -850,6 +904,43 @@ fn resolve_application(wanted: &str, running: &[(u32, u32, Vec<u16>)]) -> Option
         }
     }
     None
+}
+
+/// The device path of a DOS path ("E:\MU\main.exe").
+///
+/// The drive is asked what volume it is, and the rest of the path is kept:
+/// "\Device\HarddiskVolume3\MU\main.exe". The file itself does not have to
+/// exist -- the driver excludes an image when it starts, not when it is
+/// already running.
+fn device_path_from_dos(wanted: &str) -> Option<String> {
+    let text = wanted.trim();
+    let mut chars = text.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    if chars.next()? != ':' {
+        return None;
+    }
+    let rest = &text[2..];
+    if !rest.contains('\\') && !rest.contains('/') {
+        return None;
+    }
+    let name: Vec<u16> = format!("{}:", drive.to_ascii_uppercase()).encode_utf16().collect();
+    let mut buffer = vec![0u16; 1024];
+    let length = unsafe {
+        QueryDosDeviceW(name.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+    };
+    if length == 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+    let device = String::from_utf16_lossy(&buffer[..end]);
+    if device.is_empty() {
+        return None;
+    }
+    let rest = rest.replace('/', "\\");
+    Some(format!("{device}{rest}"))
 }
 
 /// A wide string without a terminator: the driver reads the length itself.

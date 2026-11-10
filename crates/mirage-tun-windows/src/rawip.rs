@@ -218,8 +218,9 @@ impl RawIpRunner {
                     _ = cancel3.cancelled() => break,
                     _ = tokio::time::sleep(STATS_INTERVAL) => {
                         let s = &stats3;
+                        let (stalls, stalled_ms) = crate::wintun::queue_stats();
                         info!(
-                            "rawip stats: to_client={} from_client={} dropped_oversize={} malformed={} reconnects={} write_errors={} io_errors={}",
+                            "rawip stats: to_client={} from_client={} dropped_oversize={} malformed={} reconnects={} write_errors={} io_errors={} queue_stalls={} stalled_ms={}",
                             s.to_client.load(Ordering::Relaxed),
                             s.from_client.load(Ordering::Relaxed),
                             s.dropped_oversize.load(Ordering::Relaxed),
@@ -227,6 +228,8 @@ impl RawIpRunner {
                             s.reconnects.load(Ordering::Relaxed),
                             s.write_errors.load(Ordering::Relaxed),
                             s.io_errors.load(Ordering::Relaxed),
+                            stalls,
+                            stalled_ms,
                         );
                     }
                 }

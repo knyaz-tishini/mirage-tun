@@ -115,6 +115,81 @@ pub(crate) fn save_chains_to_config(chains: &[crate::chains::ChainConfig]) {
     }
 }
 
+/// The address the box names can change while the device runs.
+///
+/// The window writes the address the box assigned into tun.json. The device
+/// watches that file: when the address there is another one, the adapter
+/// takes it -- without the routes going down and without the session
+/// breaking. A refused change is tried again on the next tick.
+fn spawn_address_watcher(tun_name: String, current: String) {
+    tokio::spawn(async move {
+        let mut current = current;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            ticker.tick().await;
+            let Some(path) = find_config() else {
+                continue;
+            };
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            let Some(addr) = value.get("tun_addr").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if addr == current {
+                continue;
+            }
+            let from = current.clone();
+            let name = tun_name.clone();
+            let target = addr.to_owned();
+            let old_v6 = crate::config::derive_ipv6_addr(&from);
+            let new_v6 = crate::config::derive_ipv6_addr(&target);
+            info!(
+                from = %from,
+                to = %target,
+                "the box named another address -- the adapter takes it"
+            );
+            let taken = tokio::task::spawn_blocking({
+                let target = target.clone();
+                move || {
+                    // The IPv4 first: the box cares about that one.
+                    crate::wintun::set_adapter_address(&name, &target)
+                        .map_err(|error| error.to_string())?;
+                    // The IPv6 follows: it is derived from the IPv4 (10.77.0.N
+                    // is fd77::N), so the old one goes and the new one comes.
+                    if let Some(old) = old_v6 {
+                        if let Err(error) = crate::wintun::remove_ipv6_address(&name, &old) {
+                            tracing::warn!(error = %error, "the old IPv6 address stayed");
+                        }
+                    }
+                    if let Some(new) = new_v6 {
+                        if let Err(error) = crate::wintun::assign_ipv6_address(&name, &new) {
+                            tracing::warn!(error = %error, "the new IPv6 address did not come");
+                        }
+                    }
+                    Ok::<(), String>(())
+                }
+            })
+            .await;
+            match taken {
+                Ok(Ok(())) => {
+                    current = target;
+                    info!(addr = %current, "the adapter carries the new address");
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(error = %error, "the adapter did not take the new address -- trying again");
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "the address change did not finish");
+                }
+            }
+        }
+    });
+}
+
 async fn autostart_activate(
     state: Arc<crate::api::AppState>,
     params: crate::api::TunStartParams,
@@ -324,6 +399,16 @@ pub async fn run_service_logic(
             }
         })
     };
+
+    // The address the box names can change while the device runs.
+    //
+    // The box hands out one address per session, and a session that comes
+    // back gets another one. The device takes the new address on the fly: a
+    // restart would cost the machine its way out for the better part of a
+    // minute -- and the restart breaks the session, which is how the address
+    // changed in the first place. The window writes the new address into
+    // tun.json; the device reads it and gives the adapter that address.
+    spawn_address_watcher(tun_name.clone(), tun_addr.clone());
 
     // Report Running to SCM after successful bind
     if let Some(ref handle) = status_handle {
