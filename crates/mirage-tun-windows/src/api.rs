@@ -753,9 +753,13 @@ pub async fn activate_tun_inner(
     // change under it, so the holes are drilled again and again while the
     // tunnel is up.
     if !plan.domains.is_empty() {
+        let protected = crate::preset::Preset::get()
+            .map(|preset| preset.protect_strings())
+            .unwrap_or_default();
         spawn_bypass_watcher(
             Arc::clone(state),
             plan.domains.clone(),
+            protected,
             native_resolvers.clone(),
             state.config.dns_upstream,
             gateway,
@@ -824,6 +828,7 @@ fn needs_hole(ip: IpAddr) -> bool {
 fn spawn_bypass_watcher(
     state: Arc<AppState>,
     domains: Vec<String>,
+    protected: Vec<String>,
     native_resolvers: Vec<SocketAddr>,
     tunnel_dns: SocketAddr,
     gateway: Option<String>,
@@ -923,6 +928,48 @@ fn spawn_bypass_watcher(
                     fresh.push(ip);
                 }
             }
+            // The names that must not go around the tunnel.  A hole is an
+            // address, and an address is often shared: a name served by a big
+            // CDN answers with the same addresses as another name, and a hole
+            // for one of them takes the traffic of the other one with it.
+            // These names are resolved as well, and their addresses never get
+            // a hole -- whatever else points at them.
+            let mut guarded: BTreeSet<IpAddr> = BTreeSet::new();
+            if !protected.is_empty() {
+                let mut questions: Vec<_> = Vec::with_capacity(protected.len());
+                for domain in &protected {
+                    let native_resolvers = live_resolvers.clone();
+                    let tunnel_dns = tunnel_dns;
+                    questions.push(async move {
+                        let mut answers =
+                            crate::bypass::resolve_with(&native_resolvers, domain, RESOLVE_TIMEOUT)
+                                .await;
+                        let mut ips = answers.addresses.clone();
+                        ips.extend(
+                            crate::bypass::resolve(tunnel_dns, domain, RESOLVE_TIMEOUT).await,
+                        );
+                        ips.sort();
+                        ips.dedup();
+                        answers.addresses = ips;
+                        answers
+                    });
+                }
+                let answers: Vec<crate::bypass::ResolverAnswers> =
+                    futures::stream::iter(questions)
+                        .buffer_unordered(RESOLVE_PARALLEL)
+                        .collect()
+                        .await;
+                for answer in answers {
+                    guarded.extend(answer.addresses);
+                }
+                if !guarded.is_empty() {
+                    info!(
+                        names = protected.len(),
+                        addresses = guarded.len(),
+                        "bypass: the names that must not leave the tunnel are guarded"
+                    );
+                }
+            }
             info!(
                 names = domains.len(),
                 addresses = known.len(),
@@ -949,11 +996,22 @@ fn spawn_bypass_watcher(
             // it.  One process per hole would take minutes for a hundred
             // names.
             let mut holes: Vec<String> = Vec::with_capacity(fresh.len());
+            let mut kept = 0usize;
             for ip in &fresh {
+                if guarded.contains(ip) {
+                    kept += 1;
+                    continue;
+                }
                 let cidr = format!("{ip}/{}", host_prefix(*ip));
                 if crate::bypass::hole_is_safe(&cidr, tunnel_addr) {
                     holes.push(cidr);
                 }
+            }
+            if kept > 0 {
+                info!(
+                    kept,
+                    "bypass: the shared addresses keep no hole"
+                );
             }
             if !holes.is_empty() {
                 let drilled =

@@ -49,6 +49,15 @@ pub struct Preset {
     /// The applications that go around the tunnel.
     #[serde(default)]
     pub apps: Vec<String>,
+    /// The names that must NOT go around the tunnel.
+    ///
+    /// A hole is an address, and an address is often shared: a name served by
+    /// a big CDN answers with the same addresses as another name.  A hole
+    /// for one of them takes the traffic of the other one with it.  These
+    /// names are resolved as well, and their addresses never get a hole --
+    /// whatever else points at them.
+    #[serde(default)]
+    pub protect: Vec<String>,
 }
 
 impl Preset {
@@ -129,13 +138,28 @@ impl Preset {
         names
     }
 
+    /// The names that must not go around the tunnel, as they are written.
+    ///
+    /// They are resolved by the watcher, and their addresses never get a
+    /// hole: a hole follows an address, and an address is often shared.
+    pub fn protect_strings(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .protect
+            .iter()
+            .map(|domain| normalize_domain(domain))
+            .filter(|domain| !domain.is_empty())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// The networks of the preset, as they are written.
     ///
     /// They are NOT drilled as holes: a hole is a route in the routing
     /// table, and the list of a country is thousands of prefixes.  They stay
     /// in the policy, and the data plane walks out of the tunnel with them.
-    pub fn cidr_strings(&self) -> HashSet<String> {
-        self.cidrs
+    pub fn cidr_strings(&self) -> HashSet<String> {        self.cidrs
             .iter()
             .map(|c| c.trim().to_ascii_lowercase())
             .filter(|c| !c.is_empty())
