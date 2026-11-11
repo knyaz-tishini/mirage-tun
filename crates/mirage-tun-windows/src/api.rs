@@ -271,15 +271,28 @@ pub async fn activate_tun_inner(
     // is closed, which is the truth of the moment.
     let (early_gateway, early_if_index) =
         crate::routing::read_default_gateway_v4().await.unwrap_or_default();
-    let mut early_relay_ips: Vec<IpAddr> = Vec::new();
+    // The entrances of the chain, as addresses.
+    //
+    // The window hands them over as bare hosts, and the device needs the
+    // addresses: the socket to the box must not be routed into the tunnel
+    // that carries it, or the client talks to itself and the tunnel never
+    // comes up.  A name is asked of the machine's own resolvers -- right
+    // now, while the routes of the tunnel are not up yet, so the question
+    // goes the way it went before the tunnel.
+    let early_dns = discover_native_dns(early_if_index).await;
+    let early_resolvers =
+        native_resolvers(early_if_index, Some(early_gateway.as_str()), early_dns).await;
+    let mut relay_ips: Vec<IpAddr> = Vec::new();
     for relay in &params.relay_addrs {
-        if let Ok(ip) = relay.parse::<IpAddr>() {
-            early_relay_ips.push(ip);
+        for ip in resolve_entrance(relay, &early_resolvers).await {
+            if !relay_ips.contains(&ip) {
+                relay_ips.push(ip);
+            }
         }
     }
     let mut early_killswitch = crate::firewall::WfpKillSwitch::new();
     early_killswitch.set_native_if_index(early_if_index);
-    if let Err(e) = early_killswitch.activate_pre_tunnel(&early_relay_ips, &tun_name, &[]) {
+    if let Err(e) = early_killswitch.activate_pre_tunnel(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate before the tunnel (non-fatal): {e}");
     } else {
         info!("activate: the kill-switch is up before the tunnel");
@@ -339,12 +352,11 @@ pub async fn activate_tun_inner(
     // provider filters the questions to the others.
     let native_resolvers = native_resolvers(if_index, gateway.as_deref(), native_dns).await;
 
-    let mut relay_ips: Vec<IpAddr> = Vec::new();
-    for relay in &params.relay_addrs {
-        if let Ok(ip) = relay.parse::<IpAddr>() {
-            routing.add_bypass(ip).await?;
-            relay_ips.push(ip);
-        }
+    // The entrances of the chain keep their holes: the socket to the box
+    // goes the way it went before the tunnel, or the tunnel carries its own
+    // carrier and never comes up.
+    for ip in &relay_ips {
+        routing.add_bypass(*ip).await?;
     }
     info!("activate: bypass routes = {}ms", t0.elapsed().as_millis());
 
@@ -1271,6 +1283,52 @@ async fn native_resolvers(
         "bypass: the names are asked of the machine's own resolvers"
     );
     servers
+}
+
+/// The addresses of one entrance of the chain.
+///
+/// The window hands the entrances over as bare hosts, and the device needs
+/// the addresses: the socket to the box must not be routed into the tunnel
+/// that carries it, or the client talks to itself and the tunnel never comes
+/// up.  A name is asked of the machine's own resolvers; the first one that
+/// answers is enough.
+async fn resolve_entrance(entry: &str, resolvers: &[SocketAddr]) -> Vec<IpAddr> {
+    let host = entry
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(entry)
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim();
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    if host.is_empty() {
+        return Vec::new();
+    }
+    let mut addresses: Vec<IpAddr> = Vec::new();
+    for server in resolvers {
+        for ip in crate::bypass::resolve(*server, host, Duration::from_millis(1500)).await {
+            if !addresses.contains(&ip) {
+                addresses.push(ip);
+            }
+        }
+        if !addresses.is_empty() {
+            break;
+        }
+    }
+    if addresses.is_empty() {
+        warn!(
+            entrance = %entry,
+            "activate: the entrance did not answer - its traffic may be routed into the tunnel"
+        );
+    } else {
+        info!(
+            entrance = %entry,
+            addresses = addresses.len(),
+            "activate: the entrance is known by address"
+        );
+    }
+    addresses
 }
 
 async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
