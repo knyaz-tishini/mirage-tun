@@ -55,7 +55,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::ProcessStatus::K32GetProcessImageFileNameW;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
-use windows_sys::Win32::System::Services::{OpenServiceW, StartServiceW};
+use windows_sys::Win32::System::Services::{
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, StartServiceW, SC_MANAGER_CONNECT,
+    SERVICE_QUERY_STATUS, SERVICE_START,
+};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -121,6 +124,13 @@ const EVENT_STOP_SPLITTING: u32 = 1;
 pub enum SplitTunnelError {
     /// The driver is not there (not installed, or not started).
     DeviceUnavailable(String),
+    /// The driver is held by another instance.
+    ///
+    /// The device of the driver is exclusive: while one instance of the
+    /// tunnel holds it, the next one is told to go away.  That is not a
+    /// failure -- it is a queue.  The instance that holds it is shutting
+    /// down, and the next one has to wait for it.
+    DeviceBusy(u32),
     /// The driver refused a request.
     Driver(String, u32),
     /// The WFP layer refused.
@@ -135,6 +145,9 @@ impl fmt::Display for SplitTunnelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SplitTunnelError::DeviceUnavailable(m) => write!(f, "the split-tunnel device is not there: {m}"),
+            SplitTunnelError::DeviceBusy(code) => {
+                write!(f, "the split-tunnel device is held by another instance (error {code})")
+            }
             SplitTunnelError::Driver(m, code) => write!(f, "the split-tunnel driver refused: {m} (0x{code:08X})"),
             SplitTunnelError::Wfp(m, code) => write!(f, "the firewall refused: {m} (0x{code:08X})"),
             SplitTunnelError::NoSuchApplication(m) => write!(f, "no running application matches '{m}'"),
@@ -487,7 +500,7 @@ impl SplitTunnel {
         let mut excluded: Vec<Vec<u16>> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
         for wanted in applications {
-            match resolve_application(wanted, &running) {
+            match resolve_application(wanted, &running, false) {
                 Some(path) => excluded.push(wide(&path)),
                 None => missing.push(wanted.clone()),
             }
@@ -712,7 +725,7 @@ impl SplitTunnel {
         let mut excluded: Vec<Vec<u16>> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
         for wanted in applications {
-            match resolve_application(wanted, &running) {
+            match resolve_application(wanted, &running, false) {
                 Some(path) => excluded.push(wide(&path)),
                 None => missing.push(wanted.clone()),
             }
@@ -756,40 +769,52 @@ impl Drop for SplitTunnel {
 }
 
 /// Open the driver's device.
+///
+/// The device is exclusive.  When the tunnel is restarted -- and it is
+/// restarted every time the box names another address -- the new instance
+/// arrives while the old one is still closing the device.  The old answer
+/// was to treat that as "the driver is not there" and to go on without the
+/// app-bypass: the window came up, the applications went through the
+/// tunnel, and the person was told nothing.  The device is not missing --
+/// it is held.  So we wait for it, and the app-bypass is only given up when
+/// the wait is over.
 fn open_device() -> Result<HANDLE, SplitTunnelError> {
-    let handle = open_device_once();
-    if handle.is_ok() {
-        return handle;
-    }
-    // The driver is installed but not running: start it and try again.
-    //
-    // The device of the driver appears a moment after the service says it is
-    // running -- the driver still has to load and create it.  A single try
-    // after half a second was a coin toss, and the coin fell on the side
-    // where the app-bypass stayed off with a quiet warning.
-    if !start_driver_service() {
-        return Err(handle.err().unwrap_or(SplitTunnelError::DeviceUnavailable(
-            "the driver is not installed".into(),
-        )));
-    }
     let mut wait = Duration::from_millis(200);
-    for attempt in 1..=12 {
-        thread::sleep(wait);
+    let mut last: Option<SplitTunnelError> = None;
+    let mut service_asked = false;
+    for attempt in 1..=60 {
         match open_device_once() {
             Ok(handle) => {
-                tracing::info!(attempt, "split-tunnel: the driver is up");
+                if attempt > 1 {
+                    tracing::info!(attempt, "split-tunnel: the device was waited for");
+                }
                 return Ok(handle);
             }
             Err(e) => {
-                let last = e;
-                wait = (wait * 2).min(Duration::from_millis(1500));
-                if attempt == 12 {
-                    return Err(last);
+                let busy = matches!(e, SplitTunnelError::DeviceBusy(_));
+                if !busy && !service_asked {
+                    // The driver is installed but not running: start it and
+                    // try again.
+                    service_asked = true;
+                    start_driver_service();
+                }
+                if matches!(e, SplitTunnelError::DeviceUnavailable(_)) {
+                    last = Some(e);
+                } else {
+                    last = Some(e);
+                }
+                if busy {
+                    tracing::info!(
+                        attempt,
+                        "split-tunnel: the device is held by another instance - waiting for it"
+                    );
                 }
             }
         }
+        thread::sleep(wait);
+        wait = (wait * 2).min(Duration::from_millis(1000));
     }
-    Err(handle.err().unwrap_or(SplitTunnelError::DeviceUnavailable(
+    Err(last.unwrap_or(SplitTunnelError::DeviceUnavailable(
         "the driver is not installed".into(),
     )))
 }
@@ -808,9 +833,16 @@ fn open_device_once() -> Result<HANDLE, SplitTunnelError> {
         )
     };
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        let error = io::Error::last_os_error();
+        let code = error.raw_os_error().unwrap_or(0);
+        // 5 = ACCESS_DENIED, 32 = SHARING_VIOLATION: the device is there and
+        // somebody else holds it.
+        if code == 5 || code == 32 {
+            return Err(SplitTunnelError::DeviceBusy(code as u32));
+        }
         return Err(SplitTunnelError::DeviceUnavailable(format!(
             "the driver is not installed or not started (error {})",
-            io::Error::last_os_error()
+            error
         )));
     }
     Ok(handle)
@@ -820,13 +852,26 @@ fn open_device_once() -> Result<HANDLE, SplitTunnelError> {
 fn start_driver_service() -> bool {
     let name: Vec<u16> = "mullvad-split-tunnel\0".encode_utf16().collect();
     unsafe {
-        let service = OpenServiceW(ptr::null_mut(), name.as_ptr(), 0x000f_01ff);
+        // The manager first: a service handle is opened FROM the manager, and
+        // a null manager is an invalid handle -- the old code asked for the
+        // service with one and got error 6 every time, and the warning said
+        // the driver was not there when it was merely held.
+        let manager = OpenSCManagerW(ptr::null_mut(), ptr::null_mut(), SC_MANAGER_CONNECT);
+        if manager.is_null() {
+            tracing::warn!(
+                error = GetLastError(),
+                "split-tunnel: the service manager could not be opened"
+            );
+            return false;
+        }
+        let service = OpenServiceW(manager, name.as_ptr(), SERVICE_START | SERVICE_QUERY_STATUS);
         if service.is_null() {
             let error = GetLastError();
             tracing::warn!(
                 error,
                 "split-tunnel: the driver's service could not be opened - the app-bypass stays off"
             );
+            CloseServiceHandle(manager);
             return false;
         }
         let started = StartServiceW(service, 0, ptr::null()) != 0;
@@ -837,7 +882,8 @@ fn start_driver_service() -> bool {
                 "split-tunnel: the driver's service did not start - the app-bypass stays off"
             );
         }
-        CloseHandle(service);
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
         started
     }
 }
@@ -1043,7 +1089,7 @@ fn device_path_of(pid: u32) -> Option<Vec<u16>> {
 }
 
 /// Find the device path of the application the person named.
-fn resolve_application(wanted: &str, running: &[(u32, u32, Vec<u16>)]) -> Option<String> {
+fn resolve_application(wanted: &str, running: &[(u32, u32, Vec<u16>)], search_disk: bool) -> Option<String> {
     let wanted = wanted.trim();
     if wanted.is_empty() {
         return None;
@@ -1092,10 +1138,17 @@ fn resolve_application(wanted: &str, running: &[(u32, u32, Vec<u16>)]) -> Option
     // to be found on the disk -- otherwise the application goes into the
     // tunnel the moment it starts, and the work of the machine slows down to
     // the speed of the tunnel.
-    if let Some(path) = find_application_on_disk(&wanted_file) {
-        if let Some(device_path) = device_path_from_dos(&path) {
-            tracing::info!(application = %wanted_file, path = %path, "split-tunnel: the application was found on the disk");
-            return Some(device_path);
+    //
+    // The search on the disk is EIGHT SECONDS of budget per name, and it does
+    // not belong on the way the device comes up: the device that is slow to
+    // start is the device that is killed before it carries.  The caller looks
+    // for them in the background and hands the paths over.
+    if search_disk {
+        if let Some(path) = find_application_on_disk(&wanted_file) {
+            if let Some(device_path) = device_path_from_dos(&path) {
+                tracing::info!(application = %wanted_file, path = %path, "split-tunnel: the application was found on the disk");
+                return Some(device_path);
+            }
         }
     }
     None

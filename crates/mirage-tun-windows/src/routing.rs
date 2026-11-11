@@ -525,6 +525,11 @@ pub fn close_hole(hole: &BypassHole) {
 
 /// Close a hole without the async runtime.
 pub fn close_hole_sync(hole: &BypassHole) {
+    // The routing API first: a child process per hole costs a tenth of a
+    // second, and a sweep of a hundred holes would eat the machine's start.
+    if close_hole_via_api(hole) {
+        return;
+    }
     let Ok((addr, prefix)) = parse_cidr(&hole.cidr) else {
         return;
     };
@@ -920,6 +925,84 @@ pub async fn cleanup_stale_routes(tun_name: &str) {
         run_netsh_route(&args3),
     );
     debug!("Routing: stale route cleanup done");
+}
+
+/// Close a hole through the routing API of the system.
+///
+/// The row is built the same way the drilling builds it, so the API finds the
+/// route it is asked to remove.  Returns whether the route is gone.
+fn close_hole_via_api(hole: &BypassHole) -> bool {
+    let Some((row, _)) = hole_route(&hole.cidr, hole.gateway.as_deref(), hole.if_index) else {
+        return false;
+    };
+    let code = unsafe { DeleteIpForwardEntry2(&row) };
+    match code {
+        NO_ERROR => true,
+        ERROR_NOT_FOUND => true,
+        _ => false,
+    }
+}
+
+/// The holes that outlived their tunnel.
+///
+/// A hole is a route to the gateway the machine had before the tunnel took
+/// the default.  The list of the holes lives in the memory of the device, and
+/// a device that is killed takes the list with it -- the routes stay.  A hole
+/// left behind keeps the traffic of that address out of the tunnel with the
+/// tunnel off: the machine leaks exactly where the person said it must not.
+///
+/// The sweep finds them by their shape: host routes on the physical
+/// interface that point at the gateway of the machine.  The networks of the
+/// preset are not drilled as routes at all, so they are not touched.
+///
+/// It runs BEFORE the fresh holes are drilled, so the holes of this run are
+/// never in its way.
+pub async fn cleanup_stale_holes(if_index: u32, gateway: &str) -> usize {
+    if if_index == 0 || gateway.trim().is_empty() {
+        return 0;
+    }
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Get-NetRoute -AddressFamily IPv4 | \
+         Where-Object {{ $_.InterfaceIndex -eq {if_index} -and $_.NextHop -eq '{gateway}' }} | \
+         Select-Object -ExpandProperty DestinationPrefix"
+    );
+    let out = match tokio::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .await
+    {
+        Ok(out) => out,
+        Err(error) => {
+            warn!(error = %error, "Routing: the stale holes could not be listed");
+            return 0;
+        }
+    };
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut removed = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((addr, prefix)) = line.split_once('/') else {
+            continue;
+        };
+        if prefix != "32" {
+            continue;
+        }
+        if addr.parse::<std::net::Ipv4Addr>().is_err() {
+            continue;
+        }
+        let hole = BypassHole {
+            cidr: line.to_owned(),
+            if_index,
+            gateway: Some(gateway.to_owned()),
+        };
+        close_hole_sync(&hole);
+        removed += 1;
+    }
+    if removed > 0 {
+        info!(removed, "Routing: the stale holes are closed");
+    }
+    removed
 }
 
 async fn run_route(args: &[&str]) -> Result<()> {

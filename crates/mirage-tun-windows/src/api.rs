@@ -339,6 +339,20 @@ pub async fn activate_tun_inner(
     let if_index = routing.original_interface_idx().unwrap_or(0);
     let gateway = routing.original_gateway().map(str::to_owned);
 
+    // The holes of the last run are swept before the fresh ones are drilled.
+    // A device that was killed left its holes in the routing table, and a
+    // hole left behind keeps the traffic of that address out of the tunnel
+    // with the tunnel off.  The sweep goes through the routing API of the
+    // system, so a hundred holes cost a fraction of a second -- through
+    // netsh they cost half a minute, and half a minute is the machine's
+    // internet in the dark.
+    if let Some(gw) = gateway.as_deref() {
+        let stale = crate::routing::cleanup_stale_holes(if_index, gw).await;
+        if stale > 0 {
+            info!(stale, "activate: the holes of the last run are swept");
+        }
+    }
+
     // D5: use pinned direct_dns from config when set; skip OS discovery entirely.
     let native_dns = if let Some(pinned) = state.config.direct_dns {
         info!("native_dns: using pinned direct_dns={pinned}");
@@ -422,26 +436,40 @@ pub async fn activate_tun_inner(
         info!(networks = plan.cidrs.len(), "activate: the bypass holes are in place");
     }
 
-    // The resolver the adapter asks.
+    // The resolver the adapter asks: the upstream of the tunnel, always.
     //
-    // With no excluded names, the names go through the tunnel: the adapter
-    // asks the upstream of the tunnel.  With excluded names the watcher
-    // takes the adapter over -- it points the adapter at the machine's own
-    // resolver as soon as that resolver has answered a question.
-    if plan.domains.is_empty() {
-        let dns_ip = if raw_ip_mode && !is_usable_dns(state.config.dns_upstream) {
-            warn!(
-                "raw_ip mode: dns_upstream {} is not usable - using {FALLBACK_DNS}",
-                state.config.dns_upstream
-            );
-            FALLBACK_DNS.to_owned()
-        } else {
-            state.config.dns_upstream.ip().to_string()
-        };
+    // The book of names is split, and the split has to happen HERE and not in
+    // the resolver of the machine.  The names that go around the tunnel are
+    // asked by the watcher, natively, and their addresses get a hole; the
+    // names that must go through the tunnel are asked by the machine -- and
+    // the machine asks the adapter, and the adapter asks the tunnel.  If the
+    // adapter were pointed at the machine's own resolver, EVERY name of the
+    // machine would be resolved by the provider of the line: the names of the
+    // tunnel would be asked outside it, and that is the leak.
+    //
+    // The applications that the kernel driver lets out of the tunnel ask the
+    // same address -- and their question goes out natively, because the driver
+    // excluded them.  That is the DNS book of the bypass: native for the
+    // excluded, through the tunnel for everybody else.
+    let dns_ip = if raw_ip_mode && !is_usable_dns(state.config.dns_upstream) {
+        warn!(
+            "raw_ip mode: dns_upstream {} is not usable - using {FALLBACK_DNS}",
+            state.config.dns_upstream
+        );
+        FALLBACK_DNS.to_owned()
+    } else {
+        state.config.dns_upstream.ip().to_string()
+    };
+    {
         let _ = tokio::process::Command::new("netsh")
             .args(["interface", "ip", "set", "dns", &tun_name, "static", &dns_ip])
             .output()
             .await;
+        info!(
+            resolver = %dns_ip,
+            names = plan.domains.len(),
+            "activate: the adapter asks the resolver of the tunnel"
+        );
     }
 
     // WFP: the holes must be permitted, or the kill-switch would cut the
@@ -561,25 +589,36 @@ pub async fn activate_tun_inner(
             (Some(tunnel), Some(internet)) => {
                 let asked = applications.clone();
                 let for_driver = applications.clone();
-                let engaged = tokio::task::spawn_blocking(move || {
-                    crate::split_tunnel::SplitTunnel::engage(tunnel, internet, &for_driver)
-                })
-                .await;
-                match engaged {
-                    Ok(Ok(split)) => {
-                        info!("activate: the split-tunnel is engaged");
-                        s.split_tunnel = Some(split);
+                let state = Arc::clone(state);
+                // The driver is engaged in the BACKGROUND.
+                //
+                // Engaging it means walking the processes of the machine and
+                // waiting for the driver to let go of the device of the
+                // previous run -- that is half a minute of work, and it is
+                // not the tunnel's work.  The tunnel has to come up first:
+                // the person waits for the tunnel, and the applications that
+                // leave it can be permitted a moment later.
+                tokio::spawn(async move {
+                    let engaged = tokio::task::spawn_blocking(move || {
+                        crate::split_tunnel::SplitTunnel::engage(tunnel, internet, &for_driver)
+                    })
+                    .await;
+                    match engaged {
+                        Ok(Ok(split)) => {
+                            info!("activate: the split-tunnel is engaged");
+                            state.service.lock().await.split_tunnel = Some(split);
+                        }
+                        Ok(Err(e)) => warn!(
+                            error = %e,
+                            apps = ?asked,
+                            "activate: the app-bypass is NOT in force -- the driver did not engage; those images go through the tunnel like everything else"
+                        ),
+                        Err(e) => warn!(
+                            error = %e,
+                            "activate: the app-bypass is NOT in force -- the driver panicked"
+                        ),
                     }
-                    Ok(Err(e)) => warn!(
-                        error = %e,
-                        apps = ?asked,
-                        "activate: the app-bypass is NOT in force -- the driver did not engage; those images go through the tunnel like everything else"
-                    ),
-                    Err(e) => warn!(
-                        error = %e,
-                        "activate: the app-bypass is NOT in force -- the driver panicked"
-                    ),
-                }
+                });
             }
             _ => warn!(
                 "activate: the split-tunnel needs the tunnel address and the physical address; it was not engaged"
@@ -635,6 +674,7 @@ pub async fn activate_tun_inner(
             }
         }
         let state_for_disk = Arc::clone(&state);
+        let running_paths = paths.clone();
         tokio::spawn(async move {
             let found = tokio::task::spawn_blocking(move || {
                 crate::split_tunnel::application_paths_on_disk(&missing)
@@ -650,6 +690,29 @@ pub async fn activate_tun_inner(
             };
             if let Err(error) = killswitch.install_app_permits(&found) {
                 warn!(error = %error, "activate: the applications found on the disk are NOT permitted past the switch");
+            }
+            // The driver learns about them too.
+            //
+            // The driver was engaged with the applications that were RUNNING
+            // when the device came up -- that is the fast way, and the tunnel
+            // must not wait for the disk.  The names that were not running are
+            // found here, in the background, and the list of the driver is
+            // replaced with the whole of it: the applications that are not
+            // running yet leave the tunnel the moment they start.
+            let mut all = running_paths;
+            all.extend(found.iter().cloned());
+            let Some(split) = guard.split_tunnel.as_mut() else {
+                return;
+            };
+            match split.set_exclusions(&all) {
+                Ok(()) => info!(
+                    applications = all.len(),
+                    "activate: the driver has the applications that were found on the disk"
+                ),
+                Err(error) => warn!(
+                    error = %error,
+                    "activate: the driver did not take the applications that were found on the disk"
+                ),
             }
         });
     }
@@ -841,8 +904,8 @@ fn spawn_bypass_watcher(
     tokio::spawn(async move {
         let mut known = known;
         let mut resolver_holed = false;
-        let mut dns_answered = false;
-        // The resolver that answers: it becomes the adapter's own.
+        // The resolver that answered most.  It is kept for the log: the
+        // adapter does NOT take it over -- that was the leak.
         let mut answered_resolver: Option<SocketAddr> = None;
         // The resolvers that are asked.  A resolver that stays silent is
         // dropped after the first round: on a line where the provider filters
@@ -858,8 +921,20 @@ fn spawn_bypass_watcher(
         loop {
             // The resolver's own hole: the question must not go through the
             // tunnel, or the answer would be the other side's addresses.
+            //
+            // The resolver of the TUNNEL is not one of them: a hole for it
+            // would take the questions of the whole machine out of the tunnel
+            // -- that is the leak.  The tunnel's own questions go through the
+            // tunnel, like everybody else's.
             if !resolver_holed {
                 for dns in &native_resolvers {
+                    if dns.ip() == tunnel_dns.ip() {
+                        info!(
+                            resolver = %dns.ip(),
+                            "bypass: the resolver of the tunnel keeps no hole"
+                        );
+                        continue;
+                    }
                     if needs_hole(dns.ip()) {
                         let cidr = format!("{}/{}", dns.ip(), host_prefix(dns.ip()));
                         match crate::routing::drill_hole(&cidr, gateway.as_deref(), if_index).await {
@@ -938,20 +1013,22 @@ fn spawn_bypass_watcher(
             if !protected.is_empty() {
                 let mut questions: Vec<_> = Vec::with_capacity(protected.len());
                 for domain in &protected {
-                    let native_resolvers = live_resolvers.clone();
                     let tunnel_dns = tunnel_dns;
                     questions.push(async move {
-                        let mut answers =
-                            crate::bypass::resolve_with(&native_resolvers, domain, RESOLVE_TIMEOUT)
-                                .await;
-                        let mut ips = answers.addresses.clone();
-                        ips.extend(
-                            crate::bypass::resolve(tunnel_dns, domain, RESOLVE_TIMEOUT).await,
-                        );
-                        ips.sort();
-                        ips.dedup();
-                        answers.addresses = ips;
-                        answers
+                        // ONLY through the tunnel.  These names must go through
+                        // it, and a question asked of the machine's own
+                        // resolver is a question asked outside the tunnel: the
+                        // provider of the line would see the name of the VPN
+                        // before the tunnel ever carried it.  The addresses
+                        // that come back are the ones the traffic will really
+                        // use -- the exit's view -- and those are the ones that
+                        // must never get a hole.
+                        let addresses = crate::bypass::resolve(tunnel_dns, domain, RESOLVE_TIMEOUT).await;
+                        crate::bypass::ResolverAnswers {
+                            addresses,
+                            best: None,
+                            counts: Vec::new(),
+                        }
                     });
                 }
                 let answers: Vec<crate::bypass::ResolverAnswers> =
@@ -1022,38 +1099,15 @@ fn spawn_bypass_watcher(
                 }
             }
 
-            // The adapter's resolver: the machine's own, once that resolver
-            // has answered a question.  A resolver that stays silent would
-            // take the names of the whole machine away -- and a silent
-            // resolver is the rule on a line where the provider filters the
-            // questions to some of them.
-            if !dns_answered && !known.is_empty() {
-                if let Some(dns) = answered_resolver {
-                    if is_usable_dns(dns) {
-                        dns_answered = true;
-                        let tun_name = {
-                            let s = state.service.lock().await;
-                            s.tun_name.clone()
-                        };
-                        info!(
-                            resolver = %dns.ip(),
-                            "bypass: the names are answered by the machine's own resolver"
-                        );
-                        let _ = tokio::process::Command::new("netsh")
-                            .args([
-                                "interface",
-                                "ip",
-                                "set",
-                                "dns",
-                                &tun_name,
-                                "static",
-                                &dns.ip().to_string(),
-                            ])
-                            .output()
-                            .await;
-                    }
-                }
-            }
+            // The adapter keeps the resolver of the tunnel.
+            //
+            // The old behaviour pointed the adapter at the machine's own
+            // resolver as soon as that resolver had answered one question.
+            // That took the names of the whole machine out of the tunnel --
+            // the names of the VPN included -- and it is the leak the book of
+            // names must not have.  The watcher asks what it needs natively,
+            // and the adapter asks the tunnel for the rest.
+            let _ = answered_resolver;
 
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -1216,6 +1270,18 @@ async fn post_tun_stop(
     }
     if !holes.is_empty() {
         info!(holes = holes.len(), "TUN stop: the bypass holes are closed");
+    }
+
+    // The holes that were not in the list -- the ones a killed device left --
+    // are swept here as well, so the machine does not leak them after the
+    // tunnel is gone.
+    let sweep_if = s.if_index;
+    let sweep_gw = s.original_gateway.clone();
+    if let Some(gw) = sweep_gw.as_deref() {
+        let stale = crate::routing::cleanup_stale_holes(sweep_if, gw).await;
+        if stale > 0 {
+            info!(stale, "TUN stop: the stale holes are swept");
+        }
     }
 
     // Clear DNS
