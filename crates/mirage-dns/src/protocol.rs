@@ -24,11 +24,13 @@ pub fn parse_header(buf: &[u8]) -> Option<ParsedHeader> {
     if buf.len() < 12 {
         return None;
     }
+    // The header of a DNS message: id, flags, and then four counts:
+    // the questions, the answers, the authorities and the additionals.
     Some(ParsedHeader {
         id: u16::from_be_bytes([buf[0], buf[1]]),
         flags: u16::from_be_bytes([buf[2], buf[3]]),
         qdcount: u16::from_be_bytes([buf[4], buf[5]]),
-        ancount: u16::from_be_bytes([buf[8], buf[9]]),
+        ancount: u16::from_be_bytes([buf[6], buf[7]]),
     })
 }
 
@@ -256,13 +258,11 @@ mod tests {
     fn build_response_with_ptr_compression(name: &str, ttl: u32) -> Vec<u8> {
         let mut buf = Vec::new();
         // Header: id=0x5678, flags=0x8180 (QR+RD+RA), qdcount=1, ancount=1
-        // NOTE: parse_header reads ancount from bytes 8-9 (not 6-7), so we
-        // place ancount=1 at the position parse_header actually reads.
         buf.extend_from_slice(&[0x56, 0x78, 0x81, 0x80]); // id + flags
         buf.extend_from_slice(&[0x00, 0x01]); // qdcount  (bytes 4-5)
-        buf.extend_from_slice(&[0x00, 0x00]); // bytes 6-7 (parse_header ignores these)
-        buf.extend_from_slice(&[0x00, 0x01]); // bytes 8-9 — ancount as parse_header sees it
-        buf.extend_from_slice(&[0x00, 0x00]); // bytes 10-11 arcount
+        buf.extend_from_slice(&[0x00, 0x01]); // ancount (bytes 6-7)
+        buf.extend_from_slice(&[0x00, 0x00]); // nscount (bytes 8-9)
+        buf.extend_from_slice(&[0x00, 0x00]); // arcount (bytes 10-11)
 
         // Question: uncompressed name
         for label in name.split('.') {
@@ -314,5 +314,53 @@ mod tests {
     fn non_nxdomain() {
         let buf = build_response_rcode(0);
         assert!(!is_nxdomain(&buf));
+    }
+
+    /// The answer count is read from the place the wire keeps it.
+    ///
+    /// The header of a DNS message is: id, flags, and then the counts of the
+    /// questions, the answers, the authorities and the additionals.  The
+    /// answers live in bytes 6 and 7; reading them from bytes 8 and 9 (the
+    /// authorities) made every answer look like there was none -- and the
+    /// bypass, which follows the names, never learned an address.
+    #[test]
+    fn the_answer_count_is_read_from_the_wire() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x12, 0x34, 0x81, 0x80]); // id + flags
+        buf.extend_from_slice(&[0x00, 0x01]); // qdcount
+        buf.extend_from_slice(&[0x00, 0x02]); // ancount = 2
+        buf.extend_from_slice(&[0x00, 0x00]); // nscount
+        buf.extend_from_slice(&[0x00, 0x00]); // arcount
+        // the question: example.com A IN
+        for label in ["example", "com"] {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0);
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        // two answers, each a compressed pointer back to the question
+        for ip in [[1u8, 2, 3, 4], [5, 6, 7, 8]] {
+            buf.extend_from_slice(&[0xC0, 0x0C]);
+            buf.extend_from_slice(&1u16.to_be_bytes()); // type A
+            buf.extend_from_slice(&1u16.to_be_bytes()); // class IN
+            buf.extend_from_slice(&300u32.to_be_bytes()); // TTL
+            buf.extend_from_slice(&4u16.to_be_bytes()); // rdlength
+            buf.extend_from_slice(&ip);
+        }
+
+        let header = parse_header(&buf).expect("the header parses");
+        assert_eq!(header.qdcount, 1);
+        assert_eq!(header.ancount, 2);
+
+        let ips = parse_answer_ips(&buf);
+        assert_eq!(
+            ips,
+            vec![
+                "1.2.3.4".parse::<std::net::IpAddr>().unwrap(),
+                "5.6.7.8".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(min_ttl_from_response(&buf), Some(300));
     }
 }

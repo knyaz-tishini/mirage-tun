@@ -173,8 +173,8 @@ mod tests {
         buf.extend_from_slice(&[id_bytes[0], id_bytes[1]]); // id
         buf.extend_from_slice(&[0x81, 0x80]);               // flags QR+RD+RA
         buf.extend_from_slice(&[0x00, 0x01]);               // qdcount
-        buf.extend_from_slice(&[0x00, 0x00]);               // bytes 6-7 (ignored by parse_header)
-        buf.extend_from_slice(&[0x00, 0x01]);               // bytes 8-9 = ancount (parse_header reads here)
+        buf.extend_from_slice(&[0x00, 0x01]);               // ancount
+        buf.extend_from_slice(&[0x00, 0x00]);               // nscount
         buf.extend_from_slice(&[0x00, 0x00]);               // arcount
         // Question section
         for label in name.split('.') {
