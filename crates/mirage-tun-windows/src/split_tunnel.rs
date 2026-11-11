@@ -42,8 +42,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmProviderAdd0, FwpmProviderDeleteByKey0,
-    FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
+    FwpmEngineClose0, FwpmEngineOpen0, FwpmProviderAdd0,
+    FwpmSubLayerAdd0, FwpmTransactionAbort0, FwpmTransactionBegin0,
     FwpmTransactionCommit0, FWP_BYTE_BLOB, FWPM_DISPLAY_DATA0, FWPM_PROVIDER0, FWPM_SESSION0,
     FWPM_SUBLAYER0,
 };
@@ -339,19 +339,16 @@ impl WfpScope {
     }
 
     /// Add our provider and the two sublayers the driver asked for.
+    ///
+    /// An object that is already there is KEPT, not replaced.  The sublayers
+    /// hold the filters of the driver, and a sublayer that is taken away
+    /// while the driver still uses it takes the filters with it -- the
+    /// driver's callouts are then left pointing at nothing, and the machine
+    /// goes down with a DPC violation (the two crashes of 12.11.2026 were
+    /// exactly that).  So the sublayers live as long as the machine does,
+    /// and a run that finds them uses them.
     fn add_sublayers(&self) -> Result<(), SplitTunnelError> {
-        match self.try_add_sublayers() {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Something of ours is left over from a run that died.  Take
-                // it away and try once more.
-                if !matches!(e, SplitTunnelError::Wfp(_, FWP_E_ALREADY_EXISTS)) {
-                    return Err(e);
-                }
-                self.remove_sublayers();
-                self.try_add_sublayers()
-            }
-        }
+        self.try_add_sublayers()
     }
 
     fn try_add_sublayers(&self) -> Result<(), SplitTunnelError> {
@@ -388,7 +385,7 @@ impl WfpScope {
             serviceName: ptr::null_mut(),
         };
         let status = unsafe { FwpmProviderAdd0(self.engine.0, &provider, ptr::null_mut()) };
-        if status != ERROR_SUCCESS {
+        if status != ERROR_SUCCESS && status != FWP_E_ALREADY_EXISTS {
             return Err(SplitTunnelError::Wfp("the provider would not be added".into(), status));
         }
 
@@ -411,7 +408,7 @@ impl WfpScope {
             weight: 0xffff,
         };
         let status = unsafe { FwpmSubLayerAdd0(self.engine.0, &baseline, ptr::null_mut()) };
-        if status != ERROR_SUCCESS {
+        if status != ERROR_SUCCESS && status != FWP_E_ALREADY_EXISTS {
             return Err(SplitTunnelError::Wfp("the baseline sublayer would not be added".into(), status));
         }
 
@@ -432,30 +429,25 @@ impl WfpScope {
             weight: 0xffff,
         };
         let status = unsafe { FwpmSubLayerAdd0(self.engine.0, &dns, ptr::null_mut()) };
-        if status != ERROR_SUCCESS {
+        if status != ERROR_SUCCESS && status != FWP_E_ALREADY_EXISTS {
             return Err(SplitTunnelError::Wfp("the DNS sublayer would not be added".into(), status));
         }
         Ok(())
-    }
-
-    /// Take the provider and the sublayers back.
-    fn remove_sublayers(&self) {
-        let status = unsafe { FwpmTransactionBegin0(self.engine.0, 0) };
-        if status != ERROR_SUCCESS {
-            return;
-        }
-        unsafe {
-            FwpmSubLayerDeleteByKey0(self.engine.0, &DNS_SUBLAYER);
-            FwpmSubLayerDeleteByKey0(self.engine.0, &BASELINE_SUBLAYER);
-            FwpmProviderDeleteByKey0(self.engine.0, &PROVIDER_KEY);
-        }
-        unsafe { FwpmTransactionCommit0(self.engine.0) };
     }
 }
 
 impl Drop for WfpScope {
     fn drop(&mut self) {
-        self.remove_sublayers();
+        // The provider and the sublayers STAY.
+        //
+        // They are ours, they are empty once the driver has reset itself
+        // (the driver takes its own filters away), and they are the one
+        // thing the driver hangs on.  Taking them away while the driver
+        // still holds filters in them makes the firewall remove those
+        // filters under the driver's feet -- the callouts are then
+        // unregistered while the driver still calls them, and the machine
+        // dies with a DPC violation.  The two crashes of 12.11.2026 came
+        // out of exactly this.
         unsafe { FwpmEngineClose0(self.engine.0) };
     }
 }
@@ -464,6 +456,9 @@ impl Drop for WfpScope {
 /// list leave the tunnel.
 pub struct SplitTunnel {
     device: SharedHandle,
+    /// The firewall session the driver hangs its filters on.  It is held
+    /// for the life of the exclusion -- it is not read, it is kept.
+    #[allow(dead_code)]
     scope: WfpScope,
     stop: Arc<AtomicBool>,
     events: Option<(std::sync::mpsc::Receiver<()>, thread::JoinHandle<()>)>,
@@ -524,20 +519,27 @@ impl SplitTunnel {
         // as "the internet".  The traffic then leaves the machine natively
         // while the tunnel stands right there, and the routing table cannot
         // explain it: the FIB is identical in every session.  The state is
-        // therefore cleared first; the WFP objects of the earlier run -- the
-        // sublayers the driver's filters hang on -- can be taken down
-        // afterwards, because the filters are gone by then.
+        // therefore cleared first.
+        //
+        // The driver is put back into its fresh state ONLY when it is not
+        // fresh already.  A reset tears the driver's firewall down and
+        // builds it again -- the filters and the callouts are unregistered
+        // and registered anew -- and the driver does not survive many of
+        // those (the upstream issue #11487 is a crash in this very path).
+        // A driver that is already fresh is left alone.
         let device = SharedHandle(open_device()?);
-        reset_driver(device.0);
+        if let Err(e) = reset_driver(device.0) {
+            unsafe { CloseHandle(device.0) };
+            return Err(e);
+        }
 
         // The sublayers must exist before the driver is initialized: the
-        // driver hangs its filters on them.  What an earlier run left behind
-        // is taken down first: a leftover provider answers "already exists"
-        // and would keep the run from ever engaging.
+        // driver hangs its filters on them.  The ones of an earlier run are
+        // KEPT: they are ours, and a sublayer that is taken away while the
+        // driver holds filters in it takes those filters with it.
         let scope = WfpScope::open()?;
-        scope.remove_sublayers();
         if let Err(e) = scope.add_sublayers() {
-            reset_driver(device.0);
+            let _ = reset_driver(device.0);
             unsafe { CloseHandle(device.0) };
             return Err(e);
         }
@@ -547,7 +549,7 @@ impl SplitTunnel {
             Ok(mut engaged) => Ok(engaged),
             Err(e) => {
                 // The driver must not keep a state it was never fully given.
-                reset_driver(device.0);
+                let _ = reset_driver(device.0);
                 // The device was opened: it must be closed again, or the
                 // driver stays busy for the next one.
                 unsafe { CloseHandle(device.0) };
@@ -568,7 +570,7 @@ impl SplitTunnel {
         let state = driver_state(device.0)?;
         if state != STATE_STARTED {
             tracing::warn!(state, "split-tunnel: the driver was not fresh, resetting it");
-            let _ = ioctl(device.0, IOCTL_RESET, None, &mut []);
+            reset_driver(device.0)?;
         }
         let state = driver_state(device.0)?;
         if state != STATE_STARTED {
@@ -749,8 +751,17 @@ impl Drop for SplitTunnel {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         // The reset takes the filters down and cancels the pending event.
-        let _ = ioctl(self.device.0, IOCTL_CLEAR_CONFIGURATION, None, &mut []);
-        let _ = ioctl(self.device.0, IOCTL_RESET, None, &mut []);
+        // Its answer is read: a driver that cannot be reset is in the state
+        // it calls ZOMBIE, and it says itself that from there it will not
+        // be able to unload.  That must be loud -- the service of the driver
+        // must not be stopped, the way the driver unloads ends in a bug
+        // check when the reset fails.
+        if let Err(e) = reset_driver(self.device.0) {
+            tracing::error!(
+                error = %e,
+                "split-tunnel: the driver did not come back to its fresh state - do NOT stop its service"
+            );
+        }
         if let Some((done, handle)) = self.events.take() {
             // The event thread is waiting on the driver; the reset above
             // cancelled it.  If it did not come back, the handle is closed
@@ -931,22 +942,67 @@ fn driver_state(device: HANDLE) -> Result<u64, SplitTunnelError> {
 /// longer going through the tunnel -- the routing table looks the same in
 /// every session -- so the state is cleared before the client does anything
 /// else, and again when the client gives up.
-fn reset_driver(device: HANDLE) {
+///
+/// A driver that is ALREADY fresh is left alone: a reset tears the firewall
+/// of the driver down and builds it again, and the driver does not survive
+/// many of those (the upstream issue #11487 is a crash in this path -- a
+/// transaction whose commit failed leaves the driver with a lock it never
+/// gives back, and the machine dies with a DPC violation).
+///
+/// The answer of the driver is read back: a driver that says it cannot reset
+/// is in the state it calls `ZOMBIE`, and from there the driver says itself
+/// that it will not be able to unload.  That must be loud, and the caller
+/// must not go on touching the firewall.
+fn reset_driver(device: HANDLE) -> Result<(), SplitTunnelError> {
+    match driver_state(device) {
+        Ok(state) if state == STATE_STARTED => {
+            return Ok(());
+        }
+        Ok(state) => {
+            tracing::warn!(state, "split-tunnel: the driver is not fresh, resetting it");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "split-tunnel: the state of the driver is unknown, resetting it");
+        }
+    }
+
     // The configuration first: it tells the driver which images are out.
     let _ = ioctl(device, IOCTL_CLEAR_CONFIGURATION, None, &mut []);
+    // The teardown of the firewall is not instant: the filters and the
+    // callouts are taken away first, the firewall is built again after
+    // that.  The reset is not asked for in the same breath.
+    std::thread::sleep(std::time::Duration::from_millis(200));
     if let Err(e) = ioctl(device, IOCTL_RESET, None, &mut []) {
-        tracing::debug!(error = %e, "split-tunnel: the driver would not reset");
-        return;
+        let code = match &e {
+            SplitTunnelError::Driver(_, code) => *code,
+            _ => 0,
+        };
+        tracing::error!(
+            error = %e,
+            "split-tunnel: the driver would not reset - it is in the state it cannot come out of. \
+             Its service must NOT be stopped: the way the driver unloads ends in a bug check."
+        );
+        return Err(SplitTunnelError::Driver("the driver would not reset".into(), code));
     }
     match driver_state(device) {
         Ok(state) => {
             if state != STATE_STARTED {
-                tracing::warn!(state, "split-tunnel: the driver is not in its fresh state");
-            } else {
-                tracing::info!("split-tunnel: the driver was reset into its fresh state");
+                tracing::error!(
+                    state,
+                    "split-tunnel: the driver is not in its fresh state - its service must NOT be stopped"
+                );
+                return Err(SplitTunnelError::Driver(
+                    "the driver is not in its fresh state".into(),
+                    state as u32,
+                ));
             }
+            tracing::info!("split-tunnel: the driver was reset into its fresh state");
+            Ok(())
         }
-        Err(e) => tracing::debug!(error = %e, "split-tunnel: the state of the driver is unknown"),
+        Err(e) => {
+            tracing::error!(error = %e, "split-tunnel: the state of the driver is unknown after the reset");
+            Err(e)
+        }
     }
 }
 
