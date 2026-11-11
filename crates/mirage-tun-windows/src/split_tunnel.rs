@@ -63,12 +63,22 @@ use windows_sys::Win32::System::Threading::{
 /// The device the driver exposes.
 const DEVICE_PATH: &str = r"\\.\MULLVADSPLITTUNNEL";
 
-/// IOCTL codes, as the driver defines them (`CTL_CODE(0x8000, fn, method, any)`).
+/// IOCTL codes, as the driver itself defines them
+/// (`CTL_CODE(0x8000, fn, method, any)`), taken from the sources of the
+/// driver (`src/defs/ioctl.h` of `mullvad/win-split-tunnel`).
 ///
-/// The numbers are the ones of the driver itself -- the same ones the
-/// Amnezia client uses: the function number and the method are a part of the
-/// code, and the driver dispatches on it.
-const IOCTL_INITIALIZE: u32 = 0x8000_0007;
+/// The function number and the method are both a part of the code, and the
+/// driver dispatches on the whole thing: `0x8000_0008` is not "initialize in
+/// the new version", it is the *event queue* (`fn 2`), and asking it to
+/// initialize means the driver waits for an event that never comes.
+const IOCTL_INITIALIZE: u32 = 0x8000_0004;
+/// The initialize of the driver of the version 1.2.5: the same function 1,
+/// but without a method, and without any input.
+///
+/// The driver of the version 1.3.0 knows the new number only, and answers
+/// "invalid function" to the old one; the driver of the version 1.2.5 knows
+/// the old number only.  The code asks both and takes the one that answers.
+const IOCTL_INITIALIZE_12: u32 = 0x8000_0007;
 const IOCTL_DEQUEUE_EVENT: u32 = 0x8000_0008;
 const IOCTL_REGISTER_IP_ADDRESSES: u32 = 0x8000_0010;
 const IOCTL_REGISTER_PROCESSES: u32 = 0x8000_000c;
@@ -561,7 +571,42 @@ impl SplitTunnel {
             dns: DNS_SUBLAYER,
         };
         let mut out: [u8; 0] = [];
-        ioctl(device.0, IOCTL_INITIALIZE, Some(&guids_bytes(&guids)), &mut out)?;
+        // The driver of the version 1.3.0 takes the two sublayer GUIDs as the
+        // input of the call (it stopped hardcoding its own sublayers); the
+        // driver of the version 1.2.5 takes nothing at all.  The two numbers
+        // are not interchangeable -- each driver knows only its own -- so the
+        // code asks each of them the way that driver understands, and takes
+        // the one that answered.
+        let guid_bytes = guids_bytes(&guids);
+        let attempts: [(u32, Option<&[u8]>); 2] = [
+            (IOCTL_INITIALIZE, Some(guid_bytes.as_slice())),
+            (IOCTL_INITIALIZE_12, None),
+        ];
+        let mut initialized = false;
+        let mut last_error = String::new();
+        for (code, input) in attempts {
+            let mut out: [u8; 0] = [];
+            match ioctl(device.0, code, input, &mut out) {
+                Ok(_) => {
+                    let state = driver_state(device.0).unwrap_or(STATE_STARTED);
+                    if state > STATE_STARTED {
+                        tracing::info!(code = format_args!("0x{code:08x}"), state, "split-tunnel: the driver took the call");
+                        initialized = true;
+                        break;
+                    }
+                    last_error = format!("the driver did not move out of its first state (code 0x{code:08x})");
+                }
+                Err(error) => {
+                    last_error = format!("code 0x{code:08x}: {error}");
+                }
+            }
+        }
+        if !initialized {
+            return Err(SplitTunnelError::Driver(
+                format!("the driver refused every way to be initialized ({last_error})"),
+                0,
+            ));
+        }
 
         // The processes of the machine: the driver watches them from now on.
         let processes = running_processes();
