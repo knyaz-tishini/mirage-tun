@@ -38,7 +38,9 @@ use std::thread;
 use std::time::Duration;
 
 use windows_sys::core::GUID;
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineOpen0, FwpmProviderAdd0, FwpmProviderDeleteByKey0,
     FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
@@ -62,7 +64,11 @@ use windows_sys::Win32::System::Threading::{
 const DEVICE_PATH: &str = r"\\.\MULLVADSPLITTUNNEL";
 
 /// IOCTL codes, as the driver defines them (`CTL_CODE(0x8000, fn, method, any)`).
-const IOCTL_INITIALIZE: u32 = 0x8000_0004;
+///
+/// The numbers are the ones of the driver itself -- the same ones the
+/// Amnezia client uses: the function number and the method are a part of the
+/// code, and the driver dispatches on it.
+const IOCTL_INITIALIZE: u32 = 0x8000_0007;
 const IOCTL_DEQUEUE_EVENT: u32 = 0x8000_0008;
 const IOCTL_REGISTER_IP_ADDRESSES: u32 = 0x8000_0010;
 const IOCTL_REGISTER_PROCESSES: u32 = 0x8000_000c;
@@ -164,11 +170,18 @@ struct ProcessEntry {
 }
 
 /// The addresses the driver needs to tell the tunnel from the internet.
+///
+/// The driver's structure is the C one: two `IN_ADDR` and two `IN6_ADDR`.
+/// An `IN_ADDR` holds the address in the order of the wire -- the big
+/// endian one.  The bytes we handed over were in the order of the machine,
+/// so the driver read 32.0.77.10 instead of 10.77.0.2, did not recognise
+/// the tunnel, and bound the traffic of the whole machine to the internet:
+/// the tunnel stood right there and carried nothing.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IpAddresses {
-    tunnel_v4: u32,
-    internet_v4: u32,
+    tunnel_v4: [u8; 4],
+    internet_v4: [u8; 4],
     tunnel_v6: [u8; 16],
     internet_v6: [u8; 16],
 }
@@ -176,8 +189,8 @@ struct IpAddresses {
 impl IpAddresses {
     fn new(tunnel: Ipv4Addr, internet: Ipv4Addr) -> Self {
         Self {
-            tunnel_v4: u32::from_ne_bytes(tunnel.octets()),
-            internet_v4: u32::from_ne_bytes(internet.octets()),
+            tunnel_v4: tunnel.octets(),
+            internet_v4: internet.octets(),
             tunnel_v6: [0; 16],
             internet_v6: [0; 16],
         }
@@ -186,8 +199,8 @@ impl IpAddresses {
     /// The forty bytes the driver reads.
     fn bytes(&self) -> [u8; 40] {
         let mut out = [0u8; 40];
-        out[0..4].copy_from_slice(&self.tunnel_v4.to_ne_bytes());
-        out[4..8].copy_from_slice(&self.internet_v4.to_ne_bytes());
+        out[0..4].copy_from_slice(&self.tunnel_v4);
+        out[4..8].copy_from_slice(&self.internet_v4);
         out[8..24].copy_from_slice(&self.tunnel_v6);
         out[24..40].copy_from_slice(&self.internet_v6);
         out
@@ -669,9 +682,32 @@ fn open_device() -> Result<HANDLE, SplitTunnelError> {
         return handle;
     }
     // The driver is installed but not running: start it and try again.
-    if start_driver_service() {
-        thread::sleep(Duration::from_millis(500));
-        return open_device_once();
+    //
+    // The device of the driver appears a moment after the service says it is
+    // running -- the driver still has to load and create it.  A single try
+    // after half a second was a coin toss, and the coin fell on the side
+    // where the app-bypass stayed off with a quiet warning.
+    if !start_driver_service() {
+        return Err(handle.err().unwrap_or(SplitTunnelError::DeviceUnavailable(
+            "the driver is not installed".into(),
+        )));
+    }
+    let mut wait = Duration::from_millis(200);
+    for attempt in 1..=12 {
+        thread::sleep(wait);
+        match open_device_once() {
+            Ok(handle) => {
+                tracing::info!(attempt, "split-tunnel: the driver is up");
+                return Ok(handle);
+            }
+            Err(e) => {
+                let last = e;
+                wait = (wait * 2).min(Duration::from_millis(1500));
+                if attempt == 12 {
+                    return Err(last);
+                }
+            }
+        }
     }
     Err(handle.err().unwrap_or(SplitTunnelError::DeviceUnavailable(
         "the driver is not installed".into(),
@@ -706,9 +742,21 @@ fn start_driver_service() -> bool {
     unsafe {
         let service = OpenServiceW(ptr::null_mut(), name.as_ptr(), 0x000f_01ff);
         if service.is_null() {
+            let error = GetLastError();
+            tracing::warn!(
+                error,
+                "split-tunnel: the driver's service could not be opened - the app-bypass stays off"
+            );
             return false;
         }
         let started = StartServiceW(service, 0, ptr::null()) != 0;
+        if !started {
+            let error = GetLastError();
+            tracing::warn!(
+                error,
+                "split-tunnel: the driver's service did not start - the app-bypass stays off"
+            );
+        }
         CloseHandle(service);
         started
     }
