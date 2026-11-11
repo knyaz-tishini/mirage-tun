@@ -1,4 +1,4 @@
-//! The holes the bypass punches into the routing.
+﻿//! The holes the bypass punches into the routing.
 //!
 //! The tunnel takes every packet: while it is up the adapter holds the
 //! default route, so a destination the person excluded has no way out
@@ -13,6 +13,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use futures::StreamExt;
 use tracing::{debug, info, warn};
 
 use mirage_tun_core::policy::CompiledPolicy;
@@ -219,6 +220,85 @@ pub async fn resolve_both(
     addresses
 }
 
+/// The addresses of a name, from every resolver that answers.
+///
+/// A resolver that stays silent is the rule on a line where the provider
+/// filters the questions: the names of the country are asked of the router
+/// and of the provider's own resolver, and the answers of every one of them
+/// are taken.  The questions go out together, so a silent resolver costs no
+/// more time than the slowest of them.
+pub async fn resolve_any(servers: &[SocketAddr], name: &str, timeout: Duration) -> Vec<IpAddr> {
+    resolve_with(servers, name, timeout).await.addresses
+}
+
+/// What the machine's own resolvers answered.
+///
+/// The addresses are the ones the machine itself would talk to -- the ones
+/// the application will use when the tunnel is off -- so the hole covers the
+/// right addresses.  The counts say who answered: a resolver that stays
+/// silent is the rule on a line where the provider filters the questions, and
+/// a silent resolver must never become the adapter's own.
+#[derive(Debug, Default)]
+pub struct ResolverAnswers {
+    /// Every address the resolvers gave.
+    pub addresses: Vec<IpAddr>,
+    /// The resolver that answered the most: the one the adapter is given.
+    pub best: Option<SocketAddr>,
+    /// How many names each resolver answered.
+    pub counts: Vec<(SocketAddr, usize)>,
+}
+
+/// The addresses of a name, and the resolver that answered.
+///
+/// The resolver that answered is the one the machine can ask: it becomes the
+/// adapter's own resolver, so the names of the machine keep working.  A
+/// resolver that stays silent must never become the adapter's: the machine
+/// would lose its names altogether.
+pub async fn resolve_with(
+    servers: &[SocketAddr],
+    name: &str,
+    timeout: Duration,
+) -> ResolverAnswers {
+    if servers.is_empty() {
+        return ResolverAnswers::default();
+    }
+    let mut questions: Vec<_> = Vec::with_capacity(servers.len());
+    for server in servers {
+        let server = *server;
+        questions.push(async move {
+            let ips = resolve(server, name, timeout).await;
+            (server, ips)
+        });
+    }
+    let pairs: Vec<(SocketAddr, Vec<IpAddr>)> = futures::stream::iter(questions)
+        .buffer_unordered(4)
+        .collect()
+        .await;
+
+    let mut answers = ResolverAnswers::default();
+    let mut counts: Vec<(SocketAddr, usize)> = Vec::with_capacity(pairs.len());
+    let mut addresses: Vec<IpAddr> = Vec::new();
+    for (server, ips) in pairs {
+        counts.push((server, ips.len()));
+        addresses.extend(ips);
+    }
+    // The resolver that answered the most speaks for the machine.  The order
+    // of the list breaks a tie: the one the interface names comes first.
+    counts.sort_by_key(|(server, count)| {
+        let order = servers.iter().position(|s| s == server).unwrap_or(usize::MAX);
+        (std::cmp::Reverse(*count), order)
+    });
+    answers.best = counts
+        .iter()
+        .find(|(_, count)| *count > 0)
+        .map(|(server, _)| *server);
+    answers.counts = counts;
+    addresses.sort();
+    addresses.dedup();
+    answers.addresses = addresses;
+    answers
+}
+
 /// The IPv4 form of a prefix, the way the firewall wants it:
 /// the network address and the mask.
 pub fn cidr_to_wfp(cidr: &str) -> Option<(u32, u32)> {
@@ -343,8 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn a_question_names_its_type() {
-        let query = build_query(0x1234, "example.com", 1);
+    fn a_question_names_its_type() {        let query = build_query(0x1234, "example.com", 1);
         assert_eq!(&query[0..2], &[0x12, 0x34]);
         // qdcount = 1
         assert_eq!(&query[4..6], &[0x00, 0x01]);

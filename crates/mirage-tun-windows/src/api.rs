@@ -11,6 +11,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use futures::StreamExt;
 use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
@@ -33,6 +34,9 @@ const FALLBACK_DNS: &str = "1.1.1.1";
 
 /// How long a name may take to answer when the holes are drilled.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How many names are asked at the same time when the holes are drilled.
+const RESOLVE_PARALLEL: usize = 16;
 
 #[derive(Serialize, Deserialize)]
 pub struct TunStartParams {
@@ -306,6 +310,10 @@ pub async fn activate_tun_inner(
         info!("native_dns discovered: {dns:?}");
         dns
     };
+    // The names of the bypass are asked of every resolver of the machine:
+    // the one the interface names and the router, which answers when the
+    // provider filters the questions to the others.
+    let native_resolvers = native_resolvers(if_index, gateway.as_deref(), native_dns).await;
 
     let mut relay_ips: Vec<IpAddr> = Vec::new();
     for relay in &params.relay_addrs {
@@ -340,6 +348,16 @@ pub async fn activate_tun_inner(
     if let Some(preset) = crate::preset::Preset::get() {
         let preset_cidrs = preset.cidr_strings();
         plan.cidrs.retain(|cidr| !preset_cidrs.contains(&cidr.trim().to_ascii_lowercase()));
+        // The NAMES of the preset ARE drilled.  The adapter takes every
+        // packet when the tunnel is up, so a name can only leave the
+        // machine through a hole that follows its addresses -- the watcher
+        // drills those holes.  Without this the names of the preset would
+        // go into the tunnel like everything else.
+        plan.merge(crate::bypass::BypassPlan {
+            cidrs: Vec::new(),
+            domains: preset.domain_strings(),
+            apps: Vec::new(),
+        });
     }
     crate::bypass::log_plan(&plan);
 
@@ -558,6 +576,35 @@ pub async fn activate_tun_inner(
     // Prevent Drop from restoring routes — we'll do it manually on stop
     std::mem::forget(routing);
 
+    // The networks of the preset leave the tunnel as well.  The exclusions
+    // of the machine are routes to the gateway it had before the tunnel, and
+    // they go in through the routing API of the system -- one route per
+    // network, in one go, the way the other clients do it.  A separate
+    // process per network would take hours for a list of a country.
+    if let Some(preset) = crate::preset::Preset::get() {
+        let networks: Vec<String> = preset
+            .cidr_strings()
+            .into_iter()
+            .filter(|cidr| !cidr.contains(':'))
+            .filter(|cidr| crate::bypass::hole_is_safe(cidr, tunnel_addr))
+            .collect();
+        if !networks.is_empty() {
+            let state = Arc::clone(state);
+            let gateway = gateway.clone();
+            tokio::spawn(async move {
+                let holes =
+                    crate::routing::drill_holes_batch(&networks, gateway.as_deref(), if_index).await;
+                info!(
+                    networks = holes.len(),
+                    "bypass: the networks of the preset leave the tunnel"
+                );
+                for hole in holes {
+                    remember_hole(&state, hole).await;
+                }
+            });
+        }
+    }
+
     // The names are holes that follow the name: the addresses of a CDN
     // change under it, so the holes are drilled again and again while the
     // tunnel is up.
@@ -565,11 +612,11 @@ pub async fn activate_tun_inner(
         spawn_bypass_watcher(
             Arc::clone(state),
             plan.domains.clone(),
-            native_dns,
+            native_resolvers.clone(),
             state.config.dns_upstream,
             gateway,
             if_index,
-            plan.cidrs.clone(),
+            tunnel_addr,
             BTreeSet::new(),
             cancel.clone(),
         );
@@ -633,11 +680,11 @@ fn needs_hole(ip: IpAddr) -> bool {
 fn spawn_bypass_watcher(
     state: Arc<AppState>,
     domains: Vec<String>,
-    native_dns: Option<SocketAddr>,
+    native_resolvers: Vec<SocketAddr>,
     tunnel_dns: SocketAddr,
     gateway: Option<String>,
     if_index: u32,
-    plan_cidrs: Vec<String>,
+    tunnel_addr: Option<IpAddr>,
     known: BTreeSet<IpAddr>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -646,8 +693,11 @@ fn spawn_bypass_watcher(
         let mut known = known;
         let mut resolver_holed = false;
         let mut dns_answered = false;
+        // The resolver that answers: it becomes the adapter's own.
+        let mut answered_resolver: Option<SocketAddr> = None;
         info!(
             names = domains.len(),
+            resolvers = native_resolvers.len(),
             every = interval.as_secs(),
             "bypass: the watcher is watching the names"
         );
@@ -655,56 +705,109 @@ fn spawn_bypass_watcher(
             // The resolver's own hole: the question must not go through the
             // tunnel, or the answer would be the other side's addresses.
             if !resolver_holed {
-                if let Some(dns) = native_dns {
+                for dns in &native_resolvers {
                     if needs_hole(dns.ip()) {
                         let cidr = format!("{}/{}", dns.ip(), host_prefix(dns.ip()));
                         match crate::routing::drill_hole(&cidr, gateway.as_deref(), if_index).await {
                             Ok(hole) => {
                                 info!(cidr = %hole.cidr, "bypass: the resolver has a hole");
-                                remember_hole(&state, hole, &plan_cidrs).await;
+                                remember_hole(&state, hole).await;
                             }
                             Err(e) => warn!(cidr, error = %e, "bypass: the hole for the resolver was refused"),
                         }
                     }
-                    resolver_holed = true;
                 }
+                resolver_holed = true;
             }
 
             let mut fresh: Vec<IpAddr> = Vec::new();
+            // The names are asked together: the preset carries dozens of them,
+            // and one question after another would hold the tunnel hostage
+            // for minutes.
+            let mut questions: Vec<_> = Vec::with_capacity(domains.len());
             for domain in &domains {
-                // Two answers: the one the machine's own resolver gives and
-                // the one the tunnel's resolver gives.  The hole covers both,
-                // so the traffic leaves the machine whichever answer the
-                // application took.
-                let ips = crate::bypass::resolve_both(
-                    native_dns,
-                    Some(tunnel_dns),
-                    domain,
-                    RESOLVE_TIMEOUT,
-                )
-                .await;
-                for ip in ips {
-                    if known.insert(ip) {
-                        fresh.push(ip);
+                let native_resolvers = native_resolvers.clone();
+                let tunnel_dns = tunnel_dns;
+                questions.push(async move {
+                    // Two answers: the one the machine's own resolver gives
+                    // and the one the tunnel's resolver gives.  The hole
+                    // covers both, so the traffic leaves the machine
+                    // whichever answer the application took.
+                    let mut answers = crate::bypass::resolve_with(
+                        &native_resolvers,
+                        domain,
+                        RESOLVE_TIMEOUT,
+                    )
+                    .await;
+                    let mut ips = answers.addresses.clone();
+                    ips.extend(
+                        crate::bypass::resolve(tunnel_dns, domain, RESOLVE_TIMEOUT).await,
+                    );
+                    ips.sort();
+                    ips.dedup();
+                    answers.addresses = ips;
+                    answers
+                });
+            }
+            let answers: Vec<crate::bypass::ResolverAnswers> =
+                futures::stream::iter(questions)
+                    .buffer_unordered(RESOLVE_PARALLEL)
+                    .collect()
+                    .await;
+            let mut asked: Vec<IpAddr> = Vec::new();
+            // How many names each of the machine's resolvers answered.
+            let mut counts: Vec<(SocketAddr, usize)> = Vec::new();
+            for answer in answers {
+                for (server, count) in answer.counts {
+                    match counts.iter_mut().find(|(s, _)| *s == server) {
+                        Some(entry) => entry.1 += count,
+                        None => counts.push((server, count)),
                     }
                 }
+                if answered_resolver.is_none() {
+                    answered_resolver = answer.best;
+                }
+                asked.extend(answer.addresses);
             }
+            for ip in asked {
+                if known.insert(ip) {
+                    fresh.push(ip);
+                }
+            }
+            info!(
+                names = domains.len(),
+                addresses = known.len(),
+                fresh = fresh.len(),
+                resolvers = ?counts,
+                "bypass: the names are resolved"
+            );
+            // The holes are drilled in one go: a route per address, through
+            // the routing API of the system -- the way the other clients do
+            // it.  One process per hole would take minutes for a hundred
+            // names.
+            let mut holes: Vec<String> = Vec::with_capacity(fresh.len());
             for ip in &fresh {
                 let cidr = format!("{ip}/{}", host_prefix(*ip));
-                match crate::routing::drill_hole(&cidr, gateway.as_deref(), if_index).await {
-                    Ok(hole) => {
-                        info!(cidr = %hole.cidr, "bypass: the hole follows the name");
-                        remember_hole(&state, hole, &plan_cidrs).await;
-                    }
-                    Err(e) => warn!(cidr, error = %e, "bypass: the hole was refused"),
+                if crate::bypass::hole_is_safe(&cidr, tunnel_addr) {
+                    holes.push(cidr);
+                }
+            }
+            if !holes.is_empty() {
+                let drilled =
+                    crate::routing::drill_holes_batch(&holes, gateway.as_deref(), if_index).await;
+                info!(holes = drilled.len(), "bypass: the holes follow the names");
+                for hole in drilled {
+                    remember_hole(&state, hole).await;
                 }
             }
 
             // The adapter's resolver: the machine's own, once that resolver
             // has answered a question.  A resolver that stays silent would
-            // take the names of the whole machine away.
+            // take the names of the whole machine away -- and a silent
+            // resolver is the rule on a line where the provider filters the
+            // questions to some of them.
             if !dns_answered && !known.is_empty() {
-                if let Some(dns) = native_dns {
+                if let Some(dns) = answered_resolver {
                     if is_usable_dns(dns) {
                         dns_answered = true;
                         let tun_name = {
@@ -741,48 +844,15 @@ fn spawn_bypass_watcher(
 }
 
 /// Remember a hole: it is the device's own, and it goes when the tunnel goes.
-async fn remember_hole(
-    state: &Arc<AppState>,
-    hole: crate::routing::BypassHole,
-    plan_cidrs: &[String],
-) {
+///
+/// The hole is a route.  The kill-switch is NOT touched here: the traffic
+/// that leaves through a hole leaves through the physical interface, and the
+/// kill-switch already lets that interface through.  Rebuilding the filters
+/// for every hole would take the firewall down hundreds of times a minute --
+/// and the handshake of the tunnel would die in the middle of it.
+async fn remember_hole(state: &Arc<AppState>, hole: crate::routing::BypassHole) {
     let mut s = state.service.lock().await;
     s.bypass_holes.push(hole);
-    let permits = wfp_permits(plan_cidrs, &s.bypass_holes);
-    let relay_ips: Vec<IpAddr> = s.bypass_addrs.clone();
-    let tun_name = s.tun_name.clone();
-    if let Some(ks) = s.killswitch.as_mut() {
-        if let Err(e) = ks.update_bypass_cidrs(permits.0, permits.1, &relay_ips, &tun_name, &[]) {
-            warn!("WFP bypass permit update failed (non-fatal): {e}");
-        }
-    }
-}
-
-/// The addresses the kill-switch must let through: the networks the person
-/// excluded and every hole that was drilled.
-fn wfp_permits(
-    plan_cidrs: &[String],
-    holes: &[crate::routing::BypassHole],
-) -> (Vec<(u32, u32)>, Vec<(u128, u128)>) {
-    let mut v4: Vec<(u32, u32)> = Vec::new();
-    let mut v6: Vec<(u128, u128)> = Vec::new();
-    for cidr in plan_cidrs {
-        if let Some(v) = crate::bypass::cidr_to_wfp(cidr) {
-            v4.push(v);
-        }
-        if let Some(v) = crate::bypass::cidr_to_wfp_v6(cidr) {
-            v6.push(v);
-        }
-    }
-    for hole in holes {
-        if let Some(v) = crate::bypass::cidr_to_wfp(&hole.cidr) {
-            v4.push(v);
-        }
-        if let Some(v) = crate::bypass::cidr_to_wfp_v6(&hole.cidr) {
-            v6.push(v);
-        }
-    }
-    (v4, v6)
 }
 
 async fn post_tun_start(
@@ -1119,6 +1189,45 @@ async fn discover_native_dns(if_index: u32) -> Option<SocketAddr> {
     // what the holes follow.
     info!("native_dns: the interface names no resolver; falling back to 8.8.8.8");
     Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 53))
+}
+
+/// The resolvers of the machine itself, in the order they are asked.
+///
+/// The names of the bypass must be resolved the way the machine would
+/// resolve them with the tunnel off -- otherwise the hole is drilled for
+/// the wrong addresses.  A provider that filters the questions to some
+/// resolvers (Google's are filtered on many lines) leaves the machine with
+/// a resolver that stays silent, so the gateway is asked too: the router
+/// answers for the line it serves.
+async fn native_resolvers(
+    if_index: u32,
+    gateway: Option<&str>,
+    pinned: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut servers: Vec<SocketAddr> = Vec::new();
+    let mut push = |server: Option<SocketAddr>, servers: &mut Vec<SocketAddr>| {
+        if let Some(server) = server {
+            if !servers.contains(&server) {
+                servers.push(server);
+            }
+        }
+    };
+    push(pinned, &mut servers);
+    if servers.is_empty() {
+        push(discover_native_dns(if_index).await, &mut servers);
+    }
+    // The router is a resolver as often as not, and it is the one that
+    // answers when the provider filters the others.
+    if let Some(gateway) = gateway {
+        if let Ok(ip) = gateway.trim().parse::<std::net::Ipv4Addr>() {
+            push(Some(SocketAddr::new(IpAddr::V4(ip), 53)), &mut servers);
+        }
+    }
+    info!(
+        servers = servers.len(),
+        "bypass: the names are asked of the machine's own resolvers"
+    );
+    servers
 }
 
 async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

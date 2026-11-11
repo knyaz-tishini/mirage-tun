@@ -112,6 +112,23 @@ impl Preset {
         rules
     }
 
+    /// The names of the preset, as they are written.
+    ///
+    /// They ARE drilled as holes: the adapter takes every packet when the
+    /// tunnel is up, so a name can only leave the machine through a hole
+    /// that follows its addresses.
+    pub fn domain_strings(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .domains
+            .iter()
+            .map(|domain| normalize_domain(domain))
+            .filter(|domain| !domain.is_empty())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// The networks of the preset, as they are written.
     ///
     /// They are NOT drilled as holes: a hole is a route in the routing

@@ -1,6 +1,17 @@
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::{debug, info, warn};
 use crate::error::{Result, TunError};
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS,
+    NO_ERROR,
+};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    CreateIpForwardEntry2, DeleteIpForwardEntry2, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2,
+};
+use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+use windows_sys::Win32::Networking::WinSock::{
+    NlroManual, AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, SOCKADDR_INET,
+};
 
 /// A hole in the routing: a prefix that leaves the machine the way it
 /// always did, while the tunnel holds the default route.
@@ -554,6 +565,262 @@ pub fn close_hole_sync(hole: &BypassHole) {
     info!(cidr = %hole.cidr, "Routing: the hole is closed");
 }
 
+/// The lifetime of a permanent route: it never expires.
+const LIFETIME_FOREVER: u32 = 0xFFFF_FFFF;
+
+/// The metric of a hole: as low as a manual route goes, so the hole wins
+/// over the tunnel's default route.
+const HOLE_METRIC: u32 = 1;
+
+/// The network address of a prefix: the address with the host bits cleared.
+///
+/// 10.1.2.3/24 is the network 10.1.2.0/24, and the routing table only ever
+/// holds networks.
+fn network_of(addr: IpAddr, prefix: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(v4) => {
+            let bits = u32::from(v4);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            IpAddr::V4(Ipv4Addr::from(bits & mask))
+        }
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            IpAddr::V6(Ipv6Addr::from((bits & mask).to_be_bytes()))
+        }
+    }
+}
+
+/// The CIDR of a prefix in its canonical form: the network address and the
+/// prefix length.
+///
+/// 10.1.2.3/24 is written 10.1.2.0/24 — that is the network the routing
+/// table holds, and that is the name the hole carries.
+fn normalized_cidr(addr: IpAddr, prefix: u8) -> String {
+    format!("{}/{}", network_of(addr, prefix), prefix)
+}
+
+/// The socket address of an IP, the way the routing API wants it.
+///
+/// The address of an IPv4 next hop goes into the socket address as the
+/// native byte order of the machine, so that the bytes on the wire are
+/// the octets of the address themselves; an IPv6 next hop carries its
+/// scope, because a link-local gateway is only meaningful together with
+/// the interface it sits on.
+fn sockaddr_of(addr: IpAddr, if_index: u32) -> SOCKADDR_INET {
+    let mut sa: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+    match addr {
+        IpAddr::V4(v4) => {
+            sa.Ipv4.sin_family = AF_INET;
+            sa.Ipv4.sin_port = 0;
+            sa.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            sa.Ipv6.sin6_family = AF_INET6;
+            sa.Ipv6.sin6_port = 0;
+            sa.Ipv6.sin6_flowinfo = 0;
+            sa.Ipv6.sin6_addr.u.Byte = v6.octets();
+            sa.Ipv6.Anonymous.sin6_scope_id = if v6.is_unicast_link_local() {
+                if_index
+            } else {
+                0
+            };
+        }
+    }
+    sa
+}
+
+/// The route row of one hole: the prefix, the gateway and the interface.
+///
+/// The row is the shape the routing API takes, and it is a `windows-sys`
+/// type — the caller that wants to drill the hole by hand needs that crate
+/// too.  The row is filled in rather than through `InitializeIpForwardEntry`,
+/// so that the helper stays pure and can be checked without touching the
+/// routing table: the prefix is the network address of the CIDR, the next
+/// hop is the gateway, and the rest is what a permanent static route looks
+/// like on a live machine — metric 1, protocol NETMGMT, infinite lifetime.
+///
+/// Nothing comes back when the prefix cannot be read, when there is no
+/// gateway, or when the gateway speaks another family than the prefix.
+pub fn route_row_for(
+    cidr: &str,
+    gateway: Option<&str>,
+    if_index: u32,
+) -> Option<MIB_IPFORWARD_ROW2> {
+    hole_route(cidr, gateway, if_index).map(|(row, _)| row)
+}
+
+/// The row of a hole and the name of the hole: the route row and the CIDR
+/// that names it, in its canonical form.
+fn hole_route(
+    cidr: &str,
+    gateway: Option<&str>,
+    if_index: u32,
+) -> Option<(MIB_IPFORWARD_ROW2, String)> {
+    let (addr, prefix) = parse_cidr(cidr).ok()?;
+    let gateway = gateway?.trim();
+    let gateway: IpAddr = gateway.parse().ok()?;
+    // The next hop has to speak the same family as the prefix.
+    if gateway.is_ipv4() != addr.is_ipv4() {
+        return None;
+    }
+    let network = network_of(addr, prefix);
+
+    let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+    // The interface is named by its index; the LUID stays zero, and the
+    // routing API falls back to the index when it is.
+    row.InterfaceLuid = NET_LUID_LH { Value: 0 };
+    row.InterfaceIndex = if_index;
+    row.DestinationPrefix = IP_ADDRESS_PREFIX {
+        Prefix: sockaddr_of(network, if_index),
+        PrefixLength: prefix,
+    };
+    row.NextHop = sockaddr_of(gateway, if_index);
+    row.SitePrefixLength = 0;
+    row.ValidLifetime = LIFETIME_FOREVER;
+    row.PreferredLifetime = LIFETIME_FOREVER;
+    row.Metric = HOLE_METRIC;
+    row.Protocol = MIB_IPPROTO_NETMGMT;
+    row.Loopback = 0;
+    row.AutoconfigureAddress = 0;
+    row.Publish = 0;
+    row.Immortal = 0;
+    row.Age = 0;
+    row.Origin = NlroManual;
+    Some((row, normalized_cidr(addr, prefix)))
+}
+
+/// Drill many holes at once: one route per prefix, through the routing API.
+///
+/// The netsh path costs a child process per prefix, which is a tenth of a
+/// second each — nineteen thousand prefixes would take an hour.  This path
+/// asks the routing API directly, in this process, and the same nineteen
+/// thousand prefixes take seconds.
+///
+/// A prefix that cannot be read, or a gateway that does not fit it, is
+/// skipped and counted; a route that is already there counts as drilled,
+/// because the hole is in place either way.
+pub async fn drill_holes_batch(
+    cidrs: &[String],
+    gateway: Option<&str>,
+    if_index: u32,
+) -> Vec<BypassHole> {
+    let cidrs = cidrs.to_vec();
+    let gateway = gateway.map(str::to_owned);
+    let drilled = tokio::task::spawn_blocking(move || {
+        drill_holes_blocking(&cidrs, gateway.as_deref(), if_index)
+    })
+    .await;
+    match drilled {
+        Ok(holes) => holes,
+        Err(e) => {
+            warn!(error = %e, "Routing: the batch of holes was not drilled");
+            Vec::new()
+        }
+    }
+}
+
+/// The holes that are in place after the batch, and the count of the ones
+/// that were not.
+fn drill_holes_blocking(cidrs: &[String], gateway: Option<&str>, if_index: u32) -> Vec<BypassHole> {
+    let mut holes: Vec<BypassHole> = Vec::with_capacity(cidrs.len());
+    let mut already = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for cidr in cidrs {
+        let Some((row, normalized)) = hole_route(cidr, gateway, if_index) else {
+            skipped += 1;
+            debug!(
+                cidr,
+                "Routing: the hole was skipped, the prefix or the gateway does not fit"
+            );
+            continue;
+        };
+        let code = unsafe { CreateIpForwardEntry2(&row) };
+        match code {
+            NO_ERROR => {}
+            ERROR_OBJECT_ALREADY_EXISTS | ERROR_ALREADY_EXISTS => {
+                // The hole is there, whoever drilled it.
+                already += 1;
+            }
+            _ => {
+                failed += 1;
+                warn!(cidr, code, "Routing: the hole was not drilled");
+                continue;
+            }
+        }
+        holes.push(BypassHole {
+            cidr: normalized,
+            if_index,
+            gateway: gateway.map(str::to_owned),
+        });
+    }
+
+    info!(
+        drilled = holes.len(),
+        already, skipped, failed, "Routing: the holes are drilled"
+    );
+    holes
+}
+
+/// Close many holes at once: the prefixes go back to the tunnel.
+///
+/// A route that is not there any more is not a failure — it is already
+/// closed.  The count of the holes that were closed comes back.
+pub async fn close_holes_batch(
+    holes: &[BypassHole],
+    gateway: Option<&str>,
+    if_index: u32,
+) -> usize {
+    let holes = holes.to_vec();
+    let gateway = gateway.map(str::to_owned);
+    let closed = tokio::task::spawn_blocking(move || {
+        close_holes_blocking(&holes, gateway.as_deref(), if_index)
+    })
+    .await;
+    match closed {
+        Ok(closed) => closed,
+        Err(e) => {
+            warn!(error = %e, "Routing: the batch of holes was not closed");
+            0
+        }
+    }
+}
+
+/// The holes that are closed, the ones that were already gone and the ones
+/// that could not be closed.
+fn close_holes_blocking(holes: &[BypassHole], gateway: Option<&str>, if_index: u32) -> usize {
+    let mut closed = 0usize;
+    for hole in holes {
+        let hole_gateway = hole.gateway.as_deref().or(gateway);
+        let hole_if_index = if hole.if_index != 0 {
+            hole.if_index
+        } else {
+            if_index
+        };
+        let Some(row) = route_row_for(&hole.cidr, hole_gateway, hole_if_index) else {
+            continue;
+        };
+        let code = unsafe { DeleteIpForwardEntry2(&row) };
+        match code {
+            NO_ERROR => closed += 1,
+            ERROR_NOT_FOUND | ERROR_FILE_NOT_FOUND => {}
+            _ => warn!(cidr = %hole.cidr, code, "Routing: the hole was not closed"),
+        }
+    }
+    info!(closed, "Routing: the holes are closed");
+    closed
+}
+
 /// Stateless host-route bypass — used by the peer-LM watcher to additively
 /// extend the bypass set without owning a `Routing` instance.  Mirrors
 /// `Routing::add_bypass_*` but uses the gateway / interface_index passed by
@@ -801,4 +1068,127 @@ fn read_default_gateway_v6_win32() -> Option<(String, u32)> {
 #[cfg(not(windows))]
 fn read_default_gateway_v6_win32() -> Option<(String, u32)> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn family_of(row: &MIB_IPFORWARD_ROW2) -> u16 {
+        unsafe { row.DestinationPrefix.Prefix.si_family }
+    }
+
+    fn prefix_v4(row: &MIB_IPFORWARD_ROW2) -> Ipv4Addr {
+        let s_addr = unsafe { row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr };
+        Ipv4Addr::from(s_addr.to_ne_bytes())
+    }
+
+    fn next_hop_v4(row: &MIB_IPFORWARD_ROW2) -> Ipv4Addr {
+        let s_addr = unsafe { row.NextHop.Ipv4.sin_addr.S_un.S_addr };
+        Ipv4Addr::from(s_addr.to_ne_bytes())
+    }
+
+    fn prefix_v6(row: &MIB_IPFORWARD_ROW2) -> Ipv6Addr {
+        let bytes = unsafe { row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte };
+        Ipv6Addr::from(bytes)
+    }
+
+    fn next_hop_v6(row: &MIB_IPFORWARD_ROW2) -> Ipv6Addr {
+        let bytes = unsafe { row.NextHop.Ipv6.sin6_addr.u.Byte };
+        Ipv6Addr::from(bytes)
+    }
+
+    fn next_hop_scope(row: &MIB_IPFORWARD_ROW2) -> u32 {
+        unsafe { row.NextHop.Ipv6.Anonymous.sin6_scope_id }
+    }
+
+    fn canonical(cidr: &str) -> Option<String> {
+        let (addr, prefix) = parse_cidr(cidr).ok()?;
+        Some(normalized_cidr(addr, prefix))
+    }
+
+    #[test]
+    fn the_row_of_an_ipv4_network() {
+        let row = route_row_for("10.1.2.0/24", Some("192.168.1.1"), 7).expect("the row");
+        assert_eq!(row.DestinationPrefix.PrefixLength, 24);
+        assert_eq!(family_of(&row), AF_INET);
+        assert_eq!(prefix_v4(&row), Ipv4Addr::new(10, 1, 2, 0));
+        assert_eq!(next_hop_v4(&row), Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(row.InterfaceIndex, 7);
+    }
+
+    #[test]
+    fn the_row_of_an_ipv4_host() {
+        let row = route_row_for("10.1.2.3/32", Some("192.168.1.1"), 7).expect("the row");
+        assert_eq!(row.DestinationPrefix.PrefixLength, 32);
+        assert_eq!(family_of(&row), AF_INET);
+        assert_eq!(prefix_v4(&row), Ipv4Addr::new(10, 1, 2, 3));
+        assert_eq!(next_hop_v4(&row), Ipv4Addr::new(192, 168, 1, 1));
+    }
+
+    #[test]
+    fn the_row_of_an_ipv6_network() {
+        let row = route_row_for("2001:db8:abcd:1234::/64", Some("fe80::1"), 11).expect("the row");
+        assert_eq!(row.DestinationPrefix.PrefixLength, 64);
+        assert_eq!(family_of(&row), AF_INET6);
+        assert_eq!(
+            prefix_v6(&row),
+            Ipv6Addr::new(0x2001, 0x0db8, 0xabcd, 0x1234, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            next_hop_v6(&row),
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)
+        );
+        assert_eq!(row.InterfaceIndex, 11);
+        // A link-local gateway is only meaningful together with its scope.
+        assert_eq!(next_hop_scope(&row), 11);
+    }
+
+    #[test]
+    fn the_row_carries_the_shape_of_a_static_route() {
+        let row = route_row_for("10.1.2.0/24", Some("192.168.1.1"), 7).expect("the row");
+        assert_eq!(row.Metric, HOLE_METRIC);
+        assert_eq!(row.Protocol, MIB_IPPROTO_NETMGMT);
+        assert_eq!(row.Origin, NlroManual);
+        assert_eq!(row.ValidLifetime, LIFETIME_FOREVER);
+        assert_eq!(row.PreferredLifetime, LIFETIME_FOREVER);
+        assert_eq!(row.SitePrefixLength, 0);
+        assert_eq!(row.Age, 0);
+    }
+
+    #[test]
+    fn the_host_bits_are_cleared() {
+        let row = route_row_for("10.1.2.3/24", Some("192.168.1.1"), 7).expect("the row");
+        assert_eq!(row.DestinationPrefix.PrefixLength, 24);
+        assert_eq!(prefix_v4(&row), Ipv4Addr::new(10, 1, 2, 0));
+    }
+
+    #[test]
+    fn the_name_of_a_hole_is_the_network() {
+        assert_eq!(canonical("10.1.2.3/24").as_deref(), Some("10.1.2.0/24"));
+        assert_eq!(
+            canonical("2001:db8:abcd:1234::5/64").as_deref(),
+            Some("2001:db8:abcd:1234::/64")
+        );
+        assert_eq!(canonical("10.1.2.3").as_deref(), Some("10.1.2.3/32"));
+    }
+
+    #[test]
+    fn a_prefix_that_cannot_be_read_has_no_row() {
+        assert!(route_row_for("not a cidr", Some("192.168.1.1"), 7).is_none());
+        assert!(route_row_for("10.1.2.3/33", Some("192.168.1.1"), 7).is_none());
+        assert!(canonical("10.1.2.3/33").is_none());
+    }
+
+    #[test]
+    fn a_hole_without_a_gateway_has_no_row() {
+        assert!(route_row_for("10.1.2.0/24", None, 7).is_none());
+        assert!(route_row_for("10.1.2.0/24", Some("not an address"), 7).is_none());
+    }
+
+    #[test]
+    fn a_gateway_of_another_family_has_no_row() {
+        assert!(route_row_for("10.1.2.0/24", Some("fe80::1"), 7).is_none());
+        assert!(route_row_for("2001:db8::/32", Some("192.168.1.1"), 7).is_none());
+    }
 }
