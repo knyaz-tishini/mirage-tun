@@ -4,11 +4,13 @@
 //! DESTINATION out of the tunnel.  This module is the other half — it lets an
 //! APPLICATION out, by image.
 //!
-//! The work is done by the Mullvad split-tunnel driver
-//! (`mullvad-split-tunnel.sys`, upstream revision `v1.3.0.0`).  The driver
-//! is a WFP callout: it watches the processes, and for the ones on the list it
-//! permits the traffic that would otherwise be forced into the tunnel, and
-//! blocks the traffic that would go into it.
+//! The work is done by the split-tunnel driver: ours first
+//! (`mirage-split-tunnel.sys`, the fork of the Mullvad driver with the
+//! crash of 12.11.2026 taken out), the driver of Mullvad
+//! (`mullvad-split-tunnel.sys`, upstream revision `v1.3.0.0`) after it.
+//! The driver is a WFP callout: it watches the processes, and for the ones
+//! on the list it permits the traffic that would otherwise be forced into
+//! the tunnel, and blocks the traffic that would go into it.
 //!
 //! The protocol is the driver's own:
 //!
@@ -63,8 +65,19 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-/// The device the driver exposes.
-const DEVICE_PATH: &str = r"\\.\MULLVADSPLITTUNNEL";
+/// The devices the drivers expose, ours first.
+///
+/// Ours is the fork of the Mullvad driver (`mirage-split-tunnel.sys`) with
+/// the lock of the transaction given back on every way out and the callouts
+/// unregistered before the context they use is freed -- the two mistakes
+/// that took the machine down twice on 12.11.2026 (bug check 0x133, the
+/// faulting module `mullvad-split-tunnel.sys`).  The driver of Mullvad is
+/// still tried afterwards, so a machine that has only that one keeps
+/// working.
+const DEVICE_PATHS: [&str; 2] = [r"\\.\MIRAGESPLITTUNNEL", r"\\.\MULLVADSPLITTUNNEL"];
+
+/// The services of those drivers, ours first.
+const SERVICE_NAMES: [&str; 2] = ["mirage-split-tunnel", "mullvad-split-tunnel"];
 
 /// IOCTL codes, as the driver itself defines them
 /// (`CTL_CODE(0x8000, fn, method, any)`), taken from the sources of the
@@ -831,19 +844,23 @@ fn open_device() -> Result<HANDLE, SplitTunnelError> {
 }
 
 fn open_device_once() -> Result<HANDLE, SplitTunnelError> {
-    let name: Vec<u16> = DEVICE_PATH.encode_utf16().chain(Some(0)).collect();
-    let handle = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            0xc000_0000, // GENERIC_READ | GENERIC_WRITE
-            0x0000_0003, // FILE_SHARE_READ | FILE_SHARE_WRITE
-            ptr::null::<SECURITY_ATTRIBUTES>(),
-            3, // OPEN_EXISTING
-            0x0000_0000,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+    let mut last: Option<SplitTunnelError> = None;
+    for path in DEVICE_PATHS {
+        let name: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                0xc000_0000, // GENERIC_READ | GENERIC_WRITE
+                0x0000_0003, // FILE_SHARE_READ | FILE_SHARE_WRITE
+                ptr::null::<SECURITY_ATTRIBUTES>(),
+                3, // OPEN_EXISTING
+                0x0000_0000,
+                ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+            return Ok(handle);
+        }
         let error = io::Error::last_os_error();
         let code = error.raw_os_error().unwrap_or(0);
         // 5 = ACCESS_DENIED, 32 = SHARING_VIOLATION: the device is there and
@@ -851,17 +868,32 @@ fn open_device_once() -> Result<HANDLE, SplitTunnelError> {
         if code == 5 || code == 32 {
             return Err(SplitTunnelError::DeviceBusy(code as u32));
         }
-        return Err(SplitTunnelError::DeviceUnavailable(format!(
-            "the driver is not installed or not started (error {})",
+        last = Some(SplitTunnelError::DeviceUnavailable(format!(
+            "{path} is not there (error {})",
             error
         )));
     }
-    Ok(handle)
+    Err(last.unwrap_or(SplitTunnelError::DeviceUnavailable(
+        "the driver is not installed".into(),
+    )))
 }
 
 /// Start the driver's service, if it is installed and not running.
+///
+/// Ours first, the driver of Mullvad after it: the fork is the one that is
+/// free of the crash, but a machine that has only the other one keeps
+/// working.
 fn start_driver_service() -> bool {
-    let name: Vec<u16> = "mullvad-split-tunnel\0".encode_utf16().collect();
+    for service_name in SERVICE_NAMES {
+        if start_one_service(service_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn start_one_service(service_name: &str) -> bool {
+    let name: Vec<u16> = service_name.encode_utf16().chain(Some(0)).collect();
     unsafe {
         // The manager first: a service handle is opened FROM the manager, and
         // a null manager is an invalid handle -- the old code asked for the
@@ -880,6 +912,7 @@ fn start_driver_service() -> bool {
             let error = GetLastError();
             tracing::warn!(
                 error,
+                service_name,
                 "split-tunnel: the driver's service could not be opened - the app-bypass stays off"
             );
             CloseServiceHandle(manager);
@@ -890,6 +923,7 @@ fn start_driver_service() -> bool {
             let error = GetLastError();
             tracing::warn!(
                 error,
+                service_name,
                 "split-tunnel: the driver's service did not start - the app-bypass stays off"
             );
         }
