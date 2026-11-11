@@ -57,7 +57,7 @@ use windows_sys::Win32::System::ProcessStatus::K32GetProcessImageFileNameW;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 use windows_sys::Win32::System::Services::{OpenServiceW, StartServiceW};
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// The device the driver exposes.
@@ -1059,8 +1059,85 @@ fn resolve_application(wanted: &str, running: &[(u32, u32, Vec<u16>)]) -> Option
 /// How long the search for an application on the disk may take.
 const DISK_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// The folders an application usually lives in.
-fn application_roots() -> Vec<std::path::PathBuf> {
+/// The path of the application the person named, the way the system writes it.
+///
+/// The kernel driver takes the device path of the image, and the switch that
+/// keeps the tunnel honest takes the path the system writes. Both come from
+/// the same place: the running processes, and then the disk -- an application
+/// that is not running now must be excluded all the same, or it goes into the
+/// tunnel the moment it starts.
+pub fn application_paths(applications: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let running = running_process_dos_paths();
+    for wanted in applications {
+        let wanted = wanted.trim();
+        if wanted.is_empty() {
+            continue;
+        }
+        // A full path the person wrote.
+        if wanted.contains('\\') || wanted.contains('/') || wanted.contains(':') {
+            if std::path::Path::new(wanted).is_file() {
+                out.push(wanted.to_owned());
+            }
+            continue;
+        }
+        let wanted_file = wanted.to_ascii_lowercase();
+        if let Some(path) = running.iter().find(|path| {
+            path.rsplit('\\')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                == wanted_file
+        }) {
+            out.push(path.clone());
+            continue;
+        }
+        if let Some(path) = find_application_on_disk(&wanted_file) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The paths of the running processes, as the system writes them.
+fn running_process_dos_paths() -> Vec<String> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
+        return Vec::new();
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { mem::zeroed() };
+    entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut out = Vec::new();
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+    while ok != 0 {
+        if let Some(path) = process_dos_path(entry.th32ProcessID) {
+            out.push(path);
+        }
+        ok = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    unsafe { CloseHandle(snapshot) };
+    out
+}
+
+/// The path of a process, the way the system writes it.
+fn process_dos_path(pid: u32) -> Option<String> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 1024];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..size as usize]))
+}
+
+/// The folders an application usually lives in, and how deep the search goes
+/// in each of them.
+fn application_roots() -> Vec<(std::path::PathBuf, usize)> {
     let mut roots = Vec::new();
     for key in [
         "LOCALAPPDATA",
@@ -1072,7 +1149,7 @@ fn application_roots() -> Vec<std::path::PathBuf> {
         if let Some(dir) = std::env::var_os(key) {
             let dir = std::path::PathBuf::from(dir);
             if dir.is_dir() {
-                roots.push(dir);
+                roots.push((dir, 6));
             }
         }
     }
@@ -1080,7 +1157,17 @@ fn application_roots() -> Vec<std::path::PathBuf> {
     if let Some(windows) = std::env::var_os("SystemRoot") {
         let system = std::path::PathBuf::from(windows).join("System32");
         if system.is_dir() {
-            roots.push(system);
+            roots.push((system, 2));
+        }
+    }
+    // The applications of the store live here, one folder per package.  The
+    // folder of the package carries the version, so the path of the image
+    // changes with every update -- the name of the image is what the person
+    // writes, and the path is looked up again each time the device starts.
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        let store = std::path::PathBuf::from(program_files).join("WindowsApps");
+        if store.is_dir() {
+            roots.push((store, 2));
         }
     }
     roots
@@ -1108,8 +1195,8 @@ fn skipped_folder(name: &str) -> bool {
 fn find_application_on_disk(wanted_file: &str) -> Option<String> {
     let wanted = wanted_file.to_ascii_lowercase();
     let deadline = std::time::Instant::now() + DISK_SEARCH_BUDGET;
-    for root in application_roots() {
-        if let Some(hit) = search_for_file(&root, &wanted, 0, deadline) {
+    for (root, depth) in application_roots() {
+        if let Some(hit) = search_for_file(&root, &wanted, 0, depth, deadline) {
             return Some(hit);
         }
         if std::time::Instant::now() >= deadline {
@@ -1124,9 +1211,10 @@ fn search_for_file(
     dir: &std::path::Path,
     wanted: &str,
     depth: usize,
+    max_depth: usize,
     deadline: std::time::Instant,
 ) -> Option<String> {
-    if depth > 6 || std::time::Instant::now() >= deadline {
+    if depth > max_depth || std::time::Instant::now() >= deadline {
         return None;
     }
     let entries = std::fs::read_dir(dir).ok()?;
@@ -1140,7 +1228,7 @@ fn search_for_file(
             if skipped_folder(&name) {
                 continue;
             }
-            if let Some(hit) = search_for_file(&path, wanted, depth + 1, deadline) {
+            if let Some(hit) = search_for_file(&path, wanted, depth + 1, max_depth, deadline) {
                 return Some(hit);
             }
         } else if name == wanted {

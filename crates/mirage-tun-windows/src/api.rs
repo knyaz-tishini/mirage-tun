@@ -553,8 +553,9 @@ pub async fn activate_tun_inner(
         match (tunnel_ip, internet_ip) {
             (Some(tunnel), Some(internet)) => {
                 let asked = applications.clone();
+                let for_driver = applications.clone();
                 let engaged = tokio::task::spawn_blocking(move || {
-                    crate::split_tunnel::SplitTunnel::engage(tunnel, internet, &applications)
+                    crate::split_tunnel::SplitTunnel::engage(tunnel, internet, &for_driver)
                 })
                 .await;
                 match engaged {
@@ -576,6 +577,34 @@ pub async fn activate_tun_inner(
             _ => warn!(
                 "activate: the split-tunnel needs the tunnel address and the physical address; it was not engaged"
             ),
+        }
+    }
+
+    // The applications that leave the tunnel are permitted by their own name.
+    //
+    // The driver binds them to the physical interface; the switch does not
+    // know about the driver and blocks everything it does not permit.  So
+    // the applications that are to work around the tunnel are permitted here
+    // by their own path: they keep working even while the tunnel is slow,
+    // even while it is stuck, and even while the driver is busy.
+    if !applications.is_empty() {
+        let asked = applications.clone();
+        let paths = tokio::task::spawn_blocking(move || {
+            crate::split_tunnel::application_paths(&asked)
+        })
+        .await
+        .unwrap_or_default();
+        if paths.is_empty() {
+            warn!(
+                apps = ?applications,
+                "activate: none of the applications that leave the tunnel was found on the disk; they will be stopped by the switch"
+            );
+        }
+        if let Err(error) = killswitch.install_app_permits(&paths) {
+            warn!(
+                error = %error,
+                "activate: the applications that leave the tunnel are NOT permitted past the switch"
+            );
         }
     }
 

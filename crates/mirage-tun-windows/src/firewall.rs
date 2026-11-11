@@ -33,6 +33,14 @@ pub struct WfpKillSwitch {
     /// Per-process filter tracking: normalized exe path → list of installed WFP filter IDs.
     /// On plane change the old IDs are deleted and a new set installed.
     per_process_filters: HashMap<String, Vec<u64>>,
+    /// The filters that permit the applications which leave the tunnel.
+    ///
+    /// The driver binds them to the physical interface; the switch does not
+    /// know about the driver and blocks everything it does not permit.  So
+    /// the applications that are to work around the tunnel are permitted here
+    /// by their own name -- otherwise the very switch that keeps the tunnel
+    /// honest stops the work of the machine.
+    app_permit_ids: Vec<u64>,
     /// The resolvers of the machine: they are permitted by address AND by the
     /// port of the name service.
     ///
@@ -64,6 +72,7 @@ impl WfpKillSwitch {
             bypass_cidrs_v6: Vec::new(),
             resolver: ProcessResolver::new(),
             per_process_filters: HashMap::new(),
+            app_permit_ids: Vec::new(),
             resolvers: Vec::new(),
             lock_udp: false,
         }
@@ -309,21 +318,16 @@ impl WfpKillSwitch {
             info!(tun_idx, "WFP: permit TUN interface IPv4");
         }
 
-        // 4b. Permit native interface for bypass traffic (weight 13).
-        if let Some(native_idx) = self.native_if_index {
-            FilterBuilder::new()
-                .name("Mirage: permit native interface IPv4 (bypass)")
-                .action(Action::Permit)
-                .layer(Layer::ConnectV4)
-                .sublayer(KILLSWITCH_SUBLAYER_GUID)
-                .weight(Self::weight(13))
-                .condition(InterfaceConditionBuilder::equal(native_idx))
-                .add(tx)
-                .map_err(|e| {
-                    TunError::Wfp(format!("native interface IPv4 bypass permit failed: {e}"))
-                })?;
-            info!(native_idx, "WFP: permit native interface IPv4 (bypass)");
-        }
+        // 4b. The physical interface is NOT permitted as a whole.
+        //
+        // It used to be: a permit for the interface let everything that left
+        // through it pass, and the only traffic that leaves through it is the
+        // traffic of the bypass -- the holes of the bypass (permitted by
+        // their addresses below) and the applications that leave the tunnel
+        // (permitted by their own names, see `install_app_permits`).  A
+        // blanket permit for the interface is a blanket permit for the
+        // internet: anything that finds its way out of the tunnel by another
+        // route would pass the switch as well.
 
         // 5. Permit bypass CIDRs (weight 12).
         for &(network, mask) in &self.bypass_cidrs {
@@ -416,21 +420,9 @@ impl WfpKillSwitch {
             info!(tun_idx, "WFP: permit TUN interface IPv6");
         }
 
-        // 4b. Permit native interface for bypass traffic (weight 13).
-        if let Some(native_idx) = self.native_if_index {
-            FilterBuilder::new()
-                .name("Mirage: permit native interface IPv6 (bypass)")
-                .action(Action::Permit)
-                .layer(Layer::ConnectV6)
-                .sublayer(KILLSWITCH_SUBLAYER_GUID)
-                .weight(Self::weight(13))
-                .condition(InterfaceConditionBuilder::equal(native_idx))
-                .add(tx)
-                .map_err(|e| {
-                    TunError::Wfp(format!("native interface IPv6 bypass permit failed: {e}"))
-                })?;
-            info!(native_idx, "WFP: permit native interface IPv6 (bypass)");
-        }
+        // 4b. The physical interface is NOT permitted as a whole -- see the
+        // IPv4 side above.  The applications that leave the tunnel carry their
+        // own permits.
 
         // 5. Permit exempt local ports (weight 13).
         for &port in exempt_ports {
@@ -530,6 +522,46 @@ impl WfpKillSwitch {
         tx.commit().map_err(|e| std::io::Error::other(format!("tx commit: {e}")))?;
         Ok(())
     }
+
+    /// Permit the applications that leave the tunnel.
+    ///
+    /// The driver binds them to the physical interface, and the switch does
+    /// not know about the driver: it blocks everything that is not permitted.
+    /// So the applications that are to work around the tunnel are permitted
+    /// here by their own name -- they keep working even while the tunnel is
+    /// stuck, and even while the driver is busy.
+    pub fn install_app_permits(&mut self, app_paths: &[String]) -> Result<(), TunError> {
+        if app_paths.is_empty() {
+            return Ok(());
+        }
+        let engine = self
+            .engine
+            .as_mut()
+            .ok_or_else(|| TunError::Other("the switch is not in force yet".into()))?;
+        let tx = WfpTransaction::begin(engine)
+            .map_err(|e| TunError::Wfp(format!("tx begin (app permit): {e}")))?;
+        let mut ids = Vec::new();
+        for path in app_paths {
+            let cond = AppIdConditionBuilder::equal(path)
+                .map_err(|e| TunError::Wfp(format!("app-id condition for {path}: {e}")))?;
+            for layer in [Layer::ConnectV4, Layer::ConnectV6] {
+                let id = FilterBuilder::new()
+                    .name("Mirage: permit the application past the switch")
+                    .action(Action::Permit)
+                    .layer(layer)
+                    .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                    .weight(Self::weight(15))
+                    .condition(cond.clone())
+                    .add(&tx)
+                    .map_err(|e| TunError::Wfp(format!("app permit {path} {layer:?}: {e}")))?;
+                ids.push(id);
+            }
+            info!(app = %path, "WFP: the application is permitted past the switch");
+        }
+        tx.commit().map_err(|e| TunError::Wfp(format!("tx commit (app permit): {e}")))?;
+        self.app_permit_ids.extend(ids);
+        Ok(())
+    }
 }
 
 impl PlatformFirewall for WfpKillSwitch {
@@ -608,6 +640,18 @@ impl PlatformFirewall for WfpKillSwitch {
     }
 
     fn deactivate(&mut self) -> Result<(), TunError> {
+        // Remove the permits of the applications that leave the tunnel.
+        if let Some(engine) = self.engine.as_mut() {
+            if !self.app_permit_ids.is_empty() {
+                if let Ok(tx) = WfpTransaction::begin(engine) {
+                    for &id in &self.app_permit_ids {
+                        let _ = delete_filter(&tx, id);
+                    }
+                    let _ = tx.commit();
+                }
+                self.app_permit_ids.clear();
+            }
+        }
         // Remove per-process filters (T3 addition) before closing the engine.
         if let Some(engine) = self.engine.as_mut() {
             if !self.per_process_filters.is_empty() {
