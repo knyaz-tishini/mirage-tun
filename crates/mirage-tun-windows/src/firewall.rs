@@ -87,6 +87,38 @@ impl WfpKillSwitch {
         self.activate(relay_addrs, tun_name, exempt_ports)
     }
 
+    /// The kill-switch of the moment BEFORE the tunnel carries.
+    ///
+    /// The machine was told to tunnel: from now on nothing that is not the
+    /// bypass may reach the internet. The traffic that is not in the tunnel
+    /// yet would otherwise leave through the physical interface, and the
+    /// person would get the internet without the tunnel they asked for.
+    ///
+    /// So: everything is blocked, and only what has to stay is let through --
+    /// the loopback (the tunnel talks to itself over it), the local network
+    /// (the router answers the questions of the machine, and the machines
+    /// next door are not the internet), and the relays (the way out of the
+    /// tunnel). The physical interface is NOT permitted as a whole: the holes
+    /// of the bypass are routes, and they come a moment later.
+    pub fn activate_pre_tunnel(
+        &mut self,
+        relay_addrs: &[IpAddr],
+        tun_name: &str,
+        exempt_ports: &[u16],
+    ) -> Result<(), TunError> {
+        self.native_if_index = None;
+        self.bypass_cidrs.clear();
+        self.bypass_cidrs_v6.clear();
+        for (network, mask) in [
+            (u32::from(Ipv4Addr::new(192, 168, 0, 0)), 0xFFFF_0000u32),
+            (u32::from(Ipv4Addr::new(172, 16, 0, 0)), 0xFFF0_0000u32),
+            (u32::from(Ipv4Addr::new(169, 254, 0, 0)), 0xFFFF_0000u32),
+        ] {
+            self.bypass_cidrs.push((network, mask));
+        }
+        self.activate(relay_addrs, tun_name, exempt_ports)
+    }
+
     fn weight(n: u8) -> FilterWeight {
         // SAFETY: all call-sites pass literals 1, 12, 13, 14, 15 which are <= 15.
         FilterWeight::Range(WeightRange::try_from(n).expect("weight value must be 0..=15"))

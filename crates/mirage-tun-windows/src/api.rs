@@ -261,6 +261,30 @@ pub async fn activate_tun_inner(
 
     let raw_ip_mode = state.config.is_raw_ip();
 
+    // The kill-switch goes up FIRST.
+    //
+    // From the moment the machine is told to tunnel, nothing that is not the
+    // bypass may reach the internet: the traffic that is not in the tunnel
+    // yet would otherwise go out through the physical interface and the
+    // person would get the internet without the tunnel they asked for. The
+    // holes of the bypass are drilled a moment later; until then the machine
+    // is closed, which is the truth of the moment.
+    let (early_gateway, early_if_index) =
+        crate::routing::read_default_gateway_v4().await.unwrap_or_default();
+    let mut early_relay_ips: Vec<IpAddr> = Vec::new();
+    for relay in &params.relay_addrs {
+        if let Ok(ip) = relay.parse::<IpAddr>() {
+            early_relay_ips.push(ip);
+        }
+    }
+    let mut early_killswitch = crate::firewall::WfpKillSwitch::new();
+    early_killswitch.set_native_if_index(early_if_index);
+    if let Err(e) = early_killswitch.activate_pre_tunnel(&early_relay_ips, &tun_name, &[]) {
+        warn!("WFP kill-switch failed to activate before the tunnel (non-fatal): {e}");
+    } else {
+        info!("activate: the kill-switch is up before the tunnel");
+    }
+
     // The adapter's IPv6 address: the tunnel carries whole IP packets, so
     // the host's IPv6 has to ride it as well.  The address is the one the
     // config names, or the one derived from the IPv4 address
@@ -695,6 +719,11 @@ fn spawn_bypass_watcher(
         let mut dns_answered = false;
         // The resolver that answers: it becomes the adapter's own.
         let mut answered_resolver: Option<SocketAddr> = None;
+        // The resolvers that are asked.  A resolver that stays silent is
+        // dropped after the first round: on a line where the provider filters
+        // the questions to some of them, waiting for the silent one costs
+        // every name three seconds.
+        let mut live_resolvers = native_resolvers.clone();
         info!(
             names = domains.len(),
             resolvers = native_resolvers.len(),
@@ -726,7 +755,7 @@ fn spawn_bypass_watcher(
             // for minutes.
             let mut questions: Vec<_> = Vec::with_capacity(domains.len());
             for domain in &domains {
-                let native_resolvers = native_resolvers.clone();
+                let native_resolvers = live_resolvers.clone();
                 let tunnel_dns = tunnel_dns;
                 questions.push(async move {
                     // Two answers: the one the machine's own resolver gives
@@ -781,6 +810,20 @@ fn spawn_bypass_watcher(
                 resolvers = ?counts,
                 "bypass: the names are resolved"
             );
+            // A resolver that answered nothing is not asked again: every name
+            // would wait for it.
+            let answering: Vec<SocketAddr> = counts
+                .iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(server, _)| *server)
+                .collect();
+            if !answering.is_empty() && answering.len() < live_resolvers.len() {
+                info!(
+                    dropped = live_resolvers.len() - answering.len(),
+                    "bypass: the resolvers that stayed silent are not asked again"
+                );
+                live_resolvers = answering;
+            }
             // The holes are drilled in one go: a route per address, through
             // the routing API of the system -- the way the other clients do
             // it.  One process per hole would take minutes for a hundred

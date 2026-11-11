@@ -955,7 +955,10 @@ async fn run_netsh_route(args: &[&str]) -> Result<()> {
 }
 
 /// Returns (gateway_ip, interface_index) for the lowest-metric IPv4 default route.
-async fn read_default_gateway_v4() -> Option<(String, u32)> {
+///
+/// The gateway of the machine before the tunnel took it: the next hop of
+/// every hole, and the interface the holes are drilled on.
+pub async fn read_default_gateway_v4() -> Option<(String, u32)> {
     read_default_gateway_v4_win32()
 }
 

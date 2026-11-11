@@ -114,12 +114,18 @@ fn normalize_domain(domain: &str) -> String {
 /// the machine itself would talk to -- the ones the application will use
 /// when the tunnel is off -- so the hole covers the right addresses.
 pub async fn resolve(server: SocketAddr, name: &str, timeout: Duration) -> Vec<IpAddr> {
+    // The two kinds of address are asked at the same time: a resolver that
+    // stays silent costs the same as the slowest of them, not twice that.
+    let (v4, v6) = futures::join!(
+        resolve_one(server, name, 1, timeout),
+        resolve_one(server, name, 28, timeout)
+    );
     let mut addresses = Vec::new();
-    for qtype in [1u16, 28] {
-        match resolve_one(server, name, qtype, timeout).await {
-            Some(ips) => addresses.extend(ips),
-            None => continue,
-        }
+    if let Some(ips) = v4 {
+        addresses.extend(ips);
+    }
+    if let Some(ips) = v6 {
+        addresses.extend(ips);
     }
     addresses
 }
