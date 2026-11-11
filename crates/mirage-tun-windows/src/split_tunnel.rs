@@ -1090,9 +1090,27 @@ pub fn application_paths(applications: &[String]) -> Vec<String> {
                 == wanted_file
         }) {
             out.push(path.clone());
+        }
+    }
+    out
+}
+
+/// The applications that are not running now, looked for on the disk.
+///
+/// The search is slow -- the disk is big -- so it does not belong on the way
+/// the device comes up: a device that is slow to start is a device that is
+/// killed before it carries.  The caller runs it in the background.
+pub fn application_paths_on_disk(applications: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for wanted in applications {
+        let wanted = wanted.trim();
+        if wanted.is_empty() {
             continue;
         }
-        if let Some(path) = find_application_on_disk(&wanted_file) {
+        if wanted.contains('\\') || wanted.contains('/') || wanted.contains(':') {
+            continue;
+        }
+        if let Some(path) = find_application_on_disk(&wanted.to_ascii_lowercase()) {
             out.push(path);
         }
     }

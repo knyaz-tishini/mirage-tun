@@ -318,16 +318,29 @@ impl WfpKillSwitch {
             info!(tun_idx, "WFP: permit TUN interface IPv4");
         }
 
-        // 4b. The physical interface is NOT permitted as a whole.
+        // 4b. Permit the physical interface for the traffic of the bypass.
         //
-        // It used to be: a permit for the interface let everything that left
-        // through it pass, and the only traffic that leaves through it is the
-        // traffic of the bypass -- the holes of the bypass (permitted by
-        // their addresses below) and the applications that leave the tunnel
-        // (permitted by their own names, see `install_app_permits`).  A
-        // blanket permit for the interface is a blanket permit for the
-        // internet: anything that finds its way out of the tunnel by another
-        // route would pass the switch as well.
+        // The traffic that leaves through it is the traffic of the holes of
+        // the bypass (the addresses are permitted one by one as well) and the
+        // traffic of the applications that leave the tunnel.  The permit is
+        // one filter and not one per address: the list of the bypass holds
+        // thousands of networks, and a filter for each of them costs the
+        // device half a minute of its starting -- and a device that is slow
+        // to start is a device that is killed before it carries.
+        if let Some(native_idx) = self.native_if_index {
+            FilterBuilder::new()
+                .name("Mirage: permit native interface IPv4 (bypass)")
+                .action(Action::Permit)
+                .layer(Layer::ConnectV4)
+                .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                .weight(Self::weight(13))
+                .condition(InterfaceConditionBuilder::equal(native_idx))
+                .add(tx)
+                .map_err(|e| {
+                    TunError::Wfp(format!("native interface IPv4 bypass permit failed: {e}"))
+                })?;
+            info!(native_idx, "WFP: permit native interface IPv4 (bypass)");
+        }
 
         // 5. Permit bypass CIDRs (weight 12).
         for &(network, mask) in &self.bypass_cidrs {
@@ -420,10 +433,23 @@ impl WfpKillSwitch {
             info!(tun_idx, "WFP: permit TUN interface IPv6");
         }
 
-        // 4b. The physical interface is NOT permitted as a whole -- see the
-        // IPv4 side above.  The applications that leave the tunnel carry their
-        // own permits.
-
+        // 4b. The physical interface for the traffic of the bypass (weight 13).
+        // The IPv4 side above says why it is one filter and not one per
+        // address.
+        if let Some(native_idx) = self.native_if_index {
+            FilterBuilder::new()
+                .name("Mirage: permit native interface IPv6 (bypass)")
+                .action(Action::Permit)
+                .layer(Layer::ConnectV6)
+                .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                .weight(Self::weight(13))
+                .condition(InterfaceConditionBuilder::equal(native_idx))
+                .add(tx)
+                .map_err(|e| {
+                    TunError::Wfp(format!("native interface IPv6 bypass permit failed: {e}"))
+                })?;
+            info!(native_idx, "WFP: permit native interface IPv6 (bypass)");
+        }
         // 5. Permit exempt local ports (weight 13).
         for &port in exempt_ports {
             FilterBuilder::new()

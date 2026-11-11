@@ -501,12 +501,19 @@ pub async fn activate_tun_inner(
     if let Some(tun_idx) = pre_resolved_tun_idx {
         killswitch.set_tun_if_index(tun_idx);
     }
-    killswitch.set_bypass_cidrs(bypass_cidrs_for_wfp);
-    killswitch.set_bypass_cidrs_v6(bypass_cidrs_v6_for_wfp);
+    killswitch.set_bypass_cidrs(Vec::new());
+    killswitch.set_bypass_cidrs_v6(Vec::new());
     killswitch.set_resolvers(native_resolvers.clone());
     if let Err(e) = killswitch.activate(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate (non-fatal): {e}");
     }
+    // The switch goes into the state right here.
+    //
+    // A device that falls later -- the driver refuses, the disk search runs
+    // long -- must not take the switch with it: a switch that is dropped
+    // removes its filters, and a machine without the switch has the
+    // internet without the tunnel.
+    s.killswitch = Some(killswitch);
 
     // The applications that leave the tunnel.
     //
@@ -587,6 +594,11 @@ pub async fn activate_tun_inner(
     // the applications that are to work around the tunnel are permitted here
     // by their own path: they keep working even while the tunnel is slow,
     // even while it is stuck, and even while the driver is busy.
+    //
+    // The ones that are running now are permitted at once.  The ones that are
+    // not are looked for on the disk -- that is slow, and it does not belong
+    // on the way the device comes up: the disk search runs in the background
+    // and permits them when it finds them.
     if !applications.is_empty() {
         let asked = applications.clone();
         let paths = tokio::task::spawn_blocking(move || {
@@ -594,18 +606,34 @@ pub async fn activate_tun_inner(
         })
         .await
         .unwrap_or_default();
-        if paths.is_empty() {
-            warn!(
-                apps = ?applications,
-                "activate: none of the applications that leave the tunnel was found on the disk; they will be stopped by the switch"
-            );
+        if let Some(killswitch) = s.killswitch.as_mut() {
+            if let Err(error) = killswitch.install_app_permits(&paths) {
+                warn!(
+                    error = %error,
+                    "activate: the applications that leave the tunnel are NOT permitted past the switch"
+                );
+            }
         }
-        if let Err(error) = killswitch.install_app_permits(&paths) {
-            warn!(
-                error = %error,
-                "activate: the applications that leave the tunnel are NOT permitted past the switch"
-            );
-        }
+        // The search on the disk, in the background.
+        let state_for_disk = Arc::clone(&state);
+        let asked_for_disk = applications.clone();
+        tokio::spawn(async move {
+            let found = tokio::task::spawn_blocking(move || {
+                crate::split_tunnel::application_paths_on_disk(&asked_for_disk)
+            })
+            .await
+            .unwrap_or_default();
+            if found.is_empty() {
+                return;
+            }
+            let mut guard = state_for_disk.service.lock().await;
+            let Some(killswitch) = guard.killswitch.as_mut() else {
+                return;
+            };
+            if let Err(error) = killswitch.install_app_permits(&found) {
+                warn!(error = %error, "activate: the applications found on the disk are NOT permitted past the switch");
+            }
+        });
     }
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -662,7 +690,6 @@ pub async fn activate_tun_inner(
     s.dns_upstream = state.config.dns_upstream;
     s.ipstack_cancel = Some(cancel.clone());
     s.socks5_addr = Some(default_socks5);
-    s.killswitch = Some(killswitch);
     s.tun_phase = TunPhase::TunActive;
     s.if_index = if_index;
     s.chains = Arc::clone(&state.chains);
