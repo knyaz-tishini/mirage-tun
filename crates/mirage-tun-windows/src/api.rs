@@ -614,12 +614,30 @@ pub async fn activate_tun_inner(
                 );
             }
         }
-        // The search on the disk, in the background.
+        // The search on the disk, in the background -- only for the ones that
+        // are not running now and were not found by their full path.
+        let mut missing: Vec<String> = Vec::new();
+        for app in &applications {
+            let file = app
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(app)
+                .to_ascii_lowercase();
+            let known = paths.iter().any(|path| {
+                path.rsplit('\\')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    == file
+            });
+            if !known {
+                missing.push(app.clone());
+            }
+        }
         let state_for_disk = Arc::clone(&state);
-        let asked_for_disk = applications.clone();
         tokio::spawn(async move {
             let found = tokio::task::spawn_blocking(move || {
-                crate::split_tunnel::application_paths_on_disk(&asked_for_disk)
+                crate::split_tunnel::application_paths_on_disk(&missing)
             })
             .await
             .unwrap_or_default();

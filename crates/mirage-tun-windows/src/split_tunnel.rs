@@ -1203,10 +1203,10 @@ fn process_dos_path(pid: u32) -> Option<String> {
 fn application_roots() -> Vec<(std::path::PathBuf, usize)> {
     let mut roots = Vec::new();
     for key in [
-        "LOCALAPPDATA",
         "ProgramFiles",
         "ProgramFiles(x86)",
         "ProgramData",
+        "LOCALAPPDATA",
         "APPDATA",
     ] {
         if let Some(dir) = std::env::var_os(key) {
