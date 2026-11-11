@@ -292,6 +292,7 @@ pub async fn activate_tun_inner(
     }
     let mut early_killswitch = crate::firewall::WfpKillSwitch::new();
     early_killswitch.set_native_if_index(early_if_index);
+    early_killswitch.set_resolvers(early_resolvers.clone());
     if let Err(e) = early_killswitch.activate_pre_tunnel(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate before the tunnel (non-fatal): {e}");
     } else {
@@ -464,6 +465,30 @@ pub async fn activate_tun_inner(
         }
     }
 
+    // The router is not a hole in the firewall.
+    //
+    // Every packet to the internet is addressed to the router, so a permit
+    // for the network around it permits the internet with it: the person
+    // would get the internet without the tunnel they asked for, and the
+    // kill-switch would hold nothing.  The resolver is permitted by its
+    // port instead (see the resolver permits), so the questions still go
+    // through.
+    if let Some(gateway) = gateway.as_deref().and_then(|g| g.trim().parse::<std::net::Ipv4Addr>().ok()) {
+        let gateway_u32 = u32::from(gateway);
+        let before = bypass_cidrs_for_wfp.len();
+        bypass_cidrs_for_wfp.retain(|(network, mask)| {
+            let in_net = (gateway_u32 & mask) == (*network & mask);
+            if in_net {
+                warn!(
+                    cidr = format!("{}/{}", std::net::Ipv4Addr::from(*network), mask.count_ones()),
+                    "activate: the network holds the router -- it is not permitted as a hole"
+                );
+            }
+            !in_net
+        });
+        let _ = before;
+    }
+
     // Activate WFP kill-switch (needs if_index for native bypass permit).
     // TUN interface index was resolved via spawn_blocking before taking the mutex.
     if cancel.is_cancelled() {
@@ -478,6 +503,7 @@ pub async fn activate_tun_inner(
     }
     killswitch.set_bypass_cidrs(bypass_cidrs_for_wfp);
     killswitch.set_bypass_cidrs_v6(bypass_cidrs_v6_for_wfp);
+    killswitch.set_resolvers(native_resolvers.clone());
     if let Err(e) = killswitch.activate(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate (non-fatal): {e}");
     }
@@ -526,6 +552,7 @@ pub async fn activate_tun_inner(
             .and_then(crate::split_tunnel::local_address_for);
         match (tunnel_ip, internet_ip) {
             (Some(tunnel), Some(internet)) => {
+                let asked = applications.clone();
                 let engaged = tokio::task::spawn_blocking(move || {
                     crate::split_tunnel::SplitTunnel::engage(tunnel, internet, &applications)
                 })
@@ -535,8 +562,15 @@ pub async fn activate_tun_inner(
                         info!("activate: the split-tunnel is engaged");
                         s.split_tunnel = Some(split);
                     }
-                    Ok(Err(e)) => warn!("activate: the split-tunnel did not engage (non-fatal): {e}"),
-                    Err(e) => warn!("activate: the split-tunnel panicked (non-fatal): {e}"),
+                    Ok(Err(e)) => warn!(
+                        error = %e,
+                        apps = ?asked,
+                        "activate: the app-bypass is NOT in force -- the driver did not engage; those images go through the tunnel like everything else"
+                    ),
+                    Err(e) => warn!(
+                        error = %e,
+                        "activate: the app-bypass is NOT in force -- the driver panicked"
+                    ),
                 }
             }
             _ => warn!(

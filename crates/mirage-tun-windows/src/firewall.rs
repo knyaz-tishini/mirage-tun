@@ -33,6 +33,25 @@ pub struct WfpKillSwitch {
     /// Per-process filter tracking: normalized exe path → list of installed WFP filter IDs.
     /// On plane change the old IDs are deleted and a new set installed.
     per_process_filters: HashMap<String, Vec<u64>>,
+    /// The resolvers of the machine: they are permitted by address AND by the
+    /// port of the name service.
+    ///
+    /// The router is the resolver on most lines, and the router is also the
+    /// way out of the machine: every packet to the internet is addressed to
+    /// it.  A permit for the whole local network therefore permits the whole
+    /// internet as well -- the kill-switch would hold nothing.  So the
+    /// resolver is permitted by its port, and the network around it is not
+    /// permitted at all.
+    resolvers: Vec<std::net::SocketAddr>,
+    /// Should the UDP be locked as well?
+    ///
+    /// The lock over the connections is a layer of TCP.  UDP -- the games,
+    /// the QUIC of the browsers, the questions of the machine -- would walk
+    /// out of the machine untouched, and the person would get the internet
+    /// without the tunnel they asked for.  So the UDP is locked too, while
+    /// the tunnel does not carry yet: the door is left open for the
+    /// questions of the machine and for the way out of the chain.
+    lock_udp: bool,
 }
 
 impl WfpKillSwitch {
@@ -45,6 +64,8 @@ impl WfpKillSwitch {
             bypass_cidrs_v6: Vec::new(),
             resolver: ProcessResolver::new(),
             per_process_filters: HashMap::new(),
+            resolvers: Vec::new(),
+            lock_udp: false,
         }
     }
 
@@ -68,6 +89,17 @@ impl WfpKillSwitch {
     /// Each entry is (network_addr_u128, mask_u128).
     pub fn set_bypass_cidrs_v6(&mut self, cidrs: Vec<(u128, u128)>) {
         self.bypass_cidrs_v6 = cidrs;
+    }
+
+    /// The resolvers of the machine.
+    ///
+    /// They are permitted by their address AND by the port of the name
+    /// service.  The router is the resolver on most lines, and the router is
+    /// also the way out of the machine: every packet to the internet is
+    /// addressed to it.  A permit for the whole local network would permit
+    /// the whole internet with it, and the kill-switch would hold nothing.
+    pub fn set_resolvers(&mut self, resolvers: Vec<std::net::SocketAddr>) {
+        self.resolvers = resolvers;
     }
 
     /// Re-apply WFP filters with an updated bypass CIDR list (IPv4 + IPv6).
@@ -107,16 +139,18 @@ impl WfpKillSwitch {
         exempt_ports: &[u16],
     ) -> Result<(), TunError> {
         self.native_if_index = None;
+        // The local network is NOT permitted here.  The router answers the
+        // questions of the machine AND carries its traffic to the internet:
+        // a permit for the network around the router permits the internet
+        // with it, and the person would get the internet without the tunnel
+        // they asked for.  The resolver is permitted by its port instead.
         self.bypass_cidrs.clear();
         self.bypass_cidrs_v6.clear();
-        for (network, mask) in [
-            (u32::from(Ipv4Addr::new(192, 168, 0, 0)), 0xFFFF_0000u32),
-            (u32::from(Ipv4Addr::new(172, 16, 0, 0)), 0xFFF0_0000u32),
-            (u32::from(Ipv4Addr::new(169, 254, 0, 0)), 0xFFFF_0000u32),
-        ] {
-            self.bypass_cidrs.push((network, mask));
-        }
-        self.activate(relay_addrs, tun_name, exempt_ports)
+        // The UDP is locked as well while the tunnel does not carry.
+        self.lock_udp = true;
+        let result = self.activate(relay_addrs, tun_name, exempt_ports);
+        self.lock_udp = false;
+        result
     }
 
     fn weight(n: u8) -> FilterWeight {
@@ -169,6 +203,96 @@ impl WfpKillSwitch {
                     .map_err(|e| TunError::Wfp(format!("relay permit {v4} failed: {e}")))?;
                 info!(%v4, "WFP: permit relay IPv4");
             }
+        }
+
+        // 3b. Permit the resolvers by their address AND their port (weight 13).
+        //
+        // The router is the resolver on most lines, and the router is also
+        // the way out of the machine: every packet to the internet is
+        // addressed to it.  A permit for the whole local network would
+        // permit the whole internet with it, and the kill-switch would hold
+        // nothing -- the person would get the internet without the tunnel.
+        for resolver in &self.resolvers {
+            let IpAddr::V4(v4) = resolver.ip() else {
+                continue;
+            };
+            FilterBuilder::new()
+                .name("Mirage: permit resolver IPv4")
+                .action(Action::Permit)
+                .layer(Layer::ConnectV4)
+                .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                .weight(Self::weight(13))
+                .condition(AddrConditionBuilder::remote().equal_v4(v4))
+                .condition(PortConditionBuilder::remote().equal(resolver.port()))
+                .add(tx)
+                .map_err(|e| TunError::Wfp(format!("resolver permit {v4} failed: {e}")))?;
+            info!(%v4, port = resolver.port(), "WFP: permit resolver IPv4");
+        }
+
+        // 3c. The lock over the UDP, while the tunnel does not carry.
+        //
+        // The block over the connections is a layer of TCP.  The UDP -- the
+        // games, the QUIC of the browsers -- would walk out of the machine
+        // untouched, and the person would get the internet without the
+        // tunnel they asked for.  The door is left open for the questions
+        // of the machine and for the way out of the chain.
+        if self.lock_udp {
+            FilterBuilder::new()
+                .name("Mirage: block all outbound UDP IPv4")
+                .action(Action::Block)
+                .layer(Layer::OutboundTransportV4)
+                .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                .weight(Self::weight(1))
+                .add(tx)
+                .map_err(|e| TunError::Wfp(format!("block-all UDP IPv4 filter failed: {e}")))?;
+
+            FilterBuilder::new()
+                .name("Mirage: permit loopback UDP IPv4")
+                .action(Action::Permit)
+                .layer(Layer::OutboundTransportV4)
+                .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                .weight(Self::weight(15))
+                .condition(AddrConditionBuilder::remote().subnet_v4(
+                    u32::from(Ipv4Addr::new(127, 0, 0, 0)),
+                    0xFF00_0000u32,
+                ))
+                .add(tx)
+                .map_err(|e| TunError::Wfp(format!("loopback UDP permit failed: {e}")))?;
+
+            for relay_addr in relay_addrs {
+                if let IpAddr::V4(v4) = relay_addr {
+                    FilterBuilder::new()
+                        .name("Mirage: permit relay UDP IPv4")
+                        .action(Action::Permit)
+                        .layer(Layer::OutboundTransportV4)
+                        .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                        .weight(Self::weight(14))
+                        .condition(AddrConditionBuilder::remote().equal_v4(*v4))
+                        .add(tx)
+                        .map_err(|e| {
+                            TunError::Wfp(format!("relay UDP permit {v4} failed: {e}"))
+                        })?;
+                }
+            }
+
+            for resolver in &self.resolvers {
+                let IpAddr::V4(v4) = resolver.ip() else {
+                    continue;
+                };
+                FilterBuilder::new()
+                    .name("Mirage: permit resolver UDP IPv4")
+                    .action(Action::Permit)
+                    .layer(Layer::OutboundTransportV4)
+                    .sublayer(KILLSWITCH_SUBLAYER_GUID)
+                    .weight(Self::weight(13))
+                    .condition(AddrConditionBuilder::remote().equal_v4(v4))
+                    .condition(PortConditionBuilder::remote().equal(resolver.port()))
+                    .add(tx)
+                    .map_err(|e| {
+                        TunError::Wfp(format!("resolver UDP permit {v4} failed: {e}"))
+                    })?;
+            }
+            info!("WFP: the UDP is locked until the tunnel carries");
         }
 
         // 4. Permit all traffic on TUN interface (weight 14) — fires before routing.
