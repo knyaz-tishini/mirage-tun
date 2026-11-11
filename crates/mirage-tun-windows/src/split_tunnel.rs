@@ -475,16 +475,39 @@ impl SplitTunnel {
             );
         }
 
-        // The sublayers must exist before the driver is initialized: the
-        // driver hangs its filters on them.
-        let scope = WfpScope::open()?;
-        scope.add_sublayers()?;
-
+        // The device comes FIRST, and the driver is put back into its fresh
+        // state before anything else happens.
+        //
+        // This order is the whole point.  A driver that still holds the state
+        // of an earlier client keeps that client's filters, and those filters
+        // BIND the traffic of the machine to the interface that client named
+        // as "the internet".  The traffic then leaves the machine natively
+        // while the tunnel stands right there, and the routing table cannot
+        // explain it: the FIB is identical in every session.  The state is
+        // therefore cleared first; the WFP objects of the earlier run -- the
+        // sublayers the driver's filters hang on -- can be taken down
+        // afterwards, because the filters are gone by then.
         let device = SharedHandle(open_device()?);
+        reset_driver(device.0);
+
+        // The sublayers must exist before the driver is initialized: the
+        // driver hangs its filters on them.  What an earlier run left behind
+        // is taken down first: a leftover provider answers "already exists"
+        // and would keep the run from ever engaging.
+        let scope = WfpScope::open()?;
+        scope.remove_sublayers();
+        if let Err(e) = scope.add_sublayers() {
+            reset_driver(device.0);
+            unsafe { CloseHandle(device.0) };
+            return Err(e);
+        }
+
         let result = Self::engage_inner(device, scope, tunnel, internet, excluded);
         match result {
             Ok(mut engaged) => Ok(engaged),
             Err(e) => {
+                // The driver must not keep a state it was never fully given.
+                reset_driver(device.0);
                 // The device was opened: it must be closed again, or the
                 // driver stays busy for the next one.
                 unsafe { CloseHandle(device.0) };
@@ -723,6 +746,34 @@ fn driver_state(device: HANDLE) -> Result<u64, SplitTunnelError> {
     let mut out = [0u8; 8];
     ioctl(device, IOCTL_GET_STATE, None, &mut out)?;
     Ok(u64::from_ne_bytes(out))
+}
+
+/// Put the driver back into its fresh state.
+///
+/// The driver's state is a machine-wide thing: while it is not `STARTED`, it
+/// keeps the filters of the client that left it there, and those filters bind
+/// the traffic of the machine to the interface that client named as "the
+/// internet".  Nothing else on the machine notices that the traffic is no
+/// longer going through the tunnel -- the routing table looks the same in
+/// every session -- so the state is cleared before the client does anything
+/// else, and again when the client gives up.
+fn reset_driver(device: HANDLE) {
+    // The configuration first: it tells the driver which images are out.
+    let _ = ioctl(device, IOCTL_CLEAR_CONFIGURATION, None, &mut []);
+    if let Err(e) = ioctl(device, IOCTL_RESET, None, &mut []) {
+        tracing::debug!(error = %e, "split-tunnel: the driver would not reset");
+        return;
+    }
+    match driver_state(device) {
+        Ok(state) => {
+            if state != STATE_STARTED {
+                tracing::warn!(state, "split-tunnel: the driver is not in its fresh state");
+            } else {
+                tracing::info!("split-tunnel: the driver was reset into its fresh state");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "split-tunnel: the state of the driver is unknown"),
+    }
 }
 
 /// The two sublayer GUIDs as the driver wants them.
