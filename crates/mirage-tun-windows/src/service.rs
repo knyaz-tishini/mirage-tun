@@ -121,7 +121,7 @@ pub(crate) fn save_chains_to_config(chains: &[crate::chains::ChainConfig]) {
 /// watches that file: when the address there is another one, the adapter
 /// takes it -- without the routes going down and without the session
 /// breaking. A refused change is tried again on the next tick.
-fn spawn_address_watcher(tun_name: String, current: String) {
+fn spawn_address_watcher(state: Arc<crate::api::AppState>, tun_name: String, current: String) {
     tokio::spawn(async move {
         let mut current = current;
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -178,6 +178,27 @@ fn spawn_address_watcher(tun_name: String, current: String) {
                 Ok(Ok(())) => {
                     current = target;
                     info!(addr = %current, "the adapter carries the new address");
+                    // The driver decides by the addresses which traffic is
+                    // inside the tunnel.  A driver that still carries the old
+                    // address does not see the new tunnel, and the
+                    // applications that are to leave the tunnel do not leave
+                    // it: they go into the tunnel, and the work of the machine
+                    // slows down to the speed of the tunnel.
+                    let tunnel_ip = current
+                        .split('/')
+                        .next()
+                        .and_then(|address| address.trim().parse::<std::net::Ipv4Addr>().ok());
+                    if let Some(tunnel_ip) = tunnel_ip {
+                        let mut guard = state.service.lock().await;
+                        if let Some(split) = guard.split_tunnel.as_mut() {
+                            if let Err(error) = split.retunnel(tunnel_ip) {
+                                tracing::warn!(
+                                    error = %error,
+                                    "the driver did not take the new tunnel address -- the applications that leave the tunnel go into it"
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(Err(error)) => {
                     tracing::error!(error = %error, "the adapter did not take the new address -- trying again");
@@ -408,7 +429,7 @@ pub async fn run_service_logic(
     // minute -- and the restart breaks the session, which is how the address
     // changed in the first place. The window writes the new address into
     // tun.json; the device reads it and gives the adapter that address.
-    spawn_address_watcher(tun_name.clone(), tun_addr.clone());
+    spawn_address_watcher(Arc::clone(&app_state), tun_name.clone(), tun_addr.clone());
 
     // Report Running to SCM after successful bind
     if let Some(ref handle) = status_handle {

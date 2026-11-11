@@ -444,6 +444,10 @@ pub struct SplitTunnel {
     scope: WfpScope,
     stop: Arc<AtomicBool>,
     events: Option<(std::sync::mpsc::Receiver<()>, thread::JoinHandle<()>)>,
+    /// The address the driver was told is the tunnel.
+    tunnel: Ipv4Addr,
+    /// The address the driver was told is the internet.
+    internet: Ipv4Addr,
 }
 
 impl SplitTunnel {
@@ -620,7 +624,38 @@ impl SplitTunnel {
             scope,
             stop,
             events: events.map(|handle| (done_rx, handle)),
+            tunnel,
+            internet,
         })
+    }
+
+    /// The tunnel carries another address -- the driver must know it.
+    ///
+    /// The box hands out one address per session, and the adapter takes the
+    /// new one on the fly.  The driver decides by the addresses which traffic
+    /// is "inside the tunnel": a driver that still carries the old address
+    /// does not see the new tunnel at all, and the applications that are to
+    /// leave the tunnel do not leave it.  They go into the tunnel instead, and
+    /// the work of the machine slows down to the speed of the tunnel.
+    pub fn retunnel(&mut self, tunnel: Ipv4Addr) -> Result<(), SplitTunnelError> {
+        if tunnel == self.tunnel {
+            return Ok(());
+        }
+        let addresses = IpAddresses::new(tunnel, self.internet);
+        let mut out: [u8; 0] = [];
+        ioctl(
+            self.device.0,
+            IOCTL_REGISTER_IP_ADDRESSES,
+            Some(&addresses.bytes()),
+            &mut out,
+        )?;
+        tracing::info!(
+            from = %self.tunnel,
+            to = %tunnel,
+            "split-tunnel: the driver has the new tunnel address"
+        );
+        self.tunnel = tunnel;
+        Ok(())
     }
 
     /// Replace the list of applications that leave the tunnel.
@@ -1000,6 +1035,116 @@ fn resolve_application(wanted: &str, running: &[(u32, u32, Vec<u16>)]) -> Option
         // A full path: the device path carries the same tail.
         if lower.ends_with(&wanted_tail) && wanted_tail.contains('\\') {
             return Some(text);
+        }
+    }
+
+    // The application is not running right now.
+    //
+    // A bare name needs a place on the disk to become a device path, and the
+    // running processes are not the only place: the person names the
+    // application ("YandexBrowser.exe") and starts it later.  The driver takes
+    // the list of images and excludes them when they show up, so the name has
+    // to be found on the disk -- otherwise the application goes into the
+    // tunnel the moment it starts, and the work of the machine slows down to
+    // the speed of the tunnel.
+    if let Some(path) = find_application_on_disk(&wanted_file) {
+        if let Some(device_path) = device_path_from_dos(&path) {
+            tracing::info!(application = %wanted_file, path = %path, "split-tunnel: the application was found on the disk");
+            return Some(device_path);
+        }
+    }
+    None
+}
+
+/// How long the search for an application on the disk may take.
+const DISK_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The folders an application usually lives in.
+fn application_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    for key in [
+        "LOCALAPPDATA",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+        "APPDATA",
+    ] {
+        if let Some(dir) = std::env::var_os(key) {
+            let dir = std::path::PathBuf::from(dir);
+            if dir.is_dir() {
+                roots.push(dir);
+            }
+        }
+    }
+    // The tools of Windows itself live here (notepad.exe, and the like).
+    if let Some(windows) = std::env::var_os("SystemRoot") {
+        let system = std::path::PathBuf::from(windows).join("System32");
+        if system.is_dir() {
+            roots.push(system);
+        }
+    }
+    roots
+}
+
+/// The folders the search does not walk into: they are big and they hold no
+/// application the person would name.
+fn skipped_folder(name: &str) -> bool {
+    matches!(
+        name,
+        "windows"
+            | "$recycle.bin"
+            | "system volume information"
+            | "node_modules"
+            | "cache"
+            | "caches"
+            | "temp"
+            | "tmp"
+            | "installer"
+            | "winsxs"
+    )
+}
+
+/// Find the application on the disk by its file name.
+fn find_application_on_disk(wanted_file: &str) -> Option<String> {
+    let wanted = wanted_file.to_ascii_lowercase();
+    let deadline = std::time::Instant::now() + DISK_SEARCH_BUDGET;
+    for root in application_roots() {
+        if let Some(hit) = search_for_file(&root, &wanted, 0, deadline) {
+            return Some(hit);
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    None
+}
+
+/// Walk a folder looking for the file.
+fn search_for_file(
+    dir: &std::path::Path,
+    wanted: &str,
+    depth: usize,
+    deadline: std::time::Instant,
+) -> Option<String> {
+    if depth > 6 || std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if skipped_folder(&name) {
+                continue;
+            }
+            if let Some(hit) = search_for_file(&path, wanted, depth + 1, deadline) {
+                return Some(hit);
+            }
+        } else if name == wanted {
+            return Some(path.to_string_lossy().to_string());
         }
     }
     None
