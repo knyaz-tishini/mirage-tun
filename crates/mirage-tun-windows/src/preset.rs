@@ -292,6 +292,7 @@ mod tests {
             domains: vec!["Yandex.RU".to_owned(), "  ".to_owned()],
             cidrs: vec!["5.45.0.0/16".to_owned()],
             apps: vec!["node.exe".to_owned()],
+            protect: Vec::new(),
         };
         let rules = preset.policy_rules();
         assert_eq!(rules.len(), 3);
