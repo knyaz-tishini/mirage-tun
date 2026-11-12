@@ -950,6 +950,10 @@ fn hole_route(
 /// A prefix that cannot be read, or a gateway that does not fit it, is
 /// skipped and counted; a route that is already there counts as drilled,
 /// because the hole is in place either way.
+///
+/// The prefixes are drilled by several threads at once: the routing API takes
+/// its own lock per call, and one call at a time left the machine waiting a
+/// minute for twelve thousand holes while the person waited for the tunnel.
 pub async fn drill_holes_batch(
     cidrs: &[String],
     gateway: Option<&str>,
@@ -970,33 +974,196 @@ pub async fn drill_holes_batch(
     }
 }
 
+/// How many threads drill the holes at once.
+fn hole_threads(count: usize) -> usize {
+    if count < 256 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    cores.clamp(2, 8).min(count / 256)
+}
+
+/// The shape of a route: its network, its length, its next hop and the
+/// interface it points at.
+///
+/// That is what the routing API compares, and that is what we compare too:
+/// a route that is already there is a route that is already there, whoever
+/// put it there.
+type RouteKey = (Ipv4Addr, u8, Ipv4Addr, u32);
+
+/// The shape of one row of the forwarding table.
+fn route_key(row: &MIB_IPFORWARD_ROW2) -> RouteKey {
+    let network = unsafe { row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr };
+    let next_hop = unsafe { row.NextHop.Ipv4.sin_addr.S_un.S_addr };
+    (
+        Ipv4Addr::from(network.to_ne_bytes()),
+        row.DestinationPrefix.PrefixLength,
+        Ipv4Addr::from(next_hop.to_ne_bytes()),
+        row.InterfaceIndex,
+    )
+}
+
+/// Read the routes of the machine, once.
+///
+/// The table is read in one go.  Asking the routing API about every prefix of
+/// a list one by one cost a scan of the whole table per prefix, and the table
+/// of a machine that carries twelve thousand bypass holes has twelve thousand
+/// rows: twenty-seven seconds for a list that was already in place.
+fn existing_routes_v4() -> std::collections::HashSet<RouteKey> {
+    let mut routes = std::collections::HashSet::new();
+    unsafe {
+        let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        let ret = GetIpForwardTable2(AF_INET, &mut table_ptr);
+        if ret != NO_ERROR {
+            warn!("GetIpForwardTable2(AF_INET) failed: {ret}");
+            return routes;
+        }
+        let table = &*table_ptr;
+        let rows = table.Table.as_ptr();
+        for i in 0..table.NumEntries as usize {
+            let row: &MIB_IPFORWARD_ROW2 = &*rows.add(i);
+            if row.DestinationPrefix.Prefix.si_family != AF_INET as u16 {
+                continue;
+            }
+            routes.insert(route_key(row));
+        }
+        FreeMibTable(table_ptr.cast());
+    }
+    routes
+}
+
+/// Which of the holes are already in the table, and which are not.
+///
+/// A hole that the table already has is a hole that is in place: the kernel
+/// is not asked about it, and the machine does not pay a scan of its own table
+/// for every prefix of the list.
+fn partition_holes<'a>(
+    holes: &'a [(String, MIB_IPFORWARD_ROW2)],
+    existing: &std::collections::HashSet<RouteKey>,
+) -> (
+    Vec<&'a (String, MIB_IPFORWARD_ROW2)>,
+    Vec<&'a (String, MIB_IPFORWARD_ROW2)>,
+) {
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    for hole in holes {
+        if existing.contains(&route_key(&hole.1)) {
+            present.push(hole);
+        } else {
+            missing.push(hole);
+        }
+    }
+    (present, missing)
+}
+
 /// The holes that are in place after the batch, and the count of the ones
 /// that were not.
+///
+/// The table of the machine is read first, and only the prefixes that are
+/// really missing are asked about: a hole that is already there is a hole
+/// that is already there, and the kernel is not asked about it again.  The
+/// missing ones are drilled by several threads at once -- the routing API
+/// takes its own lock per call, and one call at a time left the person
+/// waiting a minute for twelve thousand holes.
 fn drill_holes_blocking(cidrs: &[String], gateway: Option<&str>, if_index: u32) -> Vec<BypassHole> {
-    let mut holes: Vec<BypassHole> = Vec::with_capacity(cidrs.len());
-    let mut already = 0usize;
+    let existing = existing_routes_v4();
+    let gateway_owned = gateway.map(str::to_owned);
+
+    // The shape of every hole of the list, and the ones the table does not
+    // have yet.
+    let mut shapes: Vec<(String, MIB_IPFORWARD_ROW2)> = Vec::with_capacity(cidrs.len());
     let mut skipped = 0usize;
+    for cidr in cidrs {
+        match hole_route(cidr, gateway, if_index) {
+            Some((row, normalized)) => shapes.push((normalized, row)),
+            None => {
+                skipped += 1;
+                debug!(
+                    cidr,
+                    "Routing: the hole was skipped, the prefix or the gateway does not fit"
+                );
+            }
+        }
+    }
+    let (present, missing) = partition_holes(&shapes, &existing);
+    let already = present.len();
+
+    // The prefixes that are missing are shared out: every thread asks the
+    // routing API for its own share.
+    let wanted: Vec<String> = missing.iter().map(|(cidr, _)| cidr.clone()).collect();
+    let threads = hole_threads(wanted.len());
+    let mut holes: Vec<BypassHole> = Vec::with_capacity(shapes.len());
+    let mut drilled = 0usize;
+    let mut failed = 0usize;
+
+    for (cidr, _) in present {
+        holes.push(BypassHole {
+            cidr: cidr.clone(),
+            if_index,
+            gateway: gateway_owned.clone(),
+        });
+    }
+
+    if threads <= 1 {
+        let (part, part_drilled, part_failed) = drill_holes_chunk(&wanted, gateway, if_index);
+        holes.extend(part);
+        drilled += part_drilled;
+        failed += part_failed;
+    } else {
+        let chunk = wanted.len().div_ceil(threads);
+        let mut handles = Vec::with_capacity(threads);
+        for part in wanted.chunks(chunk) {
+            let part = part.to_vec();
+            let gateway = gateway_owned.clone();
+            handles.push(std::thread::spawn(move || {
+                drill_holes_chunk(&part, gateway.as_deref(), if_index)
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok((part, part_drilled, part_failed)) => {
+                    holes.extend(part);
+                    drilled += part_drilled;
+                    failed += part_failed;
+                }
+                Err(_) => warn!("Routing: a thread that drilled holes did not come back"),
+            }
+        }
+    }
+
+    info!(
+        drilled,
+        already, skipped, failed, "Routing: the holes are drilled"
+    );
+    holes
+}
+
+/// One thread's share: the holes the kernel is asked about.
+///
+/// The holes come back whole -- the ones that are in place, whether they were
+/// drilled here or were there before.
+fn drill_holes_chunk(
+    cidrs: &[String],
+    gateway: Option<&str>,
+    if_index: u32,
+) -> (Vec<BypassHole>, usize, usize) {
+    let mut holes: Vec<BypassHole> = Vec::with_capacity(cidrs.len());
+    let mut drilled = 0usize;
     let mut failed = 0usize;
 
     for cidr in cidrs {
         let Some((row, normalized)) = hole_route(cidr, gateway, if_index) else {
-            skipped += 1;
-            debug!(
-                cidr,
-                "Routing: the hole was skipped, the prefix or the gateway does not fit"
-            );
             continue;
         };
         let code = unsafe { CreateIpForwardEntry2(&row) };
         match code {
-            NO_ERROR => {}
+            NO_ERROR => drilled += 1,
             ERROR_OBJECT_ALREADY_EXISTS | ERROR_ALREADY_EXISTS => {
                 // The hole is there, whoever drilled it.
-                already += 1;
             }
             _ => {
                 failed += 1;
-                warn!(cidr, code, "Routing: the hole was not drilled");
+                warn!(cidr = %normalized, code, "Routing: the hole was not drilled");
                 continue;
             }
         }
@@ -1007,11 +1174,7 @@ fn drill_holes_blocking(cidrs: &[String], gateway: Option<&str>, if_index: u32) 
         });
     }
 
-    info!(
-        drilled = holes.len(),
-        already, skipped, failed, "Routing: the holes are drilled"
-    );
-    holes
+    (holes, drilled, failed)
 }
 
 /// Close many holes at once: the prefixes go back to the tunnel.
@@ -1040,7 +1203,12 @@ pub async fn close_holes_batch(
 
 /// The holes that are closed, the ones that were already gone and the ones
 /// that could not be closed.
+///
+/// The table of the machine is read once, and only the holes that are really
+/// there are asked to go: a hole that is not there any more is not closed
+/// twice, and the kernel is not scanned for it.
 fn close_holes_blocking(holes: &[BypassHole], gateway: Option<&str>, if_index: u32) -> usize {
+    let existing = existing_routes_v4();
     let mut closed = 0usize;
     for hole in holes {
         let hole_gateway = hole.gateway.as_deref().or(gateway);
@@ -1052,6 +1220,10 @@ fn close_holes_blocking(holes: &[BypassHole], gateway: Option<&str>, if_index: u
         let Some(row) = route_row_for(&hole.cidr, hole_gateway, hole_if_index) else {
             continue;
         };
+        if !existing.contains(&route_key(&row)) {
+            // The hole is not there any more: it is closed already.
+            continue;
+        }
         let code = unsafe { DeleteIpForwardEntry2(&row) };
         match code {
             NO_ERROR => closed += 1,
@@ -1524,6 +1696,29 @@ mod tests {
     fn a_hole_without_a_gateway_has_no_row() {
         assert!(route_row_for("10.1.2.0/24", None, 7).is_none());
         assert!(route_row_for("10.1.2.0/24", Some("not an address"), 7).is_none());
+    }
+
+    /// A hole that the table of the machine already has is not asked about
+    /// again: the table is read once, and the kernel is only troubled with
+    /// the prefixes that are really missing.  That is the difference between
+    /// a second of work and half a minute of it.
+    #[test]
+    fn the_holes_that_are_already_there_are_not_asked_about() {
+        let gateway = "192.168.1.1";
+        let (row, normalized) = hole_route("10.11.0.0/16", Some(gateway), 23)
+            .expect("the hole fits the gateway");
+        let holes = vec![(normalized, row)];
+
+        let mut existing = std::collections::HashSet::new();
+        existing.insert(route_key(&holes[0].1));
+        let (present, missing) = partition_holes(&holes, &existing);
+        assert_eq!(present.len(), 1, "the hole is in the table");
+        assert!(missing.is_empty(), "the kernel is not asked about it");
+
+        let empty = std::collections::HashSet::new();
+        let (present, missing) = partition_holes(&holes, &empty);
+        assert!(present.is_empty(), "the hole is not in the table");
+        assert_eq!(missing.len(), 1, "the kernel is asked about it");
     }
 
     #[test]
