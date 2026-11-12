@@ -479,6 +479,9 @@ pub struct SplitTunnel {
     tunnel: Ipv4Addr,
     /// The address the driver was told is the internet.
     internet: Ipv4Addr,
+    /// The names the person asked about: the log carries them and the rest
+    /// of the machine is a debug line.
+    watched: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl SplitTunnel {
@@ -500,26 +503,37 @@ impl SplitTunnel {
         // (`\Device\HarddiskVolumeN\...`), so the names have to be resolved
         // against the processes that are running right now.
         //
-        // One name that cannot be resolved is not a reason to give the whole
+        // EVERY running process that carries the wanted name is taken, not
+        // just the first one: two different images may carry the same file
+        // name ("node.exe" of Program Files and one of the cache of a
+        // tool), and the first match is not enough -- the other one keeps
+        // going through the tunnel, and the driver was given the wrong
+        // image.
+        //
+        // A name that cannot be resolved is not a reason to give the whole
         // list up: the applications that ARE known still leave the tunnel.
-        // A bare name ("node.exe") that is not running right now cannot be
-        // resolved at all -- the driver gets it when the process shows up.
+        // A bare name ("node.exe") that is not running right now is looked
+        // for on the disk -- the driver takes the images it is given and
+        // excludes them when they show up, so a path that is known now is
+        // enough.
         let running = running_processes();
-        let mut excluded: Vec<Vec<u16>> = Vec::new();
-        let mut missing: Vec<String> = Vec::new();
-        for wanted in applications {
-            match resolve_application(wanted, &running, false) {
-                Some(path) => excluded.push(wide(&path)),
-                None => missing.push(wanted.clone()),
+        let (excluded, missing) = collect_exclusions(applications, &running, |file| {
+            let path = find_application_on_disk(file)?;
+            match device_path_from_dos(&path) {
+                Some(device) => {
+                    tracing::info!(application = %file, path = %path, "split-tunnel: the application was found on the disk");
+                    Some(device)
+                }
+                None => None,
             }
-        }
+        });
         if excluded.is_empty() {
             return Err(SplitTunnelError::NoSuchApplication(missing.join(", ")));
         }
         if !missing.is_empty() {
             tracing::info!(
                 missing = %missing.join(", "),
-                "split-tunnel: these names are not running now; the rest of the list leaves the tunnel"
+                "split-tunnel: these names are neither running nor on the disk; the rest of the list leaves the tunnel"
             );
         }
 
@@ -557,7 +571,7 @@ impl SplitTunnel {
             return Err(e);
         }
 
-        let result = Self::engage_inner(device, scope, tunnel, internet, excluded);
+        let result = Self::engage_inner(device, scope, tunnel, internet, excluded, watched_names(applications));
         match result {
             Ok(mut engaged) => Ok(engaged),
             Err(e) => {
@@ -577,6 +591,7 @@ impl SplitTunnel {
         tunnel: Ipv4Addr,
         internet: Ipv4Addr,
         excluded: Vec<Vec<u16>>,
+        watched: Vec<String>,
     ) -> Result<Self, SplitTunnelError> {
         // A driver that is still holding the state of a previous client has
         // to be reset before it can be initialized again.
@@ -660,20 +675,16 @@ impl SplitTunnel {
         // The events: the driver says who started and who stopped.
         //
         // The driver tells about every process on the machine, so the log
-        // only carries the names the person asked about.
-        let watched: Vec<String> = excluded
-            .iter()
-            .filter_map(|path| {
-                let text = String::from_utf16_lossy(path);
-                text.rsplit('\\').next().map(|name| name.to_lowercase())
-            })
-            .filter(|name| !name.is_empty())
-            .collect();
+        // only carries the names the person asked about.  The names are
+        // the ones that were ASKED for -- not the ones that happened to be
+        // running: an application that is not running yet leaves the tunnel
+        // when it starts, and the log has to say so.
+        let watched = Arc::new(std::sync::Mutex::new(watched));
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let events = {
             let stop = Arc::clone(&stop);
-            let watched = watched.clone();
+            let watched = Arc::clone(&watched);
             thread::Builder::new()
                 .name("mirage-split-tunnel".into())
                 .spawn(move || {
@@ -699,6 +710,7 @@ impl SplitTunnel {
             events: events.map(|handle| (done_rx, handle)),
             tunnel,
             internet,
+            watched,
         })
     }
 
@@ -737,20 +749,19 @@ impl SplitTunnel {
             return Err(SplitTunnelError::NoSuchApplication("the list is empty".into()));
         }
         let running = running_processes();
-        let mut excluded: Vec<Vec<u16>> = Vec::new();
-        let mut missing: Vec<String> = Vec::new();
-        for wanted in applications {
-            match resolve_application(wanted, &running, false) {
-                Some(path) => excluded.push(wide(&path)),
-                None => missing.push(wanted.clone()),
-            }
-        }
+        // The list that comes here carries the paths themselves (the ones
+        // that were found on the disk), so the disk is not searched again.
+        let (excluded, missing) = collect_exclusions(applications, &running, |_| None);
         if excluded.is_empty() {
             return Err(SplitTunnelError::NoSuchApplication(missing.join(", ")));
         }
         let configuration = pack_configuration(&excluded);
         let mut out: [u8; 0] = [];
         ioctl(self.device.0, IOCTL_SET_CONFIGURATION, Some(&configuration), &mut out)?;
+        // The names the log carries follow the list.
+        if let Ok(mut watched) = self.watched.lock() {
+            *watched = watched_names(applications);
+        }
         Ok(())
     }
 
@@ -1054,7 +1065,11 @@ fn guids_bytes(guids: &SublayerGuids) -> [u8; 32] {
 /// the one that decides who leaves the tunnel. So the log only carries the
 /// names the person asked about; the rest is a debug line. A log that grows
 /// by megabytes a minute is a log nobody reads.
-fn event_loop(device: SharedHandle, stop: Arc<AtomicBool>, watched: Vec<String>) {
+fn event_loop(
+    device: SharedHandle,
+    stop: Arc<AtomicBool>,
+    watched: Arc<std::sync::Mutex<Vec<String>>>,
+) {
     let mut buffer = vec![0u8; 4096];
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -1096,6 +1111,10 @@ fn event_loop(device: SharedHandle, stop: Arc<AtomicBool>, watched: Vec<String>)
         }
         let event_id = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
         let size = u64::from_ne_bytes(buffer[8..16].try_into().unwrap()) as usize;
+        let watched = match watched.lock() {
+            Ok(watched) => watched.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         match event_id {
             EVENT_START_SPLITTING => {
                 let name = event_name(&buffer[16..returned.min(16 + size)]);
@@ -1178,70 +1197,142 @@ fn device_path_of(pid: u32) -> Option<Vec<u16>> {
     Some(buffer[..end].to_vec())
 }
 
-/// Find the device path of the application the person named.
-fn resolve_application(wanted: &str, running: &[(u32, u32, Vec<u16>)], search_disk: bool) -> Option<String> {
+/// The device paths of EVERY running process that carries the wanted name.
+///
+/// Two different images may carry the same file name -- "node.exe" of
+/// `C:\Program Files\nodejs` and one of the cache of a tool -- and both of
+/// them have to leave the tunnel.  The first match is not enough: the
+/// driver is given the images, and the one that was left out keeps going
+/// through the tunnel.
+///
+/// A full path the person wrote ("E:\MU\main.exe") is honoured exactly:
+/// the drive alone says which volume it is on, and the file does not have
+/// to be running for that -- the driver excludes an image when it starts.
+fn resolve_applications(wanted: &str, running: &[(u32, u32, Vec<u16>)]) -> Vec<String> {
     let wanted = wanted.trim();
     if wanted.is_empty() {
-        return None;
+        return Vec::new();
     }
     // A full path the person wrote ("E:\MU\main.exe") is translated into the
     // device path of its own accord -- the drive alone says which volume it
-    // is on. The application does NOT have to be running for that: the driver
-    // takes the list of images and excludes them when they show up. Only a
-    // bare name ("node.exe") needs a running process to say where it lives.
+    // is on.
     if let Some(path) = device_path_from_dos(wanted) {
-        return Some(path);
+        return vec![path];
     }
-    let wanted_file = wanted
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(wanted)
-        .to_ascii_lowercase();
-    // A full path as the person wrote it ("E:\MU\main.exe") is compared with
-    // the tail of the device path ("\Device\HarddiskVolumeN\MU\main.exe"):
-    // the drive is dropped, the rest must match.
-    let wanted_tail = wanted.replace('/', "\\").to_ascii_lowercase();
-    let wanted_tail = match wanted_tail.find(':') {
-        Some(drive) => wanted_tail[drive + 1..].to_owned(),
-        None => wanted_tail,
-    };
 
+    let wanted_file = file_name_of(wanted).to_ascii_lowercase();
+    // A path without a drive ("Windows\System32\notepad.exe") is compared
+    // with the tail of the device path ("\Device\HarddiskVolumeN\Windows
+    // \System32\notepad.exe"): the drive is dropped, the rest must match.
+    let wanted_tail = wanted.replace('/', "\\").to_ascii_lowercase();
+    let has_tail = wanted_tail.contains('\\');
+
+    let mut out: Vec<String> = Vec::new();
     for (_, _, path) in running {
         let text = String::from_utf16_lossy(path);
         let lower = text.to_ascii_lowercase();
         let file = lower.rsplit('\\').next().unwrap_or(&lower).to_string();
-        if file == wanted_file {
-            return Some(text);
+        let hit = if has_tail {
+            lower.ends_with(&wanted_tail)
+        } else {
+            file == wanted_file
+        };
+        if hit && !out.iter().any(|seen| seen.eq_ignore_ascii_case(&text)) {
+            out.push(text);
         }
-        // A full path: the device path carries the same tail.
-        if lower.ends_with(&wanted_tail) && wanted_tail.contains('\\') {
-            return Some(text);
+    }
+    out
+}
+
+/// The images of the applications the person named, and the names that could
+/// not be found at all.
+///
+/// EVERY running process that carries the name is taken -- see
+/// [`resolve_applications`].  A bare name that is not running right now is
+/// looked for on the disk: the driver takes the images it is given and
+/// excludes them when they show up, so a path that is known at the moment
+/// the driver is engaged is enough.
+///
+/// `from_disk` is given the file name of the wanted application and answers
+/// the device path of it, or nothing when the name is nowhere to be found.
+fn collect_exclusions<F>(
+    applications: &[String],
+    running: &[(u32, u32, Vec<u16>)],
+    mut from_disk: F,
+) -> (Vec<Vec<u16>>, Vec<String>)
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut excluded: Vec<Vec<u16>> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    // The bare names that are not running: they are looked for on the disk.
+    let mut wanted_on_disk: Vec<(String, String)> = Vec::new();
+
+    for wanted in applications {
+        let wanted = wanted.trim();
+        if wanted.is_empty() {
+            continue;
+        }
+        let paths = resolve_applications(wanted, running);
+        if paths.is_empty() {
+            // A path the person wrote is not looked for on the disk: the
+            // disk holds a dozen images with the same file name, and none
+            // of them is the one that was named.
+            let explicit = wanted.contains('\\') || wanted.contains('/') || wanted.contains(':');
+            if explicit {
+                missing.push(wanted.to_owned());
+            } else {
+                wanted_on_disk.push((wanted.to_owned(), file_name_of(wanted).to_owned()));
+            }
+            continue;
+        }
+        for path in paths {
+            push_unique(&mut excluded, wide(&path));
         }
     }
 
-    // The application is not running right now.
-    //
-    // A bare name needs a place on the disk to become a device path, and the
-    // running processes are not the only place: the person names the
-    // application ("YandexBrowser.exe") and starts it later.  The driver takes
-    // the list of images and excludes them when they show up, so the name has
-    // to be found on the disk -- otherwise the application goes into the
-    // tunnel the moment it starts, and the work of the machine slows down to
-    // the speed of the tunnel.
-    //
-    // The search on the disk is EIGHT SECONDS of budget per name, and it does
-    // not belong on the way the device comes up: the device that is slow to
-    // start is the device that is killed before it carries.  The caller looks
-    // for them in the background and hands the paths over.
-    if search_disk {
-        if let Some(path) = find_application_on_disk(&wanted_file) {
-            if let Some(device_path) = device_path_from_dos(&path) {
-                tracing::info!(application = %wanted_file, path = %path, "split-tunnel: the application was found on the disk");
-                return Some(device_path);
-            }
+    for (wanted, file) in wanted_on_disk {
+        match from_disk(&file) {
+            Some(path) => push_unique(&mut excluded, wide(&path)),
+            None => missing.push(wanted),
         }
     }
-    None
+
+    (excluded, missing)
+}
+
+/// The names the person asked about: the log carries them, the rest of the
+/// machine is a debug line.
+fn watched_names(applications: &[String]) -> Vec<String> {
+    applications
+        .iter()
+        .filter_map(|app| {
+            let file = file_name_of(app.trim());
+            if file.is_empty() {
+                None
+            } else {
+                Some(file.to_ascii_lowercase())
+            }
+        })
+        .collect()
+}
+
+/// The file name of a path, the way the person wrote it.
+fn file_name_of(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+/// Add an image to the list, unless it is already there.
+fn push_unique(list: &mut Vec<Vec<u16>>, path: Vec<u16>) {
+    if list.iter().any(|seen| wide_eq_ignore_case(seen, &path)) {
+        return;
+    }
+    list.push(path);
+}
+
+/// Compare two wide strings, ignoring the case of the letters.
+fn wide_eq_ignore_case(a: &[u16], b: &[u16]) -> bool {
+    String::from_utf16_lossy(a).eq_ignore_ascii_case(&String::from_utf16_lossy(b))
 }
 
 /// How long the search for an application on the disk may take.
@@ -1270,14 +1361,20 @@ pub fn application_paths(applications: &[String]) -> Vec<String> {
             continue;
         }
         let wanted_file = wanted.to_ascii_lowercase();
-        if let Some(path) = running.iter().find(|path| {
+        // EVERY image with that file name is taken: two of them may carry
+        // the same name ("node.exe" of Program Files and one of the cache
+        // of a tool), and the one that is left out keeps going through the
+        // tunnel.
+        for path in running.iter().filter(|path| {
             path.rsplit('\\')
                 .next()
                 .unwrap_or_default()
                 .to_ascii_lowercase()
                 == wanted_file
         }) {
-            out.push(path.clone());
+            if !out.iter().any(|seen| seen.eq_ignore_ascii_case(path)) {
+                out.push(path.clone());
+            }
         }
     }
     out
@@ -1581,8 +1678,92 @@ mod tests {
             1u32,
             wide(r"\Device\HarddiskVolume2\Program Files\nodejs\node.exe"),
         )];
-        let found = resolve_application("node.exe", &running).expect("node.exe is running");
-        assert!(found.ends_with("node.exe"));
-        assert!(resolve_application("nothing.exe", &running).is_none());
+        let found = resolve_applications("node.exe", &running);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("node.exe"));
+        assert!(resolve_applications("nothing.exe", &running).is_empty());
+    }
+
+    /// Two different images may carry the same file name -- and both of
+    /// them have to leave the tunnel.  The first match is not enough: the
+    /// other one keeps going through the tunnel.
+    #[test]
+    fn every_image_with_the_wanted_file_name_is_taken() {
+        let running = vec![
+            (
+                10u32,
+                1u32,
+                wide(r"\Device\HarddiskVolume2\Program Files\nodejs\node.exe"),
+            ),
+            (
+                20u32,
+                1u32,
+                wide(r"\Device\HarddiskVolume4\codex\node.exe"),
+            ),
+            (
+                30u32,
+                1u32,
+                wide(r"\Device\HarddiskVolume2\Windows\System32\svchost.exe"),
+            ),
+        ];
+        let found = resolve_applications("node.exe", &running);
+        assert_eq!(found.len(), 2, "both images of node.exe are taken");
+        assert!(found[0].contains("Program Files"));
+        assert!(found[1].contains("codex"));
+    }
+
+    /// The name of an application that is not running yet is looked for on
+    /// the disk: the driver excludes the images it is given when they show
+    /// up, so the path has to be known when the driver is engaged.
+    #[test]
+    fn a_name_that_is_on_the_disk_but_not_running_is_taken_from_the_disk() {
+        let running = vec![(
+            10u32,
+            1u32,
+            wide(r"\Device\HarddiskVolume2\Program Files\nodejs\node.exe"),
+        )];
+        let applications = vec!["node.exe".to_owned(), "yandexbrowser.exe".to_owned()];
+        let (excluded, missing) = collect_exclusions(&applications, &running, |file| {
+            if file.eq_ignore_ascii_case("yandexbrowser.exe") {
+                Some(r"\Device\HarddiskVolume2\Yandex\YandexBrowser.exe".to_owned())
+            } else {
+                None
+            }
+        });
+        assert!(missing.is_empty(), "the name was found on the disk");
+        assert_eq!(excluded.len(), 2, "the running image and the one on the disk");
+        let texts: Vec<String> = excluded
+            .iter()
+            .map(|path| String::from_utf16_lossy(path))
+            .collect();
+        assert!(texts.iter().any(|text| text.contains("nodejs")));
+        assert!(texts.iter().any(|text| text.contains("YandexBrowser.exe")));
+    }
+
+    /// A name that is neither running nor on the disk is reported -- and it
+    /// does not keep the rest of the list from leaving the tunnel.
+    #[test]
+    fn a_name_that_is_nowhere_is_reported() {
+        let running = vec![(
+            10u32,
+            1u32,
+            wide(r"\Device\HarddiskVolume2\Program Files\nodejs\node.exe"),
+        )];
+        let applications = vec!["node.exe".to_owned(), "nowhere.exe".to_owned()];
+        let (excluded, missing) = collect_exclusions(&applications, &running, |_| None);
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(missing, vec!["nowhere.exe".to_owned()]);
+    }
+
+    /// The log carries the names that were ASKED for -- not the ones that
+    /// happened to be running.
+    #[test]
+    fn the_watched_names_are_the_ones_that_were_asked_for() {
+        let watched = watched_names(&[
+            "node.exe".to_owned(),
+            "C:\\Program Files\\nodejs\\node.exe".to_owned(),
+            "YandexBrowser.exe".to_owned(),
+        ]);
+        assert_eq!(watched, vec!["node.exe".to_owned(), "node.exe".to_owned(), "yandexbrowser.exe".to_owned()]);
     }
 }
