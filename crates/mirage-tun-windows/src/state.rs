@@ -62,7 +62,10 @@ impl ServiceState {
             chains: Arc::new(crate::chains::ChainRegistry::empty()),
             active_conns: None,
             drain_timeout_secs: 5,
-            dns_upstream: "8.8.8.8:53".parse().expect("static addr is valid"),
+            // The same resolver the configuration names by default: through
+            // the tunnel the question to 8.8.8.8 comes back as a FORMERR,
+            // and the question to 1.1.1.1 comes back as an answer.
+            dns_upstream: "1.1.1.1:53".parse().expect("static addr is valid"),
         }
     }
 }

@@ -20,6 +20,12 @@ pub struct TunConfig {
     /// derived from `tun_addr` by [`derive_ipv6_addr`].
     #[serde(default)]
     pub ipv6_addr: Option<String>,
+    /// The resolver the tunnel asks for the names of the machine.
+    ///
+    /// The machine asks the adapter, and the adapter asks this address
+    /// through the tunnel.  The default is `1.1.1.1` -- through the tunnel
+    /// the question to `8.8.8.8` comes back as a twelve-byte FORMERR, and
+    /// the question to `1.1.1.1` comes back as an answer.
     #[serde(default = "default_dns_upstream")]
     pub dns_upstream: SocketAddr,
     #[serde(default = "default_dns_cache_ttl_secs")]
@@ -145,8 +151,16 @@ fn default_tun_addr() -> String {
     "10.0.85.1/24".to_owned()
 }
 
+/// The resolver the tunnel asks for its own names.
+///
+/// `1.1.1.1` and not `8.8.8.8`: through the tunnel the question to
+/// `8.8.8.8` comes back as a twelve-byte FORMERR (rcode 1, qdcount 0),
+/// while the same question to `1.1.1.1` comes back as a proper answer.
+/// The names of the machine are asked through the adapter, and the adapter
+/// asks this address -- so the wrong resolver here is the wrong resolver
+/// for the whole machine.
 fn default_dns_upstream() -> SocketAddr {
-    "8.8.8.8:53".parse().expect("static addr is valid")
+    "1.1.1.1:53".parse().expect("static addr is valid")
 }
 
 fn default_bypass_refresh_secs() -> u64 {

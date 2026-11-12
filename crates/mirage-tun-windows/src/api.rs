@@ -30,6 +30,12 @@ use crate::routing::Routing;
 use crate::state::{ServiceState, TunPhase};
 
 /// DNS server used in raw-IP mode when the configured upstream is unusable.
+///
+/// It is the address the configuration names by default: the question to
+/// `8.8.8.8` that goes through the tunnel comes back as a twelve-byte
+/// FORMERR, and the question to `1.1.1.1` comes back as an answer.  The
+/// fallback and the default are the same address, so the machine asks the
+/// same resolver either way.
 const FALLBACK_DNS: &str = "1.1.1.1";
 
 /// How long a name may take to answer when the holes are drilled.
@@ -461,6 +467,8 @@ pub async fn activate_tun_inner(
         state.config.dns_upstream.ip().to_string()
     };
     {
+        // Only the adapter of the tunnel is touched here: no other interface
+        // gets a resolver, and nothing is written to the registry.
         let _ = tokio::process::Command::new("netsh")
             .args(["interface", "ip", "set", "dns", &tun_name, "static", &dns_ip])
             .output()
@@ -1447,8 +1455,8 @@ fn tunnel_ipv6_addr(config: &TunConfig) -> Option<String> {
 async fn discover_native_dns(if_index: u32) -> Option<SocketAddr> {
     // Query DNS servers for the specific interface by index.
     // `netsh interface ipv4 show dnsservers interface=<idx>` returns only the
-    // DNS entries for that interface, avoiding picking up 8.8.8.8 that we set
-    // on the TUN adapter itself.
+    // DNS entries for that interface, avoiding picking up the 1.1.1.1 that we
+    // set on the TUN adapter itself.
     let index_str = if_index.to_string();
     let out = tokio::process::Command::new("netsh")
         .args(["interface", "ipv4", "show", "dnsservers", &format!("interface={index_str}")])
