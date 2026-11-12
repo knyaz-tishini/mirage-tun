@@ -355,6 +355,7 @@ fn create_wintun_shared(
     let tunnel_type_wide = to_wide(tunnel_type);
 
     // Try to open an existing adapter first; create one if not found.
+    let open_began = std::time::Instant::now();
     let adapter_ptr = unsafe { fn_open(name_wide.as_ptr()) };
     let adapter_ptr = if adapter_ptr.is_null() {
         debug!(name = tun_name, "no existing Wintun adapter, creating");
@@ -372,9 +373,18 @@ fn create_wintun_shared(
     };
 
     let adapter = WintunAdapter(adapter_ptr);
+    let began = std::time::Instant::now();
+    info!(
+        ms = open_began.elapsed().as_millis() as u64,
+        "wintun: the adapter is open"
+    );
 
     // Assign IPv4 address via netsh before starting the session.
     assign_ip_address(tun_name, tun_addr, mtu)?;
+    info!(
+        ms = began.elapsed().as_millis() as u64,
+        "wintun: the address is on the adapter"
+    );
 
     // Optionally assign IPv6 address.
     if let Some(v6) = tun_addr_v6 {
@@ -385,6 +395,10 @@ fn create_wintun_shared(
 
     // Wait for the adapter to stabilize.
     wait_interface_ready(tun_name);
+    info!(
+        ms = began.elapsed().as_millis() as u64,
+        "wintun: the interface is ready"
+    );
 
     // Start the Wintun session.
     let session_ptr = unsafe { fn_start(adapter.0, WINTUN_RING_CAPACITY) };
@@ -394,6 +408,10 @@ fn create_wintun_shared(
             "WintunStartSession failed (ring buffer too large or driver error?)".to_owned(),
         ));
     }
+    info!(
+        ms = began.elapsed().as_millis() as u64,
+        "wintun: the session is open"
+    );
 
     let session = WintunSession(session_ptr);
 
