@@ -1221,7 +1221,18 @@ async fn post_tun_stop(
 
     // Restore routes manually
     let tun_name = s.tun_name.clone();
+    // The half-routes go back through the routing API.
+    //
+    // netsh has to match the route by the name of the interface, and by
+    // the time the routes are given back the adapter may be gone -- the
+    // delete was a no-op, the routes stayed behind, and the machine had
+    // no way out with the tunnel off.
+    let removed = crate::routing::remove_half_routes(&tun_name);
+    if removed > 0 {
+        info!(removed, "TUN stop: the half-routes are taken back");
+    }
     if s.tun_default_set {
+        // netsh is the second hand: it works while the adapter is alive.
         let iface = format!("interface={tun_name}");
         let (_, _) = tokio::join!(
             tokio::process::Command::new("netsh")
@@ -1240,6 +1251,8 @@ async fn post_tun_stop(
     // routes: an address left behind would make the host pick it as the
     // source of traffic that has nowhere to go.
     if let Some(addr) = tunnel_ipv6_addr(state.config.as_ref()) {
+        // The IPv6 halves are taken back by the same call as the IPv4
+        // ones: the sweep of the routing API knows both families.
         let iface = format!("interface={tun_name}");
         let (_, _) = tokio::join!(
             tokio::process::Command::new("netsh")

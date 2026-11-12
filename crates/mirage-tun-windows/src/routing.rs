@@ -6,11 +6,12 @@ use windows_sys::Win32::Foundation::{
     NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, DeleteIpForwardEntry2, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2,
+    CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetIfEntry2, GetIpForwardTable2,
+    IP_ADDRESS_PREFIX, MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Networking::WinSock::{
-    NlroManual, AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, SOCKADDR_INET,
+    ADDRESS_FAMILY, NlroManual, AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, SOCKADDR_INET,
 };
 
 /// A hole in the routing: a prefix that leaves the machine the way it
@@ -178,7 +179,21 @@ impl Routing {
                 .output();
         }
 
+        if self.tun_default_set || self.tun_v6_default_set {
+            // The routes go back through the routing API first.
+            //
+            // netsh has to match the route by the name of the interface,
+            // and by the time the routes are given back the adapter may be
+            // gone -- the delete was a no-op, the routes stayed, and the
+            // machine lost its way out with the tunnel off.
+            let removed = remove_half_routes(&self.tun_name);
+            if removed > 0 {
+                info!(removed, "Routing: the half-routes are taken back");
+            }
+        }
+
         if self.tun_default_set {
+            // netsh is the second hand: it works while the adapter is alive.
             let _ = std::process::Command::new("netsh")
                 .args(["interface", "ipv4", "delete", "route", "0.0.0.0/1",
                        &format!("interface={name}"), "store=active"])
@@ -323,6 +338,228 @@ impl Routing {
         self.bypass_v6_routes.push(addr_str);
         Ok(())
     }
+}
+
+/// The half-routes the tunnel holds the default route with.
+///
+/// The default route of the machine is taken as two halves, because a
+/// route of 0.0.0.0/0 would fight the routes that have to stay: the
+/// entrances of the chain, the holes of the bypass, the routes of the
+/// machine itself.  The IPv6 halves are the same trick for the IPv6 of
+/// the host.
+pub const TUN_HALF_ROUTES: [&str; 4] = ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"];
+
+/// One half-route of the tunnel: the prefix and the family it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HalfRoute {
+    /// The prefix, in CIDR form.
+    pub prefix: String,
+    /// Whether the prefix belongs to the IPv6 family.
+    pub is_v6: bool,
+}
+
+/// The half-routes that must be gone when the tunnel stops.
+///
+/// The IPv4 halves always go.  The IPv6 halves go when they were set --
+/// they are only set when the adapter carries an IPv6 address, for a
+/// route into an adapter without one would black-hole the host's IPv6.
+pub fn half_routes_to_remove(v4_set: bool, v6_set: bool) -> Vec<HalfRoute> {
+    let mut out = Vec::new();
+    if v4_set {
+        out.push(HalfRoute {
+            prefix: "0.0.0.0/1".to_owned(),
+            is_v6: false,
+        });
+        out.push(HalfRoute {
+            prefix: "128.0.0.0/1".to_owned(),
+            is_v6: false,
+        });
+    }
+    if v6_set {
+        out.push(HalfRoute {
+            prefix: "::/1".to_owned(),
+            is_v6: true,
+        });
+        out.push(HalfRoute {
+            prefix: "8000::/1".to_owned(),
+            is_v6: true,
+        });
+    }
+    out
+}
+
+/// Whether the prefix is one of the half-routes of the tunnel.
+///
+/// The shape is the fingerprint: a machine whose default route is held
+/// in halves has exactly these four prefixes, and nothing else holds a
+/// default route that way.  A route that carries one of them is the
+/// tunnel's -- or the tunnel's leftover, and the leftover is worse: it
+/// takes the whole internet of the machine with it.
+pub fn is_tunnel_half_route(prefix: &str) -> bool {
+    let prefix = prefix.trim().to_ascii_lowercase();
+    TUN_HALF_ROUTES.iter().any(|half| *half == prefix)
+}
+
+/// The routes of the table that must be taken back.
+///
+/// This is the pure part of the sweep: out of the prefixes of the
+/// routing table, the ones that carry the shape of the tunnel are ours.
+pub fn select_half_routes(prefixes: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for prefix in prefixes {
+        let prefix = prefix.trim();
+        if prefix.is_empty() || !is_tunnel_half_route(prefix) {
+            continue;
+        }
+        let canonical = prefix.to_ascii_lowercase();
+        if !out.contains(&canonical) {
+            out.push(canonical);
+        }
+    }
+    out
+}
+
+/// The rows of the forwarding table of one family.
+fn forward_rows(family: ADDRESS_FAMILY) -> Vec<MIB_IPFORWARD_ROW2> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let code = unsafe { GetIpForwardTable2(family, &mut table) };
+    if code != NO_ERROR || table.is_null() {
+        warn!(family, code, "Routing: the forwarding table could not be read");
+        return Vec::new();
+    }
+    let count = unsafe { (*table).NumEntries } as usize;
+    let rows_ptr = unsafe { (*table).Table.as_ptr() };
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        rows.push(unsafe { *rows_ptr.add(index) });
+    }
+    unsafe { FreeMibTable(table.cast()) };
+    rows
+}
+
+/// The prefix of a route row, in CIDR form.
+fn row_prefix(row: &MIB_IPFORWARD_ROW2) -> Option<String> {
+    let family = unsafe { row.DestinationPrefix.Prefix.si_family };
+    let length = row.DestinationPrefix.PrefixLength;
+    match family {
+        AF_INET => {
+            let octets =
+                unsafe { row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr }.to_ne_bytes();
+            Some(format!("{}/{}", Ipv4Addr::from(octets), length))
+        }
+        AF_INET6 => {
+            let octets = unsafe { row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte };
+            Some(format!("{}/{}", Ipv6Addr::from(octets), length))
+        }
+        _ => None,
+    }
+}
+
+/// The name of the interface a route points at.
+///
+/// Nothing comes back when the interface is not there any more: the
+/// route points at an adapter that is gone, and that is the shape of the
+/// leftover of a tunnel that was killed.
+fn interface_alias(row: &MIB_IPFORWARD_ROW2) -> Option<String> {
+    let mut by_luid: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
+    by_luid.InterfaceLuid = row.InterfaceLuid;
+    by_luid.InterfaceIndex = row.InterfaceIndex;
+    if unsafe { GetIfEntry2(&mut by_luid) } == NO_ERROR {
+        return Some(alias_of(&by_luid));
+    }
+    // The LUID of a route whose adapter is gone is stale; the index may
+    // still be known.
+    let mut by_index: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
+    by_index.InterfaceIndex = row.InterfaceIndex;
+    if unsafe { GetIfEntry2(&mut by_index) } == NO_ERROR {
+        return Some(alias_of(&by_index));
+    }
+    None
+}
+
+/// The name of an interface, as the system writes it.
+fn alias_of(ifrow: &MIB_IF_ROW2) -> String {
+    let units: Vec<u16> = ifrow.Alias.iter().copied().take_while(|c| *c != 0).collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Take the half-routes of the tunnel out of the routing table.
+///
+/// The routes are read from the forwarding table of the system and are
+/// deleted through the routing API.  The old way -- netsh, with the name
+/// of the interface -- was a no-op by the time it ran: the adapter was
+/// gone, netsh could not match the route by that name, and the route
+/// stayed behind and took the whole internet of the machine with it.
+///
+/// A route that carries the shape of a half-route of the tunnel and that
+/// points at the tunnel's own adapter is ours.  A route that points at
+/// an adapter that is not there any more is ours as well: it is the
+/// leftover of a tunnel that was killed, and it points at nothing.
+///
+/// The count of the routes that are gone comes back.
+pub fn remove_half_routes(tun_name: &str) -> usize {
+    let mut removed = 0usize;
+    for family in [AF_INET, AF_INET6] {
+        for row in forward_rows(family) {
+            let Some(prefix) = row_prefix(&row) else {
+                continue;
+            };
+            if !is_tunnel_half_route(&prefix) {
+                continue;
+            }
+            let alias = interface_alias(&row);
+            let ours = match alias.as_deref() {
+                Some(alias) => alias.eq_ignore_ascii_case(tun_name),
+                None => true,
+            };
+            if !ours {
+                debug!(
+                    prefix,
+                    interface = ?alias,
+                    "Routing: the half-route of another adapter is left alone"
+                );
+                continue;
+            }
+            let code = unsafe { DeleteIpForwardEntry2(&row) };
+            match code {
+                NO_ERROR => {
+                    removed += 1;
+                    info!(prefix, interface = ?alias, "Routing: the half-route is taken back");
+                }
+                ERROR_NOT_FOUND | ERROR_FILE_NOT_FOUND => {}
+                _ => warn!(
+                    prefix,
+                    interface = ?alias,
+                    code,
+                    "Routing: the half-route was NOT taken back"
+                ),
+            }
+        }
+    }
+    if removed > 0 {
+        info!(removed, "Routing: the half-routes of the tunnel are gone");
+    }
+    removed
+}
+
+/// The half-routes that are still in the routing table.
+///
+/// Nothing of ours must be left behind when the tunnel stops: the
+/// machine would have no way out, and the resolver of the machine would
+/// have no way out with it.
+pub fn half_routes_left() -> Vec<String> {
+    let mut out = Vec::new();
+    for family in [AF_INET, AF_INET6] {
+        for row in forward_rows(family) {
+            let Some(prefix) = row_prefix(&row) else {
+                continue;
+            };
+            if is_tunnel_half_route(&prefix) {
+                out.push(prefix);
+            }
+        }
+    }
+    out
 }
 
 impl Drop for Routing {
@@ -913,6 +1150,19 @@ async fn add_runtime_bypass_v6(addr: IpAddr, gateway: Option<&str>, if_index: u3
 }
 
 pub async fn cleanup_stale_routes(tun_name: &str) {
+    // The leftovers of the last run are taken back through the routing
+    // API.
+    //
+    // netsh has to match the route by the name of the interface, and the
+    // adapter of the last run may be gone by now -- the delete was a
+    // no-op, the half-routes stayed, and the machine had no way out with
+    // the tunnel off.  The routing API does not care: the route is found
+    // by its shape and by the interface it points at.
+    let removed = remove_half_routes(tun_name);
+    if removed > 0 {
+        info!(removed, "Routing: the leftover half-routes are taken back");
+    }
+    // netsh is the second hand: it works while the adapter is alive.
     let iface = format!("interface={tun_name}");
     let args0 = ["interface", "ipv4", "delete", "route", "0.0.0.0/1", iface.as_str(), "store=active"];
     let args1 = ["interface", "ipv4", "delete", "route", "128.0.0.0/1", iface.as_str(), "store=active"];
@@ -924,6 +1174,10 @@ pub async fn cleanup_stale_routes(tun_name: &str) {
         run_netsh_route(&args2),
         run_netsh_route(&args3),
     );
+    let left = half_routes_left();
+    if !left.is_empty() {
+        warn!(routes = ?left, "Routing: half-routes are still in the table");
+    }
     debug!("Routing: stale route cleanup done");
 }
 
@@ -1276,5 +1530,93 @@ mod tests {
     fn a_gateway_of_another_family_has_no_row() {
         assert!(route_row_for("10.1.2.0/24", Some("fe80::1"), 7).is_none());
         assert!(route_row_for("2001:db8::/32", Some("192.168.1.1"), 7).is_none());
+    }
+
+    #[test]
+    fn the_half_routes_of_the_tunnel_are_known() {
+        assert!(is_tunnel_half_route("0.0.0.0/1"));
+        assert!(is_tunnel_half_route("128.0.0.0/1"));
+        assert!(is_tunnel_half_route("::/1"));
+        assert!(is_tunnel_half_route("8000::/1"));
+        // The whole default route is not ours: it is not the shape of the
+        // tunnel, and taking it would fight the routes of the machine.
+        assert!(!is_tunnel_half_route("0.0.0.0/0"));
+        assert!(!is_tunnel_half_route("::/0"));
+        assert!(!is_tunnel_half_route("10.0.0.0/8"));
+        assert!(!is_tunnel_half_route("0.0.0.0/2"));
+        assert!(!is_tunnel_half_route(""));
+    }
+
+    #[test]
+    fn the_restore_list_carries_the_half_routes() {
+        let v4 = half_routes_to_remove(true, false);
+        assert_eq!(v4.len(), 2);
+        assert_eq!(v4[0].prefix, "0.0.0.0/1");
+        assert_eq!(v4[1].prefix, "128.0.0.0/1");
+        assert!(v4.iter().all(|half| !half.is_v6));
+
+        let both = half_routes_to_remove(true, true);
+        assert_eq!(both.len(), 4);
+        assert_eq!(both[2].prefix, "::/1");
+        assert_eq!(both[3].prefix, "8000::/1");
+        assert!(both[2].is_v6 && both[3].is_v6);
+
+        // The IPv6 halves are only set when the adapter carries an IPv6
+        // address, so they are only taken back when they were set.
+        assert!(half_routes_to_remove(false, false).is_empty());
+        assert!(half_routes_to_remove(false, true).len() == 2);
+    }
+
+    #[test]
+    fn only_the_routes_of_the_shape_of_the_tunnel_are_taken_back() {
+        let table: Vec<String> = [
+            "0.0.0.0/1",
+            "128.0.0.0/1",
+            "::/1",
+            "8000::/1",
+            "0.0.0.0/0",
+            "192.168.1.0/24",
+            "10.77.0.0/24",
+            "0.0.0.0/1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let selected = select_half_routes(&table);
+        assert_eq!(
+            selected,
+            vec![
+                "0.0.0.0/1".to_owned(),
+                "128.0.0.0/1".to_owned(),
+                "::/1".to_owned(),
+                "8000::/1".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_prefix_of_a_route_is_read_back_the_way_it_was_written() {
+        let row = route_row_for("10.1.2.0/24", Some("192.168.1.1"), 7).expect("the row");
+        assert_eq!(row_prefix(&row).as_deref(), Some("10.1.2.0/24"));
+        let row = route_row_for("2001:db8::/32", Some("2001:db8::1"), 7).expect("the row");
+        assert_eq!(row_prefix(&row).as_deref(), Some("2001:db8::/32"));
+    }
+
+    #[test]
+    fn the_half_routes_of_the_tunnel_are_recognised_in_the_table() {
+        // The sweep finds the routes by their prefix: the prefix of the
+        // row has to be read back the way it was written, or the sweep
+        // finds nothing and the routes stay behind.
+        let row = route_row_for("0.0.0.0/1", Some("0.0.0.0"), 7).expect("the row");
+        assert!(is_tunnel_half_route(&row_prefix(&row).expect("the prefix")));
+        let row = route_row_for("128.0.0.0/1", Some("0.0.0.0"), 7).expect("the row");
+        assert!(is_tunnel_half_route(&row_prefix(&row).expect("the prefix")));
+        let row = route_row_for("::/1", Some("::"), 7).expect("the row");
+        assert!(is_tunnel_half_route(&row_prefix(&row).expect("the prefix")));
+        let row = route_row_for("8000::/1", Some("::"), 7).expect("the row");
+        assert!(is_tunnel_half_route(&row_prefix(&row).expect("the prefix")));
+        // A route that is not ours is not taken back.
+        let row = route_row_for("0.0.0.0/0", Some("192.168.1.1"), 7).expect("the row");
+        assert!(!is_tunnel_half_route(&row_prefix(&row).expect("the prefix")));
     }
 }

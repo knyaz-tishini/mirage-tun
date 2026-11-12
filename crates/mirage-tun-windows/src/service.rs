@@ -471,7 +471,21 @@ pub async fn run_service_logic(
         if let Some(cancel) = s.ipstack_cancel.take() {
             cancel.cancel();
         }
+        // The half-routes go back through the routing API.
+        //
+        // netsh has to match the route by the name of the interface, and
+        // by the time the routes are given back the adapter may be gone
+        // -- the delete was a no-op, the routes stayed behind, and the
+        // machine lost its way out with the tunnel off.
+        //
+        // This happens BEFORE the adapter is given up: the routes go
+        // first, the adapter after them.
+        let removed = crate::routing::remove_half_routes(&s.tun_name);
+        if removed > 0 {
+            info!(removed, "the half-routes are taken back");
+        }
         if s.tun_default_set {
+            // netsh is the second hand: it works while the adapter is alive.
             let name = &s.tun_name;
             let _ = std::process::Command::new("netsh")
                 .args(["interface", "ipv4", "delete", "route", "0.0.0.0/1", &format!("interface={name}"), "store=active"])
@@ -479,6 +493,13 @@ pub async fn run_service_logic(
             let _ = std::process::Command::new("netsh")
                 .args(["interface", "ipv4", "delete", "route", "128.0.0.0/1", &format!("interface={name}"), "store=active"])
                 .output();
+        }
+        // Nothing of ours must be left behind: with the tunnel off the
+        // machine would have no way out, and the resolver of the machine
+        // would have no way out with it.
+        let left = crate::routing::half_routes_left();
+        if !left.is_empty() {
+            tracing::warn!(routes = ?left, "the half-routes are still in the table -- the machine may have no way out");
         }
         // The holes the device drilled are the device's own: they go with it.
         let holes: Vec<crate::routing::BypassHole> = s.bypass_holes.drain(..).collect();
