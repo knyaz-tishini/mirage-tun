@@ -318,11 +318,28 @@ pub async fn run_service_logic(
 
     // Stale state cleanup
     cleanup_stale_routes(&tun_name).await;
-    crate::proxy::clear_system_proxy().await;
 
-    let wintun = match WintunHandle::create(&tun_name, &tun_addr, tun_cfg.tun_addr_v6.as_deref(), tun_mtu, Some(&tun_cfg.tunnel_type)).await {
+    // The proxy of the machine is cleared while the adapter comes up: the two
+    // are independent, and the machine waits for both of them. The proxy took
+    // two seconds and the adapter fifteen -- side by side it is the adapter
+    // alone, and the window that waits for the tunnel waits half as long.
+    let adapter_began = std::time::Instant::now();
+    let (proxy, adapter) = tokio::join!(
+        crate::proxy::clear_system_proxy(),
+        WintunHandle::create(
+            &tun_name,
+            &tun_addr,
+            tun_cfg.tun_addr_v6.as_deref(),
+            tun_mtu,
+            Some(&tun_cfg.tunnel_type)
+        )
+    );
+    let wintun = match adapter {
         Ok(w) => {
-            info!("Wintun adapter '{tun_name}' ready");
+            info!(
+                ms = adapter_began.elapsed().as_millis() as u64,
+                "Wintun adapter '{tun_name}' ready"
+            );
             Some(w)
         }
         Err(e) => {
