@@ -28,6 +28,7 @@
 
 #![cfg(target_os = "windows")]
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fmt;
 use std::io;
@@ -1059,18 +1060,156 @@ fn guids_bytes(guids: &SublayerGuids) -> [u8; 32] {
     out
 }
 
+/// The change of the state of an application that leaves the tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    /// The application left the tunnel.
+    Left,
+    /// The application came back into the tunnel.
+    CameBack,
+}
+
+/// The applications that are out of the tunnel, and the processes that hold
+/// them there.
+///
+/// The driver tells about EVERY process of the machine, and it tells about
+/// every process that starts and every process that stops: its events are
+/// about the PROCESSES, not about the applications.  A machine that spawns
+/// node.exe a hundred times an hour said "the application left the tunnel"
+/// a hundred times and "the application came back into the tunnel" a
+/// hundred times, while the application never left the tunnel at all -- it
+/// was running the whole time, and the processes that came and went were
+/// its children.
+///
+/// So the state is kept per image, and the instances are counted: an
+/// application leaves the tunnel when its first instance leaves it, and it
+/// comes back when its last instance comes back.  The same event twice
+/// changes nothing: the instance is already known.
+#[derive(Debug, Default)]
+pub struct ExcludedState {
+    /// The names the person asked about, in lower case.
+    watched: Vec<String>,
+    /// The instances that are out of the tunnel, per image.
+    outside: HashMap<String, HashSet<u64>>,
+}
+
+impl ExcludedState {
+    /// The state of the applications of the list.
+    pub fn new(watched: Vec<String>) -> Self {
+        let mut state = Self::default();
+        state.set_watched(watched);
+        state
+    }
+
+    /// The names the person asked about.
+    pub fn watched(&self) -> &[String] {
+        &self.watched
+    }
+
+    /// The list of the applications changed.
+    ///
+    /// The applications that are not on the list any more are not ours, and
+    /// their instances are forgotten.  The ones that stay keep their
+    /// instances: the driver did not change them either.
+    pub fn set_watched(&mut self, watched: Vec<String>) {
+        let mut wanted: Vec<String> = Vec::new();
+        for name in watched {
+            let name = name.trim().to_ascii_lowercase();
+            if name.is_empty() || wanted.contains(&name) {
+                continue;
+            }
+            wanted.push(name);
+        }
+        if wanted == self.watched {
+            return;
+        }
+        self.watched = wanted;
+        let watched = self.watched.clone();
+        self.outside
+            .retain(|image, _| watched.iter().any(|name| image.contains(name)));
+    }
+
+    /// Whether the image is one of the applications the person asked about.
+    pub fn is_watched(&self, image: &str) -> bool {
+        let image = image.to_ascii_lowercase();
+        self.watched.iter().any(|name| image.contains(name))
+    }
+
+    /// A process of an application left the tunnel.
+    ///
+    /// The transition comes back only when the state really changed: the
+    /// first instance of the image is the one that leaves the tunnel, and
+    /// the instances that follow it are the same application leaving
+    /// again.
+    pub fn started(&mut self, image: &str, pid: u64) -> Option<Transition> {
+        if !self.is_watched(image) {
+            return None;
+        }
+        let key = image.to_ascii_lowercase();
+        let instances = self.outside.entry(key).or_default();
+        let first = instances.is_empty();
+        instances.insert(pid);
+        if first {
+            Some(Transition::Left)
+        } else {
+            None
+        }
+    }
+
+    /// A process of an application came back into the tunnel.
+    ///
+    /// The transition comes back only when the last instance of the image
+    /// is gone: the application is still out of the tunnel as long as one
+    /// of its processes is running.
+    pub fn stopped(&mut self, image: &str, pid: u64) -> Option<Transition> {
+        if !self.is_watched(image) {
+            return None;
+        }
+        let key = image.to_ascii_lowercase();
+        let Some(instances) = self.outside.get_mut(&key) else {
+            return None;
+        };
+        instances.remove(&pid);
+        if !instances.is_empty() {
+            return None;
+        }
+        self.outside.remove(&key);
+        Some(Transition::CameBack)
+    }
+
+    /// The applications that are out of the tunnel right now.
+    pub fn outside(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.outside.keys().cloned().collect();
+        out.sort();
+        out
+    }
+}
+
 /// The events: who started and who stopped being out of the tunnel.
 ///
 /// The driver tells about EVERY process on the machine -- it has to, it is
 /// the one that decides who leaves the tunnel. So the log only carries the
 /// names the person asked about; the rest is a debug line. A log that grows
 /// by megabytes a minute is a log nobody reads.
+///
+/// The events of the driver are about the PROCESSES, not about the
+/// applications: every process that starts and every process that stops is
+/// an event of its own.  A machine that spawns node.exe a hundred times an
+/// hour said "the application left the tunnel" a hundred times and "the
+/// application came back into the tunnel" a hundred times -- while the
+/// application never left the tunnel at all: it was running the whole time,
+/// and the processes that came and went were its children.
+///
+/// So the state is kept per image, and the instances are counted: an
+/// application leaves the tunnel when its first instance leaves it, and it
+/// comes back when its last instance comes back.
 fn event_loop(
     device: SharedHandle,
     stop: Arc<AtomicBool>,
     watched: Arc<std::sync::Mutex<Vec<String>>>,
 ) {
     let mut buffer = vec![0u8; 4096];
+    let mut state = ExcludedState::default();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1106,30 +1245,44 @@ fn event_loop(
             continue;
         }
         let returned = returned as usize;
-        if returned < 16 {
+        // The header of the event is sixteen bytes, and the payload of a
+        // splitting event carries the process the event is about.
+        if returned < 24 {
             continue;
         }
         let event_id = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
         let size = u64::from_ne_bytes(buffer[8..16].try_into().unwrap()) as usize;
-        let watched = match watched.lock() {
-            Ok(watched) => watched.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
         match event_id {
-            EVENT_START_SPLITTING => {
+            EVENT_START_SPLITTING | EVENT_STOP_SPLITTING => {
                 let name = event_name(&buffer[16..returned.min(16 + size)]);
-                if watched.iter().any(|watched| name.to_lowercase().contains(watched)) {
-                    tracing::info!(application = %name, "split-tunnel: the application left the tunnel");
+                // The process the event is about: the same image may be
+                // many processes at once, and they are told apart by it.
+                let pid = u64::from_ne_bytes(buffer[16..24].try_into().unwrap());
+                // The names the log carries follow the list of the driver.
+                let names = match watched.lock() {
+                    Ok(watched) => watched.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                state.set_watched(names);
+                let transition = if event_id == EVENT_START_SPLITTING {
+                    state.started(&name, pid)
                 } else {
-                    tracing::debug!(application = %name, "split-tunnel: an application left the tunnel");
-                }
-            }
-            EVENT_STOP_SPLITTING => {
-                let name = event_name(&buffer[16..returned.min(16 + size)]);
-                if watched.iter().any(|watched| name.to_lowercase().contains(watched)) {
-                    tracing::info!(application = %name, "split-tunnel: the application came back into the tunnel");
-                } else {
-                    tracing::debug!(application = %name, "split-tunnel: an application came back into the tunnel");
+                    state.stopped(&name, pid)
+                };
+                match transition {
+                    Some(Transition::Left) => {
+                        tracing::info!(application = %name, "split-tunnel: the application left the tunnel");
+                    }
+                    Some(Transition::CameBack) => {
+                        tracing::info!(application = %name, "split-tunnel: the application came back into the tunnel");
+                    }
+                    None => {
+                        tracing::debug!(
+                            application = %name,
+                            event = event_id,
+                            "split-tunnel: the state of the application did not change"
+                        );
+                    }
                 }
             }
             _ => {
@@ -1765,5 +1918,84 @@ mod tests {
             "YandexBrowser.exe".to_owned(),
         ]);
         assert_eq!(watched, vec!["node.exe".to_owned(), "node.exe".to_owned(), "yandexbrowser.exe".to_owned()]);
+    }
+
+    /// The image of the application the log kept talking about.
+    const NODE: &str = r"\device\harddiskvolume3\program files\nodejs\node.exe";
+
+    /// An application leaves the tunnel once, no matter how many processes
+    /// of it are running.
+    #[test]
+    fn an_application_leaves_the_tunnel_once() {
+        let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
+        assert_eq!(state.started(NODE, 42), Some(Transition::Left));
+        // The child of the application leaves the tunnel as well, and the
+        // application did not leave it a second time.
+        assert_eq!(state.started(NODE, 43), None);
+        assert_eq!(state.outside(), vec![NODE.to_owned()]);
+    }
+
+    /// An application that exits comes back exactly once.
+    #[test]
+    fn an_application_that_exits_comes_back_exactly_once() {
+        let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
+        assert_eq!(state.started(NODE, 42), Some(Transition::Left));
+        assert_eq!(state.stopped(NODE, 42), Some(Transition::CameBack));
+        // The same event again: nothing comes back a second time.
+        assert_eq!(state.stopped(NODE, 42), None);
+        assert!(state.outside().is_empty());
+    }
+
+    /// The children of an application do not toggle it: the application is
+    /// still out of the tunnel while one of its processes is running.
+    #[test]
+    fn the_children_of_an_application_do_not_toggle_it() {
+        let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
+        assert_eq!(state.started(NODE, 42), Some(Transition::Left));
+        assert_eq!(state.started(NODE, 43), None);
+        assert_eq!(state.stopped(NODE, 43), None);
+        assert_eq!(state.outside(), vec![NODE.to_owned()]);
+        // The application itself is gone: now it comes back.
+        assert_eq!(state.stopped(NODE, 42), Some(Transition::CameBack));
+        assert!(state.outside().is_empty());
+    }
+
+    /// The same event twice does not move the state: the configuration of
+    /// the applications is the same, and the state does not flip.
+    #[test]
+    fn the_same_event_twice_does_not_move_the_state() {
+        let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
+        assert_eq!(state.started(NODE, 42), Some(Transition::Left));
+        let configuration = state.outside();
+        assert_eq!(state.started(NODE, 42), None);
+        assert_eq!(state.outside(), configuration);
+        assert_eq!(state.stopped(NODE, 42), Some(Transition::CameBack));
+        let configuration = state.outside();
+        assert_eq!(state.stopped(NODE, 42), None);
+        assert_eq!(state.outside(), configuration);
+    }
+
+    /// The applications of the machine that were not asked about are not
+    /// ours: they move nothing.
+    #[test]
+    fn an_application_that_was_not_asked_about_moves_nothing() {
+        let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
+        let other = r"\device\harddiskvolume3\windows\system32\notepad.exe";
+        assert_eq!(state.started(other, 7), None);
+        assert_eq!(state.stopped(other, 7), None);
+        assert!(state.outside().is_empty());
+    }
+
+    /// The list of the applications changed: the ones that are not on it
+    /// any more are forgotten, and the ones that stay keep their state.
+    #[test]
+    fn a_changed_list_keeps_the_applications_that_stay() {
+        let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
+        assert_eq!(state.started(NODE, 42), Some(Transition::Left));
+        state.set_watched(vec!["node.exe".to_owned(), "notepad.exe".to_owned()]);
+        assert_eq!(state.outside(), vec![NODE.to_owned()]);
+        state.set_watched(vec!["notepad.exe".to_owned()]);
+        assert!(state.outside().is_empty());
+        assert_eq!(state.stopped(NODE, 42), None);
     }
 }
