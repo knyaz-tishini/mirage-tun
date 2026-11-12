@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::{debug, info, warn};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 
 use mirage_wfp::{
@@ -19,6 +19,95 @@ use crate::process_info::ProcessResolver;
 
 // Fixed GUID for our sublayer — deterministic so we don't leak sublayers on crash.
 const KILLSWITCH_SUBLAYER_GUID: GUID = GUID::from_u128(0x4d697261_6765_4b69_6c6c_537769746368);
+
+/// The permits of the applications that leave the tunnel.
+///
+/// Every filter of the switch is filed under the application it belongs to:
+/// the filters of the switch survive the run (the session is persistent),
+/// so a permit that is not taken away stays for ever.  An application that
+/// was let out of the tunnel once would then keep working around it for
+/// ever -- and the person who took it off the list would never see the
+/// tunnel again.
+#[derive(Debug, Default)]
+struct AppPermits {
+    /// The key of the application -> the ids of its filters.
+    filters: BTreeMap<String, Vec<u64>>,
+}
+
+/// The key a path of an application is filed under.
+///
+/// The same path in two spellings ("C:/a/b.exe" and "C:\a\b.exe") is the
+/// same application, and the case of the letters does not matter on
+/// Windows.
+fn permit_key(path: &str) -> String {
+    path.trim().replace('/', "\\").to_ascii_lowercase()
+}
+
+impl AppPermits {
+    /// The filters of the applications that are not on the list any more.
+    ///
+    /// These are the permits that have to be taken away: the application
+    /// goes back into the tunnel.
+    fn stale(&self, wanted: &[String]) -> Vec<(String, Vec<u64>)> {
+        let keys: Vec<String> = wanted.iter().map(|path| permit_key(path)).collect();
+        self.filters
+            .iter()
+            .filter(|(key, _)| !keys.contains(key))
+            .map(|(key, ids)| (key.clone(), ids.clone()))
+            .collect()
+    }
+
+    /// The applications of the list that are not permitted yet.
+    fn fresh(&self, wanted: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for path in wanted {
+            let key = permit_key(path);
+            if key.is_empty() || self.filters.contains_key(&key) {
+                continue;
+            }
+            if !out.iter().any(|seen: &String| permit_key(seen) == key) {
+                out.push(path.clone());
+            }
+        }
+        out
+    }
+
+    /// Remember the filters of an application.
+    fn record(&mut self, path: &str, ids: Vec<u64>) {
+        self.filters.insert(permit_key(path), ids);
+    }
+
+    /// Forget the filters of an application.
+    fn forget(&mut self, path: &str) {
+        self.filters.remove(&permit_key(path));
+    }
+
+    /// Every permit that is in force.
+    fn all(&self) -> Vec<(String, Vec<u64>)> {
+        self.filters
+            .iter()
+            .map(|(key, ids)| (key.clone(), ids.clone()))
+            .collect()
+    }
+}
+
+/// What has to happen to the permits when the list of the applications
+/// changes.
+#[derive(Debug, Default)]
+struct PermitPlan {
+    /// The filters of the applications that are not on the list any more.
+    stale: Vec<(String, Vec<u64>)>,
+    /// The applications of the list that are not permitted yet.
+    fresh: Vec<String>,
+}
+
+/// The plan of the permits for a new list of applications.
+fn plan_permits(permits: &AppPermits, wanted: &[String]) -> PermitPlan {
+    PermitPlan {
+        stale: permits.stale(wanted),
+        fresh: permits.fresh(wanted),
+    }
+}
 
 pub struct WfpKillSwitch {
     engine: Option<WfpEngine>,
@@ -40,7 +129,14 @@ pub struct WfpKillSwitch {
     /// the applications that are to work around the tunnel are permitted here
     /// by their own name -- otherwise the very switch that keeps the tunnel
     /// honest stops the work of the machine.
-    app_permit_ids: Vec<u64>,
+    ///
+    /// The filters of the switch live in a persistent session: they survive
+    /// the engine and the process.  So a permit that is not taken away
+    /// stays for ever, and an application that was let out of the tunnel
+    /// once would keep working around it for ever.  The bookkeeping knows
+    /// WHICH application every filter belongs to, so the permits of the
+    /// applications that are not on the list any more can go away.
+    app_permits: AppPermits,
     /// The resolvers of the machine: they are permitted by address AND by the
     /// port of the name service.
     ///
@@ -72,7 +168,7 @@ impl WfpKillSwitch {
             bypass_cidrs_v6: Vec::new(),
             resolver: ProcessResolver::new(),
             per_process_filters: HashMap::new(),
-            app_permit_ids: Vec::new(),
+            app_permits: AppPermits::default(),
             resolvers: Vec::new(),
             lock_udp: false,
         }
@@ -556,20 +652,41 @@ impl WfpKillSwitch {
     /// So the applications that are to work around the tunnel are permitted
     /// here by their own name -- they keep working even while the tunnel is
     /// stuck, and even while the driver is busy.
+    ///
+    /// The list REPLACES the old one: the permits of the applications that
+    /// are not on it any more are taken away.  The filters of the switch
+    /// survive the run, so a permit that is left behind would keep the
+    /// application out of the tunnel for ever.
     pub fn install_app_permits(&mut self, app_paths: &[String]) -> Result<(), TunError> {
-        if app_paths.is_empty() {
+        let plan = plan_permits(&self.app_permits, app_paths);
+
+        // The applications that are not on the list any more go back into
+        // the tunnel: their permits go away.
+        if !plan.stale.is_empty() {
+            self.remove_app_permits(&plan.stale)?;
+            for (path, _) in &plan.stale {
+                info!(
+                    app = %path,
+                    "WFP: the application is not permitted past the switch any more"
+                );
+            }
+        }
+
+        if plan.fresh.is_empty() {
             return Ok(());
         }
+
         let engine = self
             .engine
             .as_mut()
             .ok_or_else(|| TunError::Other("the switch is not in force yet".into()))?;
         let tx = WfpTransaction::begin(engine)
             .map_err(|e| TunError::Wfp(format!("tx begin (app permit): {e}")))?;
-        let mut ids = Vec::new();
-        for path in app_paths {
+        let mut installed: Vec<(String, Vec<u64>)> = Vec::new();
+        for path in &plan.fresh {
             let cond = AppIdConditionBuilder::equal(path)
                 .map_err(|e| TunError::Wfp(format!("app-id condition for {path}: {e}")))?;
+            let mut ids = Vec::new();
             for layer in [Layer::ConnectV4, Layer::ConnectV6] {
                 let id = FilterBuilder::new()
                     .name("Mirage: permit the application past the switch")
@@ -583,9 +700,35 @@ impl WfpKillSwitch {
                 ids.push(id);
             }
             info!(app = %path, "WFP: the application is permitted past the switch");
+            installed.push((path.clone(), ids));
         }
         tx.commit().map_err(|e| TunError::Wfp(format!("tx commit (app permit): {e}")))?;
-        self.app_permit_ids.extend(ids);
+        for (path, ids) in installed {
+            self.app_permits.record(&path, ids);
+        }
+        Ok(())
+    }
+
+    /// Take the filters of the given applications away.
+    fn remove_app_permits(&mut self, stale: &[(String, Vec<u64>)]) -> Result<(), TunError> {
+        if stale.is_empty() {
+            return Ok(());
+        }
+        if let Some(engine) = self.engine.as_mut() {
+            let tx = WfpTransaction::begin(engine)
+                .map_err(|e| TunError::Wfp(format!("tx begin (app permit removal): {e}")))?;
+            for (_, ids) in stale {
+                for id in ids {
+                    // Best-effort: the filter may be gone already.
+                    let _ = delete_filter(&tx, *id);
+                }
+            }
+            tx.commit()
+                .map_err(|e| TunError::Wfp(format!("tx commit (app permit removal): {e}")))?;
+        }
+        for (path, _) in stale {
+            self.app_permits.forget(path);
+        }
         Ok(())
     }
 }
@@ -667,16 +810,13 @@ impl PlatformFirewall for WfpKillSwitch {
 
     fn deactivate(&mut self) -> Result<(), TunError> {
         // Remove the permits of the applications that leave the tunnel.
-        if let Some(engine) = self.engine.as_mut() {
-            if !self.app_permit_ids.is_empty() {
-                if let Ok(tx) = WfpTransaction::begin(engine) {
-                    for &id in &self.app_permit_ids {
-                        let _ = delete_filter(&tx, id);
-                    }
-                    let _ = tx.commit();
-                }
-                self.app_permit_ids.clear();
-            }
+        //
+        // The filters of the switch survive the session, so they have to be
+        // taken away here: an application that was let out of the tunnel
+        // once would keep working around it for ever.
+        let permits = self.app_permits.all();
+        if let Err(e) = self.remove_app_permits(&permits) {
+            warn!("WFP: the permits of the applications were not removed: {e}");
         }
         // Remove per-process filters (T3 addition) before closing the engine.
         if let Some(engine) = self.engine.as_mut() {
@@ -960,5 +1100,78 @@ mod tests {
         let result = ks.enforce(&Plane::Kill, Some(&identity), &flow);
         assert!(result.is_ok(), "enforce with no token must be a no-op (Ok)");
         assert!(ks.per_process_filters.is_empty(), "no filter should be inserted when token is absent");
+    }
+
+    /// The filters of the switch survive the run: an application that was
+    /// let out of the tunnel once would keep working around it for ever.
+    /// So the permits of the applications that are not on the list any more
+    /// have to be taken away.
+    #[test]
+    fn a_stale_application_is_not_permitted_any_more() {
+        let mut permits = AppPermits::default();
+        permits.record("C:\\Program Files\\nodejs\\node.exe", vec![10, 11]);
+
+        // The list changes: the old application is not on it any more.
+        let wanted = vec!["C:\\tools\\codex\\codex.exe".to_owned()];
+        let plan = plan_permits(&permits, &wanted);
+        assert_eq!(plan.stale.len(), 1, "the old permit is taken away");
+        assert_eq!(
+            plan.stale[0].1,
+            vec![10, 11],
+            "the filters of the old application are the ones that go away"
+        );
+        assert_eq!(plan.fresh, wanted, "the new application is permitted");
+
+        // The plan is carried out.
+        for (path, _) in &plan.stale {
+            permits.forget(path);
+        }
+        for path in &plan.fresh {
+            permits.record(path, vec![20, 21]);
+        }
+
+        // The old application is not permitted any more.
+        let in_force = permits.all();
+        assert_eq!(in_force.len(), 1);
+        assert!(
+            in_force[0].0.contains("codex.exe"),
+            "only the new application is permitted: {:?}",
+            in_force
+        );
+        assert!(
+            permits.stale(&wanted).is_empty(),
+            "nothing stale is left behind"
+        );
+    }
+
+    #[test]
+    fn the_same_list_twice_changes_nothing() {
+        let mut permits = AppPermits::default();
+        permits.record("C:\\a.exe", vec![1]);
+        let wanted = vec!["C:\\a.exe".to_owned()];
+        let plan = plan_permits(&permits, &wanted);
+        assert!(plan.stale.is_empty(), "the application is still on the list");
+        assert!(plan.fresh.is_empty(), "it is permitted already");
+    }
+
+    /// The same path in two spellings is the same application.
+    #[test]
+    fn the_same_path_in_two_spellings_is_one_application() {
+        let mut permits = AppPermits::default();
+        permits.record("C:/tools/a.exe", vec![1]);
+        let wanted = vec!["c:\\tools\\a.exe".to_owned()];
+        let plan = plan_permits(&permits, &wanted);
+        assert!(plan.stale.is_empty(), "the application is still on the list");
+        assert!(plan.fresh.is_empty(), "it is permitted already");
+    }
+
+    /// An empty list takes every permit away.
+    #[test]
+    fn an_empty_list_takes_every_permit_away() {
+        let mut permits = AppPermits::default();
+        permits.record("C:\\a.exe", vec![1]);
+        let plan = plan_permits(&permits, &[]);
+        assert_eq!(plan.stale.len(), 1);
+        assert!(plan.fresh.is_empty());
     }
 }

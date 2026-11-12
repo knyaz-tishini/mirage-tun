@@ -696,7 +696,13 @@ pub async fn activate_tun_inner(
             let Some(killswitch) = guard.killswitch.as_mut() else {
                 return;
             };
-            if let Err(error) = killswitch.install_app_permits(&found) {
+            // The whole list goes to the switch: the applications that are
+            // running are still permitted, and the ones that were found on
+            // the disk are added.  A list with only the new ones would take
+            // the permits of the running ones away.
+            let mut all = running_paths;
+            all.extend(found.iter().cloned());
+            if let Err(error) = killswitch.install_app_permits(&all) {
                 warn!(error = %error, "activate: the applications found on the disk are NOT permitted past the switch");
             }
             // The driver learns about them too.
@@ -707,8 +713,6 @@ pub async fn activate_tun_inner(
             // found here, in the background, and the list of the driver is
             // replaced with the whole of it: the applications that are not
             // running yet leave the tunnel the moment they start.
-            let mut all = running_paths;
-            all.extend(found.iter().cloned());
             let Some(split) = guard.split_tunnel.as_mut() else {
                 return;
             };
