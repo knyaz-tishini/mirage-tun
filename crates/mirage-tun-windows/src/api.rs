@@ -267,6 +267,15 @@ pub async fn activate_tun_inner(
 
     let raw_ip_mode = state.config.is_raw_ip();
 
+    // The resolver that the tunnel puts on its own adapter.
+    //
+    // The machine asks the adapter, and the adapter asks this address
+    // through the tunnel.  The switch blocks the UDP that is not permitted,
+    // so the resolver of the tunnel has to be permitted as well -- without
+    // it the questions of the whole machine are blocked, and the machine
+    // has no names at all.
+    let tunnel_resolver = adapter_resolver(state.config.dns_upstream, raw_ip_mode);
+
     // The kill-switch goes up FIRST.
     //
     // From the moment the machine is told to tunnel, nothing that is not the
@@ -298,7 +307,7 @@ pub async fn activate_tun_inner(
     }
     let mut early_killswitch = crate::firewall::WfpKillSwitch::new();
     early_killswitch.set_native_if_index(early_if_index);
-    early_killswitch.set_resolvers(early_resolvers.clone());
+    early_killswitch.set_resolvers(permitted_resolvers(&early_resolvers, tunnel_resolver));
     if let Err(e) = early_killswitch.activate_pre_tunnel(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate before the tunnel (non-fatal): {e}");
     } else {
@@ -457,15 +466,15 @@ pub async fn activate_tun_inner(
     // same address -- and their question goes out natively, because the driver
     // excluded them.  That is the DNS book of the bypass: native for the
     // excluded, through the tunnel for everybody else.
-    let dns_ip = if raw_ip_mode && !is_usable_dns(state.config.dns_upstream) {
+    if raw_ip_mode && !is_usable_dns(state.config.dns_upstream) {
         warn!(
             "raw_ip mode: dns_upstream {} is not usable - using {FALLBACK_DNS}",
             state.config.dns_upstream
         );
-        FALLBACK_DNS.to_owned()
-    } else {
-        state.config.dns_upstream.ip().to_string()
-    };
+    }
+    // The very address that goes onto the adapter -- and the address the
+    // switch permits, so the question of the machine is not blocked.
+    let dns_ip = tunnel_resolver.ip().to_string();
     {
         // Only the adapter of the tunnel is touched here: no other interface
         // gets a resolver, and nothing is written to the registry.
@@ -539,7 +548,7 @@ pub async fn activate_tun_inner(
     }
     killswitch.set_bypass_cidrs(Vec::new());
     killswitch.set_bypass_cidrs_v6(Vec::new());
-    killswitch.set_resolvers(native_resolvers.clone());
+    killswitch.set_resolvers(permitted_resolvers(&native_resolvers, tunnel_resolver));
     if let Err(e) = killswitch.activate(&relay_ips, &tun_name, &[]) {
         warn!("WFP kill-switch failed to activate (non-fatal): {e}");
     }
@@ -1442,6 +1451,46 @@ fn is_usable_dns(addr: SocketAddr) -> bool {
     !addr.ip().is_unspecified() && addr.port() != 0
 }
 
+/// The resolver that the tunnel puts on its own adapter.
+///
+/// The address the machine asks for the names of the machine: in the
+/// raw-IP mode a resolver that cannot be used is replaced by the
+/// fallback.  The port is the one of the name service -- the adapter is
+/// written an address only, and the questions of the machine go to the
+/// port 53.
+fn adapter_resolver(dns_upstream: SocketAddr, raw_ip_mode: bool) -> SocketAddr {
+    let ip = if raw_ip_mode && !is_usable_dns(dns_upstream) {
+        IpAddr::V4(
+            FALLBACK_DNS
+                .parse::<std::net::Ipv4Addr>()
+                .expect("the fallback is a static address"),
+        )
+    } else {
+        dns_upstream.ip()
+    };
+    SocketAddr::new(ip, 53)
+}
+
+/// The resolvers the switch permits.
+///
+/// The resolvers of the machine AND the resolver of the tunnel: the
+/// adapter asks the last one, and the switch blocks the UDP that is not
+/// permitted -- so without the permit the questions of the whole machine
+/// are blocked and the machine has no names at all.
+///
+/// The native resolvers stay: the router answers for the names of the
+/// bypass and for the applications that leave the tunnel.  A resolver
+/// that is there twice is installed once.
+fn permitted_resolvers(native: &[SocketAddr], tunnel: SocketAddr) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for server in native.iter().copied().chain(std::iter::once(tunnel)) {
+        if !out.contains(&server) {
+            out.push(server);
+        }
+    }
+    out
+}
+
 /// The IPv6 address the adapter must carry, if any.
 ///
 /// Only the raw-IP mode forwards packets at L3: in the stack mode the
@@ -1593,5 +1642,71 @@ fn map_err(e: TunError) -> (StatusCode, Json<ErrorBody>) {
         TunError::NotActive => (StatusCode::CONFLICT, Json(ErrorBody { error: e.to_string() })),
         TunError::AdapterNotReady => (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorBody { error: e.to_string() })),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error: e.to_string() })),
+    }
+}
+
+// --- Tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn resolver(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)
+    }
+
+    /// The resolver of the tunnel has to be permitted: the switch blocks the
+    /// UDP that is not permitted, and the machine asks the adapter, and the
+    /// adapter asks the resolver of the tunnel.
+    #[test]
+    fn the_resolver_of_the_tunnel_is_permitted() {
+        let native = vec![resolver([192, 168, 1, 1], 53), resolver([8, 8, 8, 8], 53)];
+        let tunnel = resolver([1, 1, 1, 1], 53);
+
+        let permitted = permitted_resolvers(&native, tunnel);
+        assert!(
+            permitted.contains(&tunnel),
+            "the resolver of the tunnel is permitted: {permitted:?}"
+        );
+        // The native ones stay: the router answers for the names of the
+        // bypass and for the applications that leave the tunnel.
+        assert!(permitted.contains(&native[0]));
+        assert!(permitted.contains(&native[1]));
+        assert_eq!(permitted.len(), 3);
+    }
+
+    /// A resolver that is already there is not installed twice.
+    #[test]
+    fn a_resolver_that_is_already_there_is_not_installed_twice() {
+        let tunnel = resolver([1, 1, 1, 1], 53);
+        let native = vec![tunnel, resolver([192, 168, 1, 1], 53)];
+
+        let permitted = permitted_resolvers(&native, tunnel);
+        assert_eq!(
+            permitted.iter().filter(|server| **server == tunnel).count(),
+            1,
+            "the resolver of the tunnel is installed once: {permitted:?}"
+        );
+        assert_eq!(permitted.len(), 2);
+    }
+
+    /// The address that goes onto the adapter is the one that is permitted.
+    #[test]
+    fn the_adapter_asks_the_resolver_of_the_tunnel() {
+        let upstream: SocketAddr = "1.1.1.1:53".parse().expect("static addr is valid");
+        let resolver = adapter_resolver(upstream, false);
+        assert_eq!(resolver.ip().to_string(), "1.1.1.1");
+        assert_eq!(resolver.port(), 53);
+    }
+
+    /// A resolver that cannot be used is replaced by the fallback -- and the
+    /// fallback is the address that goes onto the adapter.
+    #[test]
+    fn an_unusable_resolver_becomes_the_fallback() {
+        let upstream: SocketAddr = "0.0.0.0:0".parse().expect("static addr is valid");
+        let resolver = adapter_resolver(upstream, true);
+        assert_eq!(resolver.ip().to_string(), FALLBACK_DNS);
+        assert_eq!(resolver.port(), 53);
     }
 }
