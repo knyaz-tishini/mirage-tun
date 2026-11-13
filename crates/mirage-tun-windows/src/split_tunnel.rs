@@ -1,137 +1,60 @@
 //! The split-tunnel driver: an application that leaves the tunnel.
 //!
 //! The network bypass (`crate::bypass`) is a hole in the routing: it lets a
-//! DESTINATION out of the tunnel.  This module is the other half — it lets an
+//! DESTINATION out of the tunnel.  This module is the other half -- it lets an
 //! APPLICATION out, by image.
 //!
-//! The work is done by the split-tunnel driver: ours first
-//! (`mirage-split-tunnel.sys`, the fork of the Mullvad driver with the
-//! crash of 12.11.2026 taken out), the driver of Mullvad
-//! (`mullvad-split-tunnel.sys`, upstream revision `v1.3.0.0`) after it.
-//! The driver is a WFP callout: it watches the processes, and for the ones
-//! on the list it permits the traffic that would otherwise be forced into
-//! the tunnel, and blocks the traffic that would go into it.
-//!
-//! The protocol is the driver's own:
+//! The work is done by the split-tunnel driver of ours
+//! (`mirage-split-tunnel.sys`): it watches the processes, and for the ones on
+//! the list it keeps the traffic of the tunnel away from them.  The driver and
+//! the user mode of ours speak one protocol, and it is the protocol of the
+//! crate `mirage-split-tunnel`: our own commands, our own structures, our own
+//! state machine.
 //!
 //! ```text
-//! open the device  ->  GET_STATE  ->  RESET (if it is not STARTED)
-//!                   ->  INITIALIZE (two WFP sublayer GUIDs)
+//! open the device  ->  GET_STATE  ->  RESET (if it is not Started)
+//!                   ->  INITIALIZE (the two sublayers of the user mode)
 //!                   ->  REGISTER_PROCESSES (the whole machine, once)
 //!                   ->  REGISTER_IP_ADDRESSES (tunnel + internet)
 //!                   ->  SET_CONFIGURATION (the images to exclude)
-//!                   ->  DEQUEUE_EVENT (a thread, until RESET)
+//!                   ->  DEQUEUE_EVENT (a thread, until the list is emptied)
 //! ```
 //!
 //! The order matters: the driver is a state machine, and every request that
 //! does not belong to the current state is refused.
+//!
+//! The fork of another driver is gone.  It spoke a protocol of its own --
+//! another device, another numbers, another layout of the structures -- and
+//! the driver of ours does not answer it.  So the two fallbacks of the old
+//! code are gone with it: the device of the fork and the driver of Mullvad.
+//! What is left is one driver, one protocol, and the crate that holds both
+//! sides of it.
 
 #![cfg(target_os = "windows")]
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
 use std::fmt;
 use std::io;
-use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::ptr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use windows_sys::core::GUID;
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
+use mirage_split_tunnel::error::Error as DriverError;
+use mirage_split_tunnel::image;
+use mirage_split_tunnel::process;
+use mirage_split_tunnel::protocol::{EventKind, IpAddresses};
+use mirage_split_tunnel::windows::agent::Agent;
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
 };
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmProviderAdd0,
-    FwpmSubLayerAdd0, FwpmTransactionAbort0, FwpmTransactionBegin0,
-    FwpmTransactionCommit0, FWP_BYTE_BLOB, FWPM_DISPLAY_DATA0, FWPM_PROVIDER0, FWPM_SESSION0,
-    FWPM_SUBLAYER0,
-};
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-use windows_sys::Win32::Storage::FileSystem::{CreateFileW, QueryDosDeviceW};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
-use windows_sys::Win32::System::IO::DeviceIoControl;
-use windows_sys::Win32::System::ProcessStatus::K32GetProcessImageFileNameW;
-use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
-use windows_sys::Win32::System::Services::{
-    CloseServiceHandle, OpenSCManagerW, OpenServiceW, StartServiceW, SC_MANAGER_CONNECT,
-    SERVICE_QUERY_STATUS, SERVICE_START,
-};
+use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-
-/// The devices the drivers expose, ours first.
-///
-/// Ours is the fork of the Mullvad driver (`mirage-split-tunnel.sys`) with
-/// the lock of the transaction given back on every way out and the callouts
-/// unregistered before the context they use is freed -- the two mistakes
-/// that took the machine down twice on 12.11.2026 (bug check 0x133, the
-/// faulting module `mullvad-split-tunnel.sys`).  The driver of Mullvad is
-/// still tried afterwards, so a machine that has only that one keeps
-/// working.
-const DEVICE_PATHS: [&str; 2] = [r"\\.\MIRAGESPLITTUNNEL", r"\\.\MULLVADSPLITTUNNEL"];
-
-/// The services of those drivers, ours first.
-const SERVICE_NAMES: [&str; 2] = ["mirage-split-tunnel", "mullvad-split-tunnel"];
-
-/// IOCTL codes, as the driver itself defines them
-/// (`CTL_CODE(0x8000, fn, method, any)`), taken from the sources of the
-/// driver (`src/defs/ioctl.h` of `mullvad/win-split-tunnel`).
-///
-/// The function number and the method are both a part of the code, and the
-/// driver dispatches on the whole thing: `0x8000_0008` is not "initialize in
-/// the new version", it is the *event queue* (`fn 2`), and asking it to
-/// initialize means the driver waits for an event that never comes.
-const IOCTL_INITIALIZE: u32 = 0x8000_0004;
-/// The initialize of the driver of the version 1.2.5: the same function 1,
-/// but without a method, and without any input.
-///
-/// The driver of the version 1.3.0 knows the new number only, and answers
-/// "invalid function" to the old one; the driver of the version 1.2.5 knows
-/// the old number only.  The code asks both and takes the one that answers.
-const IOCTL_INITIALIZE_12: u32 = 0x8000_0007;
-const IOCTL_DEQUEUE_EVENT: u32 = 0x8000_0008;
-const IOCTL_REGISTER_IP_ADDRESSES: u32 = 0x8000_0010;
-const IOCTL_REGISTER_PROCESSES: u32 = 0x8000_000c;
-const IOCTL_SET_CONFIGURATION: u32 = 0x8000_0018;
-const IOCTL_CLEAR_CONFIGURATION: u32 = 0x8000_0023;
-const IOCTL_GET_STATE: u32 = 0x8000_0024;
-const IOCTL_RESET: u32 = 0x8000_002F;
-
-/// The driver's states.
-const STATE_STARTED: u64 = 1;
-const STATE_INITIALIZED: u64 = 2;
-const STATE_READY: u64 = 3;
-const STATE_ENGAGED: u64 = 4;
-
-/// The provider WE own: the driver's own provider appears only inside
-/// `INITIALIZE`, and a sublayer needs a provider that already exists.
-const PROVIDER_KEY: GUID = GUID::from_u128(0x6f3c_1b54_6a2e_4f1d_9e2b_2a5d_7c8e_9f01);
-/// The sublayer the driver's ordinary filters live in.
-///
-/// The GUIDs are ours, not Mullvad's: the machine may already carry the
-/// sublayers of another client, and the driver takes whatever GUIDs it is
-/// given.
-const BASELINE_SUBLAYER: GUID = GUID::from_u128(0x9a4d_7c62_3e51_4b28_9c7d_6f0a_2b8e_5d13);
-/// The sublayer the driver's DNS filters live in.
-const DNS_SUBLAYER: GUID = GUID::from_u128(0x2f6c_81ab_5d47_4e93_8b12_0c7a_9e4d_3f58);
-
-/// `STATUS_CANCELLED` — the driver's answer to a request that was cancelled
-/// (the `RESET` cancels the pending events).
-const STATUS_CANCELLED: u32 = 0xc000_0120;
-
-/// The firewall's answer when an object with that key is already there.
-const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
-
-/// The event the driver sends when a process starts or stops being excluded.
-const EVENT_START_SPLITTING: u32 = 0;
-const EVENT_STOP_SPLITTING: u32 = 1;
 
 /// A failure of the split-tunnel path.
 #[derive(Debug)]
@@ -140,16 +63,16 @@ pub enum SplitTunnelError {
     DeviceUnavailable(String),
     /// The driver is held by another instance.
     ///
-    /// The device of the driver is exclusive: while one instance of the
-    /// tunnel holds it, the next one is told to go away.  That is not a
-    /// failure -- it is a queue.  The instance that holds it is shutting
-    /// down, and the next one has to wait for it.
+    /// The device of the driver is busy: while one instance of the tunnel
+    /// holds it, the next one is told to go away.  That is not a failure --
+    /// it is a queue.  The instance that holds it is shutting down, and the
+    /// next one has to wait for it.
     DeviceBusy(u32),
     /// The driver refused a request.
     Driver(String, u32),
     /// The WFP layer refused.
     Wfp(String, u32),
-    /// The list of applications could not be turned into device paths.
+    /// The list of applications could not be turned into paths.
     NoSuchApplication(String),
     /// Anything else the platform said.
     Platform(io::Error),
@@ -178,311 +101,51 @@ impl From<io::Error> for SplitTunnelError {
     }
 }
 
-/// The header of a configuration or a process list.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ListHeader {
-    num_entries: u64,
-    total_length: u64,
-}
-
-/// One image on the exclude list.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ConfigurationEntry {
-    image_name_offset: u64,
-    image_name_length: u16,
-    _pad: [u8; 6],
-}
-
-/// One process of the machine.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ProcessEntry {
-    process_id: u64,
-    parent_process_id: u64,
-    image_name_offset: u64,
-    image_name_length: u16,
-    _pad: [u8; 6],
-}
-
-/// The addresses the driver needs to tell the tunnel from the internet.
+/// The agent of the driver, shared between the thread of the events and the
+/// thread of the client.
 ///
-/// The driver's structure is the C one: two `IN_ADDR` and two `IN6_ADDR`.
-/// An `IN_ADDR` holds the address in the order of the wire -- the big
-/// endian one.  The bytes we handed over were in the order of the machine,
-/// so the driver read 32.0.77.10 instead of 10.77.0.2, did not recognise
-/// the tunnel, and bound the traffic of the whole machine to the internet:
-/// the tunnel stood right there and carried nothing.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IpAddresses {
-    tunnel_v4: [u8; 4],
-    internet_v4: [u8; 4],
-    tunnel_v6: [u8; 16],
-    internet_v6: [u8; 16],
-}
+/// The agent holds two handles of the kernel: the device of the driver and
+/// the engine of the firewall.  Both are numbers that the kernel knows, both
+/// are used from one thread at a time, and both the driver and the firewall
+/// are thread safe.
+struct SharedAgent(std::sync::Mutex<Agent>);
 
-impl IpAddresses {
-    fn new(tunnel: Ipv4Addr, internet: Ipv4Addr) -> Self {
-        Self {
-            tunnel_v4: tunnel.octets(),
-            internet_v4: internet.octets(),
-            tunnel_v6: [0; 16],
-            internet_v6: [0; 16],
-        }
-    }
+// SAFETY: the agent is behind a mutex, so the two threads never touch the
+// handles at the same time; the handles themselves are numbers that the
+// kernel and the firewall accept from any thread.
+unsafe impl Send for SharedAgent {}
+unsafe impl Sync for SharedAgent {}
 
-    /// The forty bytes the driver reads.
-    fn bytes(&self) -> [u8; 40] {
-        let mut out = [0u8; 40];
-        out[0..4].copy_from_slice(&self.tunnel_v4);
-        out[4..8].copy_from_slice(&self.internet_v4);
-        out[8..24].copy_from_slice(&self.tunnel_v6);
-        out[24..40].copy_from_slice(&self.internet_v6);
-        out
-    }
-}
-
-/// The two sublayer GUIDs the driver keeps.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SublayerGuids {
-    baseline: GUID,
-    dns: GUID,
-}
-
-/// Pack a list of images into the driver's buffer.
-///
-/// The layout is a header, the entries, and then the strings; an entry's
-/// offset is counted from the beginning of the string area.
-fn pack_configuration(paths: &[Vec<u16>]) -> Vec<u8> {
-    let entry_size = mem::size_of::<ConfigurationEntry>();
-    let header_size = mem::size_of::<ListHeader>();
-    let strings: Vec<u8> = paths
-        .iter()
-        .flat_map(|p| p.iter().flat_map(|c| c.to_le_bytes()))
-        .collect();
-    let mut offsets = Vec::with_capacity(paths.len());
-    let mut at = 0usize;
-    for p in paths {
-        offsets.push(at);
-        at += p.len() * 2;
-    }
-    let total = header_size + paths.len() * entry_size + strings.len();
-    let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(&(paths.len() as u64).to_ne_bytes());
-    buf.extend_from_slice(&(total as u64).to_ne_bytes());
-    for (path, offset) in paths.iter().zip(offsets) {
-        buf.extend_from_slice(&(offset as u64).to_ne_bytes());
-        buf.extend_from_slice(&((path.len() * 2) as u16).to_ne_bytes());
-        buf.extend_from_slice(&[0u8; 6]);
-    }
-    buf.extend_from_slice(&strings);
-    buf
-}
-
-/// Pack the processes of the machine into the driver's buffer.
-fn pack_processes(processes: &[(u32, u32, Vec<u16>)]) -> Vec<u8> {
-    let entry_size = mem::size_of::<ProcessEntry>();
-    let header_size = mem::size_of::<ListHeader>();
-    let strings: Vec<u8> = processes
-        .iter()
-        .flat_map(|(_, _, p)| p.iter().flat_map(|c| c.to_le_bytes()))
-        .collect();
-    let mut offsets = Vec::with_capacity(processes.len());
-    let mut at = 0usize;
-    for (_, _, p) in processes {
-        offsets.push(at);
-        at += p.len() * 2;
-    }
-    let total = header_size + processes.len() * entry_size + strings.len();
-    let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(&(processes.len() as u64).to_ne_bytes());
-    buf.extend_from_slice(&(total as u64).to_ne_bytes());
-    for ((pid, ppid, path), offset) in processes.iter().zip(offsets) {
-        buf.extend_from_slice(&(*pid as u64).to_ne_bytes());
-        buf.extend_from_slice(&(*ppid as u64).to_ne_bytes());
-        buf.extend_from_slice(&(offset as u64).to_ne_bytes());
-        buf.extend_from_slice(&((path.len() * 2) as u16).to_ne_bytes());
-        buf.extend_from_slice(&[0u8; 6]);
-    }
-    buf.extend_from_slice(&strings);
-    buf
-}
-
-/// A handle that may cross a thread boundary.
-///
-/// The driver's device and the firewall engine are used by one thread at a
-/// time; the handle itself is just a number the kernel knows.
-#[derive(Clone, Copy)]
-struct SharedHandle(HANDLE);
-
-// SAFETY: the handle is only used through the driver and the firewall, both
-// of which are thread safe, and the value is copied, never aliased.
-unsafe impl Send for SharedHandle {}
-unsafe impl Sync for SharedHandle {}
-
-/// The WFP session we own while the driver is engaged.
-struct WfpScope {
-    engine: SharedHandle,
-}
-
-impl WfpScope {
-    fn open() -> Result<Self, SplitTunnelError> {
-        let mut session: FWPM_SESSION0 = unsafe { mem::zeroed() };
-        // The session is NOT dynamic: the driver adds its filters from its
-        // own session, and it may only do that into a sublayer that belongs
-        // to a persistent session.  A dynamic one is private to us, and the
-        // driver would answer that the call came from the wrong session.
-        session.flags = 0;
-        let mut engine: HANDLE = ptr::null_mut();
-        let status = unsafe {
-            FwpmEngineOpen0(
-                ptr::null(),
-                RPC_C_AUTHN_WINNT as u32,
-                ptr::null(),
-                &session,
-                &mut engine,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(SplitTunnelError::Wfp("the engine would not open".into(), status));
-        }
-        Ok(Self { engine: SharedHandle(engine) })
-    }
-
-    /// Add our provider and the two sublayers the driver asked for.
-    ///
-    /// An object that is already there is KEPT, not replaced.  The sublayers
-    /// hold the filters of the driver, and a sublayer that is taken away
-    /// while the driver still uses it takes the filters with it -- the
-    /// driver's callouts are then left pointing at nothing, and the machine
-    /// goes down with a DPC violation (the two crashes of 12.11.2026 were
-    /// exactly that).  So the sublayers live as long as the machine does,
-    /// and a run that finds them uses them.
-    fn add_sublayers(&self) -> Result<(), SplitTunnelError> {
-        self.try_add_sublayers()
-    }
-
-    fn try_add_sublayers(&self) -> Result<(), SplitTunnelError> {
-        let status = unsafe { FwpmTransactionBegin0(self.engine.0, 0) };
-        if status != ERROR_SUCCESS {
-            return Err(SplitTunnelError::Wfp("no transaction".into(), status));
-        }
-        let result = self.add_sublayers_inner();
-        if result.is_err() {
-            unsafe { FwpmTransactionAbort0(self.engine.0) };
-            return result;
-        }
-        let status = unsafe { FwpmTransactionCommit0(self.engine.0) };
-        if status != ERROR_SUCCESS {
-            return Err(SplitTunnelError::Wfp("the transaction would not commit".into(), status));
-        }
-        Ok(())
-    }
-
-    fn add_sublayers_inner(&self) -> Result<(), SplitTunnelError> {
-        let provider_name: Vec<u16> = wide_z("mirage split tunnel");
-        let provider_desc: Vec<u16> = wide_z("the sublayers the split-tunnel driver hangs its filters on");
-        let provider = FWPM_PROVIDER0 {
-            providerKey: PROVIDER_KEY,
-            displayData: FWPM_DISPLAY_DATA0 {
-                name: provider_name.as_ptr() as *mut u16,
-                description: provider_desc.as_ptr() as *mut u16,
-            },
-            flags: 0,
-            providerData: FWP_BYTE_BLOB {
-                data: ptr::null_mut(),
-                size: 0,
-            },
-            serviceName: ptr::null_mut(),
-        };
-        let status = unsafe { FwpmProviderAdd0(self.engine.0, &provider, ptr::null_mut()) };
-        if status != ERROR_SUCCESS && status != FWP_E_ALREADY_EXISTS {
-            return Err(SplitTunnelError::Wfp("the provider would not be added".into(), status));
-        }
-
-        let baseline_name: Vec<u16> = wide_z("mirage split tunnel baseline");
-        let baseline_desc: Vec<u16> = wide_z("the split-tunnel filters");
-        let mut provider_key = PROVIDER_KEY;
-        let provider_key_ptr: *mut GUID = &mut provider_key;
-        let baseline = FWPM_SUBLAYER0 {
-            subLayerKey: BASELINE_SUBLAYER,
-            displayData: FWPM_DISPLAY_DATA0 {
-                name: baseline_name.as_ptr() as *mut u16,
-                description: baseline_desc.as_ptr() as *mut u16,
-            },
-            flags: 0,
-            providerKey: provider_key_ptr,
-            providerData: FWP_BYTE_BLOB {
-                data: ptr::null_mut(),
-                size: 0,
-            },
-            weight: 0xffff,
-        };
-        let status = unsafe { FwpmSubLayerAdd0(self.engine.0, &baseline, ptr::null_mut()) };
-        if status != ERROR_SUCCESS && status != FWP_E_ALREADY_EXISTS {
-            return Err(SplitTunnelError::Wfp("the baseline sublayer would not be added".into(), status));
-        }
-
-        let dns_name: Vec<u16> = wide_z("mirage split tunnel dns");
-        let dns_desc: Vec<u16> = wide_z("the split-tunnel DNS filters");
-        let dns = FWPM_SUBLAYER0 {
-            subLayerKey: DNS_SUBLAYER,
-            displayData: FWPM_DISPLAY_DATA0 {
-                name: dns_name.as_ptr() as *mut u16,
-                description: dns_desc.as_ptr() as *mut u16,
-            },
-            flags: 0,
-            providerKey: provider_key_ptr,
-            providerData: FWP_BYTE_BLOB {
-                data: ptr::null_mut(),
-                size: 0,
-            },
-            weight: 0xffff,
-        };
-        let status = unsafe { FwpmSubLayerAdd0(self.engine.0, &dns, ptr::null_mut()) };
-        if status != ERROR_SUCCESS && status != FWP_E_ALREADY_EXISTS {
-            return Err(SplitTunnelError::Wfp("the DNS sublayer would not be added".into(), status));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for WfpScope {
-    fn drop(&mut self) {
-        // The provider and the sublayers STAY.
-        //
-        // They are ours, they are empty once the driver has reset itself
-        // (the driver takes its own filters away), and they are the one
-        // thing the driver hangs on.  Taking them away while the driver
-        // still holds filters in them makes the firewall remove those
-        // filters under the driver's feet -- the callouts are then
-        // unregistered while the driver still calls them, and the machine
-        // dies with a DPC violation.  The two crashes of 12.11.2026 came
-        // out of exactly this.
-        unsafe { FwpmEngineClose0(self.engine.0) };
+impl SharedAgent {
+    /// The agent, locked.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Agent> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 /// The exclusion, live: the driver is engaged and the applications on the
 /// list leave the tunnel.
 pub struct SplitTunnel {
-    device: SharedHandle,
-    /// The firewall session the driver hangs its filters on.  It is held
-    /// for the life of the exclusion -- it is not read, it is kept.
-    #[allow(dead_code)]
-    scope: WfpScope,
-    stop: Arc<AtomicBool>,
-    events: Option<(std::sync::mpsc::Receiver<()>, thread::JoinHandle<()>)>,
+    /// The agent of the driver: the device, the rules of the user mode and
+    /// the state between them.
+    agent: Arc<SharedAgent>,
     /// The address the driver was told is the tunnel.
     tunnel: Ipv4Addr,
     /// The address the driver was told is the internet.
     internet: Ipv4Addr,
+    /// The number of the interface that leads to the internet.
+    internet_interface: u32,
     /// The names the person asked about: the log carries them and the rest
     /// of the machine is a debug line.
     watched: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The processes of the machine and the path of the image of each of
+    /// them.  The driver says that a process has been born; the path of its
+    /// image is only known here, in the user mode.
+    processes: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    /// The flag that tells the thread of the events to stop.
+    stop: Arc<AtomicBool>,
+    /// The thread of the events, and the way to know that it is over.
+    events: Option<(std::sync::mpsc::Receiver<()>, thread::JoinHandle<()>)>,
 }
 
 impl SplitTunnel {
@@ -500,9 +163,9 @@ impl SplitTunnel {
             return Err(SplitTunnelError::NoSuchApplication("the list is empty".into()));
         }
 
-        // The images the driver matches are NT device paths
-        // (`\Device\HarddiskVolumeN\...`), so the names have to be resolved
-        // against the processes that are running right now.
+        // The driver matches an image by the path of it in the spelling of
+        // the system: `C:\Windows\System32\node.exe`.  The names the person
+        // typed have to be turned into such paths.
         //
         // EVERY running process that carries the wanted name is taken, not
         // just the first one: two different images may carry the same file
@@ -517,17 +180,9 @@ impl SplitTunnel {
         // for on the disk -- the driver takes the images it is given and
         // excludes them when they show up, so a path that is known now is
         // enough.
-        let running = running_processes();
-        let (excluded, missing) = collect_exclusions(applications, &running, |file| {
-            let path = find_application_on_disk(file)?;
-            match device_path_from_dos(&path) {
-                Some(device) => {
-                    tracing::info!(application = %file, path = %path, "split-tunnel: the application was found on the disk");
-                    Some(device)
-                }
-                None => None,
-            }
-        });
+        let running = running_images();
+        let (excluded, missing) =
+            resolve_applications(applications, &running, |file| image::find_on_disk(file));
         if excluded.is_empty() {
             return Err(SplitTunnelError::NoSuchApplication(missing.join(", ")));
         }
@@ -537,6 +192,14 @@ impl SplitTunnel {
                 "split-tunnel: these names are neither running nor on the disk; the rest of the list leaves the tunnel"
             );
         }
+        // The paths of the images, in the spelling the driver compares.
+        let images = image::image_paths(&excluded);
+
+        // The interface that leads to the internet: the driver rewrites the
+        // sockets of the excluded applications onto it, so that they leave
+        // the tunnel.  The user mode knows the interface; the driver only
+        // has to be told.
+        let internet_interface = internet_interface_for(internet);
 
         // The device comes FIRST, and the driver is put back into its fresh
         // state before anything else happens.
@@ -550,168 +213,75 @@ impl SplitTunnel {
         // therefore cleared first.
         //
         // The driver is put back into its fresh state ONLY when it is not
-        // fresh already.  A reset tears the driver's firewall down and
-        // builds it again -- the filters and the callouts are unregistered
-        // and registered anew -- and the driver does not survive many of
-        // those (the upstream issue #11487 is a crash in this very path).
+        // fresh already: a reset tears the driver's firewall down and builds
+        // it again -- the filters and the callouts are unregistered and
+        // registered anew -- and the driver does not survive many of those.
         // A driver that is already fresh is left alone.
-        let device = SharedHandle(open_device()?);
-        if let Err(e) = reset_driver(device.0) {
-            unsafe { CloseHandle(device.0) };
-            return Err(e);
-        }
-
-        // The sublayers must exist before the driver is initialized: the
-        // driver hangs its filters on them.  The ones of an earlier run are
-        // KEPT: they are ours, and a sublayer that is taken away while the
-        // driver holds filters in it takes those filters with it.
-        let scope = WfpScope::open()?;
-        if let Err(e) = scope.add_sublayers() {
-            let _ = reset_driver(device.0);
-            unsafe { CloseHandle(device.0) };
-            return Err(e);
-        }
-
-        let result = Self::engage_inner(device, scope, tunnel, internet, excluded, watched_names(applications));
-        match result {
-            Ok(mut engaged) => Ok(engaged),
-            Err(e) => {
-                // The driver must not keep a state it was never fully given.
-                let _ = reset_driver(device.0);
-                // The device was opened: it must be closed again, or the
-                // driver stays busy for the next one.
-                unsafe { CloseHandle(device.0) };
-                Err(e)
+        let mut agent = Agent::open().map_err(map_error)?;
+        let addresses = IpAddresses::v4_on(tunnel.octets(), internet.octets(), internet_interface);
+        let state = match agent.engage(&images, addresses) {
+            Ok(state) => state,
+            Err(error) => {
+                // The driver must not keep a state it was never fully given:
+                // it is put back to the beginning, so that the next client
+                // finds it fresh.
+                let _ = agent.retract();
+                return Err(map_error(error));
             }
-        }
-    }
-
-    fn engage_inner(
-        device: SharedHandle,
-        scope: WfpScope,
-        tunnel: Ipv4Addr,
-        internet: Ipv4Addr,
-        excluded: Vec<Vec<u16>>,
-        watched: Vec<String>,
-    ) -> Result<Self, SplitTunnelError> {
-        // A driver that is still holding the state of a previous client has
-        // to be reset before it can be initialized again.
-        let state = driver_state(device.0)?;
-        if state != STATE_STARTED {
-            tracing::warn!(state, "split-tunnel: the driver was not fresh, resetting it");
-            reset_driver(device.0)?;
-        }
-        let state = driver_state(device.0)?;
-        if state != STATE_STARTED {
-            return Err(SplitTunnelError::Driver(
-                "the driver would not go back to its fresh state".into(),
-                state as u32,
-            ));
-        }
-
-        // The two sublayers the driver will hang its filters on.
-        let guids = SublayerGuids {
-            baseline: BASELINE_SUBLAYER,
-            dns: DNS_SUBLAYER,
         };
-        let mut out: [u8; 0] = [];
-        // The driver of the version 1.3.0 takes the two sublayer GUIDs as the
-        // input of the call (it stopped hardcoding its own sublayers); the
-        // driver of the version 1.2.5 takes nothing at all.  The two numbers
-        // are not interchangeable -- each driver knows only its own -- so the
-        // code asks each of them the way that driver understands, and takes
-        // the one that answered.
-        let guid_bytes = guids_bytes(&guids);
-        let attempts: [(u32, Option<&[u8]>); 2] = [
-            (IOCTL_INITIALIZE, Some(guid_bytes.as_slice())),
-            (IOCTL_INITIALIZE_12, None),
-        ];
-        let mut initialized = false;
-        let mut last_error = String::new();
-        for (code, input) in attempts {
-            let mut out: [u8; 0] = [];
-            match ioctl(device.0, code, input, &mut out) {
-                Ok(_) => {
-                    let state = driver_state(device.0).unwrap_or(STATE_STARTED);
-                    if state > STATE_STARTED {
-                        tracing::info!(code = format_args!("0x{code:08x}"), state, "split-tunnel: the driver took the call");
-                        initialized = true;
-                        break;
-                    }
-                    last_error = format!("the driver did not move out of its first state (code 0x{code:08x})");
-                }
-                Err(error) => {
-                    last_error = format!("code 0x{code:08x}: {error}");
-                }
-            }
-        }
-        if !initialized {
-            return Err(SplitTunnelError::Driver(
-                format!("the driver refused every way to be initialized ({last_error})"),
-                0,
-            ));
-        }
 
-        // The processes of the machine: the driver watches them from now on.
-        let processes = running_processes();
-        let packed = pack_processes(&processes);
-        let mut out: [u8; 0] = [];
-        ioctl(device.0, IOCTL_REGISTER_PROCESSES, Some(&packed), &mut out)?;
+        // The book of the processes: the driver says that a process has been
+        // born, and the user mode is the one that knows the path of its
+        // image.  The table of the machine is read here, once.
+        let processes: HashMap<u64, String> = running
+            .iter()
+            .map(|(id, path)| (*id, path.to_string_lossy().to_string()))
+            .collect();
 
-        // The addresses: which is the tunnel, which is the internet.
-        let addresses = IpAddresses::new(tunnel, internet);
-        let mut out: [u8; 0] = [];
-        ioctl(
-            device.0,
-            IOCTL_REGISTER_IP_ADDRESSES,
-            Some(&addresses.bytes()),
-            &mut out,
-        )?;
-
-        // The images that leave the tunnel.
-        let configuration = pack_configuration(&excluded);
-        let mut out: [u8; 0] = [];
-        ioctl(device.0, IOCTL_SET_CONFIGURATION, Some(&configuration), &mut out)?;
-
-        // The events: the driver says who started and who stopped.
+        // The events: the driver says who was born and who is gone.
         //
-        // The driver tells about every process on the machine, so the log
+        // The driver tells about EVERY process on the machine, so the log
         // only carries the names the person asked about.  The names are
         // the ones that were ASKED for -- not the ones that happened to be
         // running: an application that is not running yet leaves the tunnel
         // when it starts, and the log has to say so.
-        let watched = Arc::new(std::sync::Mutex::new(watched));
+        let watched = Arc::new(std::sync::Mutex::new(watched_names(applications)));
+        let processes = Arc::new(std::sync::Mutex::new(processes));
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shared = Arc::new(SharedAgent(std::sync::Mutex::new(agent)));
         let events = {
+            let shared = Arc::clone(&shared);
             let stop = Arc::clone(&stop);
             let watched = Arc::clone(&watched);
+            let processes = Arc::clone(&processes);
             thread::Builder::new()
                 .name("mirage-split-tunnel".into())
                 .spawn(move || {
-                    event_loop(device, stop, watched);
+                    event_loop(shared, stop, watched, processes);
                     let _ = done_tx.send(());
                 })
                 .ok()
         };
 
-        let state = driver_state(device.0)?;
         tracing::info!(
-            state,
+            state = state.as_u32(),
             tunnel = %tunnel,
             internet = %internet,
-            applications = excluded.len(),
+            interface = internet_interface,
+            applications = images.len(),
             "split-tunnel: the applications are out of the tunnel"
         );
 
         Ok(Self {
-            device,
-            scope,
-            stop,
-            events: events.map(|handle| (done_rx, handle)),
+            agent: shared,
             tunnel,
             internet,
+            internet_interface,
             watched,
+            processes,
+            stop,
+            events: events.map(|handle| (done_rx, handle)),
         })
     }
 
@@ -727,14 +297,9 @@ impl SplitTunnel {
         if tunnel == self.tunnel {
             return Ok(());
         }
-        let addresses = IpAddresses::new(tunnel, self.internet);
-        let mut out: [u8; 0] = [];
-        ioctl(
-            self.device.0,
-            IOCTL_REGISTER_IP_ADDRESSES,
-            Some(&addresses.bytes()),
-            &mut out,
-        )?;
+        let addresses =
+            IpAddresses::v4_on(tunnel.octets(), self.internet.octets(), self.internet_interface);
+        self.agent.lock().retunnel(addresses).map_err(map_error)?;
         tracing::info!(
             from = %self.tunnel,
             to = %tunnel,
@@ -749,16 +314,16 @@ impl SplitTunnel {
         if applications.is_empty() {
             return Err(SplitTunnelError::NoSuchApplication("the list is empty".into()));
         }
-        let running = running_processes();
+        let running = running_images();
         // The list that comes here carries the paths themselves (the ones
         // that were found on the disk), so the disk is not searched again.
-        let (excluded, missing) = collect_exclusions(applications, &running, |_| None);
+        let (excluded, missing) =
+            resolve_applications(applications, &running, |_| None);
         if excluded.is_empty() {
             return Err(SplitTunnelError::NoSuchApplication(missing.join(", ")));
         }
-        let configuration = pack_configuration(&excluded);
-        let mut out: [u8; 0] = [];
-        ioctl(self.device.0, IOCTL_SET_CONFIGURATION, Some(&configuration), &mut out)?;
+        let images = image::image_paths(&excluded);
+        self.agent.lock().update_images(&images).map_err(map_error)?;
         // The names the log carries follow the list.
         if let Ok(mut watched) = self.watched.lock() {
             *watched = watched_names(applications);
@@ -767,25 +332,33 @@ impl SplitTunnel {
     }
 
     /// The state the driver is in.
+    ///
+    /// The numbers are the ones of the driver of ours: 1 is the fresh state,
+    /// 4 is the state of an engaged driver.  They are the same numbers the
+    /// old driver used, so the window that shows the state does not change.
     pub fn state(&self) -> Result<u64, SplitTunnelError> {
-        driver_state(self.device.0)
+        let state = self.agent.lock().state().map_err(map_error)?;
+        Ok(state.as_u32() as u64)
     }
 }
 
 impl Drop for SplitTunnel {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // The reset takes the filters down and cancels the pending event.
-        // Its answer is read: a driver that cannot be reset is in the state
+        // The list is emptied and the driver is put back to the beginning:
+        // its answer is read.  A driver that cannot be reset is in the state
         // it calls ZOMBIE, and it says itself that from there it will not
         // be able to unload.  That must be loud -- the service of the driver
         // must not be stopped, the way the driver unloads ends in a bug
         // check when the reset fails.
-        if let Err(e) = reset_driver(self.device.0) {
-            tracing::error!(
-                error = %e,
-                "split-tunnel: the driver did not come back to its fresh state - do NOT stop its service"
-            );
+        {
+            let mut agent = self.agent.lock();
+            if let Err(error) = agent.retract() {
+                tracing::error!(
+                    error = %error,
+                    "split-tunnel: the driver did not come back to its fresh state - do NOT stop its service"
+                );
+            }
         }
         if let Some((done, handle)) = self.events.take() {
             // The event thread is waiting on the driver; the reset above
@@ -800,264 +373,44 @@ impl Drop for SplitTunnel {
                 }
             }
         }
-        unsafe { CloseHandle(self.device.0) };
     }
 }
 
-/// Open the driver's device.
-///
-/// The device is exclusive.  When the tunnel is restarted -- and it is
-/// restarted every time the box names another address -- the new instance
-/// arrives while the old one is still closing the device.  The old answer
-/// was to treat that as "the driver is not there" and to go on without the
-/// app-bypass: the window came up, the applications went through the
-/// tunnel, and the person was told nothing.  The device is not missing --
-/// it is held.  So we wait for it, and the app-bypass is only given up when
-/// the wait is over.
-fn open_device() -> Result<HANDLE, SplitTunnelError> {
-    let mut wait = Duration::from_millis(200);
-    let mut last: Option<SplitTunnelError> = None;
-    let mut service_asked = false;
-    for attempt in 1..=60 {
-        match open_device_once() {
-            Ok(handle) => {
-                if attempt > 1 {
-                    tracing::info!(attempt, "split-tunnel: the device was waited for");
-                }
-                return Ok(handle);
-            }
-            Err(e) => {
-                let busy = matches!(e, SplitTunnelError::DeviceBusy(_));
-                if !busy && !service_asked {
-                    // The driver is installed but not running: start it and
-                    // try again.
-                    service_asked = true;
-                    start_driver_service();
-                }
-                if matches!(e, SplitTunnelError::DeviceUnavailable(_)) {
-                    last = Some(e);
-                } else {
-                    last = Some(e);
-                }
-                if busy {
-                    tracing::info!(
-                        attempt,
-                        "split-tunnel: the device is held by another instance - waiting for it"
-                    );
-                }
-            }
-        }
-        thread::sleep(wait);
-        wait = (wait * 2).min(Duration::from_millis(1000));
-    }
-    Err(last.unwrap_or(SplitTunnelError::DeviceUnavailable(
-        "the driver is not installed".into(),
-    )))
-}
-
-fn open_device_once() -> Result<HANDLE, SplitTunnelError> {
-    let mut last: Option<SplitTunnelError> = None;
-    for path in DEVICE_PATHS {
-        let name: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                0xc000_0000, // GENERIC_READ | GENERIC_WRITE
-                0x0000_0003, // FILE_SHARE_READ | FILE_SHARE_WRITE
-                ptr::null::<SECURITY_ATTRIBUTES>(),
-                3, // OPEN_EXISTING
-                0x0000_0000,
-                ptr::null_mut(),
-            )
-        };
-        if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
-            return Ok(handle);
-        }
-        let error = io::Error::last_os_error();
-        let code = error.raw_os_error().unwrap_or(0);
-        // 5 = ACCESS_DENIED, 32 = SHARING_VIOLATION: the device is there and
-        // somebody else holds it.
-        if code == 5 || code == 32 {
-            return Err(SplitTunnelError::DeviceBusy(code as u32));
-        }
-        last = Some(SplitTunnelError::DeviceUnavailable(format!(
-            "{path} is not there (error {})",
-            error
-        )));
-    }
-    Err(last.unwrap_or(SplitTunnelError::DeviceUnavailable(
-        "the driver is not installed".into(),
-    )))
-}
-
-/// Start the driver's service, if it is installed and not running.
-///
-/// Ours first, the driver of Mullvad after it: the fork is the one that is
-/// free of the crash, but a machine that has only the other one keeps
-/// working.
-fn start_driver_service() -> bool {
-    for service_name in SERVICE_NAMES {
-        if start_one_service(service_name) {
-            return true;
-        }
-    }
-    false
-}
-
-fn start_one_service(service_name: &str) -> bool {
-    let name: Vec<u16> = service_name.encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        // The manager first: a service handle is opened FROM the manager, and
-        // a null manager is an invalid handle -- the old code asked for the
-        // service with one and got error 6 every time, and the warning said
-        // the driver was not there when it was merely held.
-        let manager = OpenSCManagerW(ptr::null_mut(), ptr::null_mut(), SC_MANAGER_CONNECT);
-        if manager.is_null() {
-            tracing::warn!(
-                error = GetLastError(),
-                "split-tunnel: the service manager could not be opened"
-            );
-            return false;
-        }
-        let service = OpenServiceW(manager, name.as_ptr(), SERVICE_START | SERVICE_QUERY_STATUS);
-        if service.is_null() {
-            let error = GetLastError();
-            tracing::warn!(
-                error,
-                service_name,
-                "split-tunnel: the driver's service could not be opened - the app-bypass stays off"
-            );
-            CloseServiceHandle(manager);
-            return false;
-        }
-        let started = StartServiceW(service, 0, ptr::null()) != 0;
-        if !started {
-            let error = GetLastError();
-            tracing::warn!(
-                error,
-                service_name,
-                "split-tunnel: the driver's service did not start - the app-bypass stays off"
-            );
-        }
-        CloseServiceHandle(service);
-        CloseServiceHandle(manager);
-        started
-    }
-}
-
-/// One request to the driver.
-fn ioctl(device: HANDLE, code: u32, input: Option<&[u8]>, output: &mut [u8]) -> Result<u32, SplitTunnelError> {
-    let mut returned = 0u32;
-    let ok = unsafe {
-        DeviceIoControl(
-            device,
-            code,
-            input.map(|b| b.as_ptr() as *const c_void).unwrap_or(ptr::null()),
-            input.map(|b| b.len() as u32).unwrap_or(0),
-            if output.is_empty() {
-                ptr::null_mut()
+/// The error of the driver, in the shape the rest of the client knows.
+fn map_error(error: DriverError) -> SplitTunnelError {
+    match error {
+        DriverError::Device { action, code } => {
+            // 5 = ACCESS_DENIED, 32 = SHARING_VIOLATION: the device is there
+            // and somebody else holds it.
+            if code == 5 || code == 32 {
+                SplitTunnelError::DeviceBusy(code)
             } else {
-                output.as_mut_ptr() as *mut c_void
-            },
-            output.len() as u32,
-            &mut returned,
-            ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        let err = io::Error::last_os_error();
-        let raw = err.raw_os_error().unwrap_or(0) as u32;
-        return Err(SplitTunnelError::Driver(format!("the request 0x{code:08X} failed: {err}"), raw));
-    }
-    Ok(returned)
-}
-
-/// The state the driver is in.
-fn driver_state(device: HANDLE) -> Result<u64, SplitTunnelError> {
-    let mut out = [0u8; 8];
-    ioctl(device, IOCTL_GET_STATE, None, &mut out)?;
-    Ok(u64::from_ne_bytes(out))
-}
-
-/// Put the driver back into its fresh state.
-///
-/// The driver's state is a machine-wide thing: while it is not `STARTED`, it
-/// keeps the filters of the client that left it there, and those filters bind
-/// the traffic of the machine to the interface that client named as "the
-/// internet".  Nothing else on the machine notices that the traffic is no
-/// longer going through the tunnel -- the routing table looks the same in
-/// every session -- so the state is cleared before the client does anything
-/// else, and again when the client gives up.
-///
-/// A driver that is ALREADY fresh is left alone: a reset tears the firewall
-/// of the driver down and builds it again, and the driver does not survive
-/// many of those (the upstream issue #11487 is a crash in this path -- a
-/// transaction whose commit failed leaves the driver with a lock it never
-/// gives back, and the machine dies with a DPC violation).
-///
-/// The answer of the driver is read back: a driver that says it cannot reset
-/// is in the state it calls `ZOMBIE`, and from there the driver says itself
-/// that it will not be able to unload.  That must be loud, and the caller
-/// must not go on touching the firewall.
-fn reset_driver(device: HANDLE) -> Result<(), SplitTunnelError> {
-    match driver_state(device) {
-        Ok(state) if state == STATE_STARTED => {
-            return Ok(());
-        }
-        Ok(state) => {
-            tracing::warn!(state, "split-tunnel: the driver is not fresh, resetting it");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "split-tunnel: the state of the driver is unknown, resetting it");
-        }
-    }
-
-    // The configuration first: it tells the driver which images are out.
-    let _ = ioctl(device, IOCTL_CLEAR_CONFIGURATION, None, &mut []);
-    // The teardown of the firewall is not instant: the filters and the
-    // callouts are taken away first, the firewall is built again after
-    // that.  The reset is not asked for in the same breath.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    if let Err(e) = ioctl(device, IOCTL_RESET, None, &mut []) {
-        let code = match &e {
-            SplitTunnelError::Driver(_, code) => *code,
-            _ => 0,
-        };
-        tracing::error!(
-            error = %e,
-            "split-tunnel: the driver would not reset - it is in the state it cannot come out of. \
-             Its service must NOT be stopped: the way the driver unloads ends in a bug check."
-        );
-        return Err(SplitTunnelError::Driver("the driver would not reset".into(), code));
-    }
-    match driver_state(device) {
-        Ok(state) => {
-            if state != STATE_STARTED {
-                tracing::error!(
-                    state,
-                    "split-tunnel: the driver is not in its fresh state - its service must NOT be stopped"
-                );
-                return Err(SplitTunnelError::Driver(
-                    "the driver is not in its fresh state".into(),
-                    state as u32,
-                ));
+                SplitTunnelError::DeviceUnavailable(format!("{action} (error {code})"))
             }
-            tracing::info!("split-tunnel: the driver was reset into its fresh state");
-            Ok(())
         }
-        Err(e) => {
-            tracing::error!(error = %e, "split-tunnel: the state of the driver is unknown after the reset");
-            Err(e)
+        DriverError::Command { command, code } => SplitTunnelError::Driver(
+            format!("the command {command} of our protocol was refused"),
+            code,
+        ),
+        DriverError::ServiceMissing { name } => {
+            SplitTunnelError::DeviceUnavailable(format!("the service {name} is not on this machine"))
         }
+        DriverError::Service { name, code } => {
+            SplitTunnelError::Driver(format!("the service {name} refused"), code)
+        }
+        DriverError::Protocol(inner) => {
+            SplitTunnelError::Driver(format!("the buffer of the driver: {inner}"), 0)
+        }
+        DriverError::Version { got, expected } => SplitTunnelError::Driver(
+            format!("the driver speaks the version {got}, and we speak {expected}"),
+            got,
+        ),
+        DriverError::State { got } => {
+            SplitTunnelError::Driver(format!("the driver is in the state {got}"), got)
+        }
+        DriverError::Io(inner) => SplitTunnelError::Platform(inner),
+        DriverError::Argument(text) => SplitTunnelError::Driver(text, 0),
     }
-}
-
-/// The two sublayer GUIDs as the driver wants them.
-fn guids_bytes(guids: &SublayerGuids) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(unsafe { std::slice::from_raw_parts(&guids.baseline as *const GUID as *const u8, 16) });
-    out[16..].copy_from_slice(unsafe { std::slice::from_raw_parts(&guids.dns as *const GUID as *const u8, 16) });
-    out
 }
 
 /// The change of the state of an application that leaves the tunnel.
@@ -1075,11 +428,11 @@ pub enum Transition {
 /// The driver tells about EVERY process of the machine, and it tells about
 /// every process that starts and every process that stops: its events are
 /// about the PROCESSES, not about the applications.  A machine that spawns
-/// node.exe a hundred times an hour said "the application left the tunnel"
-/// a hundred times and "the application came back into the tunnel" a
-/// hundred times, while the application never left the tunnel at all -- it
-/// was running the whole time, and the processes that came and went were
-/// its children.
+/// node.exe a hundred times an hour said "the application left the tunnel" a
+/// hundred times and "the application came back into the tunnel" a hundred
+/// times, while the application never left the tunnel at all -- it was
+/// running the whole time, and the processes that came and went were its
+/// children.
 ///
 /// So the state is kept per image, and the instances are counted: an
 /// application leaves the tunnel when its first instance leaves it, and it
@@ -1185,17 +538,42 @@ impl ExcludedState {
     }
 }
 
+/// The move of the book, given the event of the driver.
+///
+/// The events of the driver of ours are about the PROCESSES: one that was
+/// born, and one that is gone.  The book of the applications counts the
+/// instances of every image, so that an application leaves the tunnel once
+/// and comes back once, however many processes of it there are.
+fn apply_event(
+    state: &mut ExcludedState,
+    kind: EventKind,
+    image: &str,
+    process_id: u64,
+) -> Option<Transition> {
+    match kind {
+        EventKind::ProcessStarted => state.started(image, process_id),
+        EventKind::ProcessExited => state.stopped(image, process_id),
+        EventKind::ConfigurationChanged => None,
+    }
+}
+
 /// The events: who started and who stopped being out of the tunnel.
 ///
-/// The driver tells about EVERY process on the machine -- it has to, it is
-/// the one that decides who leaves the tunnel. So the log only carries the
-/// names the person asked about; the rest is a debug line. A log that grows
-/// by megabytes a minute is a log nobody reads.
+/// The driver of ours says that a PROCESS has been born or has died -- it
+/// says nothing about the applications, and it does not say which image the
+/// process has: the path of an image in the spelling of the system is only
+/// known in the user mode.
+///
+/// So the thread of the events does three things with every event: it learns
+/// the path of the image of the process that was born, it tells the driver
+/// about it (the command REGISTER_PROCESS -- the driver cannot match a
+/// process it has never been told about), and it moves the book of the
+/// applications.
 ///
 /// The events of the driver are about the PROCESSES, not about the
-/// applications: every process that starts and every process that stops is
-/// an event of its own.  A machine that spawns node.exe a hundred times an
-/// hour said "the application left the tunnel" a hundred times and "the
+/// applications: every process that starts and every process that stops is an
+/// event of its own.  A machine that spawns node.exe a hundred times an hour
+/// said "the application left the tunnel" a hundred times and "the
 /// application came back into the tunnel" a hundred times -- while the
 /// application never left the tunnel at all: it was running the whole time,
 /// and the processes that came and went were its children.
@@ -1204,254 +582,251 @@ impl ExcludedState {
 /// application leaves the tunnel when its first instance leaves it, and it
 /// comes back when its last instance comes back.
 fn event_loop(
-    device: SharedHandle,
+    agent: Arc<SharedAgent>,
     stop: Arc<AtomicBool>,
     watched: Arc<std::sync::Mutex<Vec<String>>>,
+    processes: Arc<std::sync::Mutex<HashMap<u64, String>>>,
 ) {
-    let mut buffer = vec![0u8; 4096];
     let mut state = ExcludedState::default();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let mut returned = 0u32;
-        let ok = unsafe {
-            DeviceIoControl(
-                device.0,
-                IOCTL_DEQUEUE_EVENT,
-                ptr::null(),
-                0,
-                buffer.as_mut_ptr() as *mut c_void,
-                buffer.len() as u32,
-                &mut returned,
-                ptr::null_mut(),
-            )
+        let event = {
+            let mut agent = agent.lock();
+            match agent.next_event() {
+                Ok(Some(event)) => Some(event),
+                Ok(None) => None,
+                Err(error) => {
+                    if !is_empty_queue(&error) {
+                        tracing::debug!(error = %error, "split-tunnel: the event request failed, retrying");
+                    }
+                    None
+                }
+            }
         };
-        if ok == 0 {
-            let err = io::Error::last_os_error();
-            let raw = err.raw_os_error().unwrap_or(0) as u32;
-            if raw == STATUS_CANCELLED || raw == 1223 {
-                break;
-            }
-            // The handle is gone: there is nothing left to wait for.
-            if raw == 6 {
-                break;
-            }
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            tracing::debug!(error = %err, "split-tunnel: the event request failed, retrying");
-            thread::sleep(Duration::from_millis(250));
+        let Some(event) = event else {
+            // The queue of the driver of ours is empty most of the time: it
+            // does not wait for an event, it says that there is none.
+            thread::sleep(Duration::from_millis(50));
             continue;
-        }
-        let returned = returned as usize;
-        // The header of the event is sixteen bytes, and the payload of a
-        // splitting event carries the process the event is about.
-        if returned < 24 {
+        };
+        let Some(kind) = EventKind::from_u32(event.kind) else {
+            tracing::debug!(kind = event.kind, "split-tunnel: an event from the driver that we do not know");
             continue;
-        }
-        let event_id = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
-        let size = u64::from_ne_bytes(buffer[8..16].try_into().unwrap()) as usize;
-        match event_id {
-            EVENT_START_SPLITTING | EVENT_STOP_SPLITTING => {
-                let name = event_name(&buffer[16..returned.min(16 + size)]);
-                // The process the event is about: the same image may be
-                // many processes at once, and they are told apart by it.
-                let pid = u64::from_ne_bytes(buffer[16..24].try_into().unwrap());
-                // The names the log carries follow the list of the driver.
-                let names = match watched.lock() {
-                    Ok(watched) => watched.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                state.set_watched(names);
-                let transition = if event_id == EVENT_START_SPLITTING {
-                    state.started(&name, pid)
-                } else {
-                    state.stopped(&name, pid)
-                };
-                match transition {
-                    Some(Transition::Left) => {
-                        tracing::info!(application = %name, "split-tunnel: the application left the tunnel");
-                    }
-                    Some(Transition::CameBack) => {
-                        tracing::info!(application = %name, "split-tunnel: the application came back into the tunnel");
-                    }
+        };
+        let process_id = event.process_id;
+
+        // The path of the image of the process: the book of the processes
+        // knows it, and the system is asked when it does not.
+        let image = match kind {
+            EventKind::ProcessStarted => {
+                let known = lock_map(&processes).get(&process_id).cloned();
+                match known {
+                    Some(image) => Some(image),
                     None => {
-                        tracing::debug!(
-                            application = %name,
-                            event = event_id,
-                            "split-tunnel: the state of the application did not change"
-                        );
+                        let found = image_path_of(process_id);
+                        if let Some(image) = found.as_ref() {
+                            lock_map(&processes).insert(process_id, image.clone());
+                        }
+                        found
                     }
                 }
             }
-            _ => {
-                tracing::debug!(event_id, "split-tunnel: an event from the driver");
+            EventKind::ProcessExited => {
+                // The process is gone: the book of the processes forgets it.
+                let mut book = lock_map(&processes);
+                book.remove(&process_id)
+            }
+            EventKind::ConfigurationChanged => None,
+        };
+        let Some(image) = image else {
+            // The process is already gone, or there is nothing to say about
+            // it: there is nothing to move.
+            continue;
+        };
+
+        if kind == EventKind::ProcessStarted {
+            // The driver does not know the path of the image: only the user
+            // mode can read it, and the driver needs it to know which
+            // applications leave the tunnel.
+            let mut agent = agent.lock();
+            if let Err(error) = agent.register_process(process_id, &image) {
+                tracing::debug!(error = %error, process_id, "split-tunnel: the driver did not take the new process");
+            }
+        }
+
+        // The names the log carries follow the list of the driver.
+        let names = match watched.lock() {
+            Ok(watched) => watched.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        state.set_watched(names);
+
+        match apply_event(&mut state, kind, &image, process_id) {
+            Some(Transition::Left) => {
+                tracing::info!(application = %image, "split-tunnel: the application left the tunnel");
+            }
+            Some(Transition::CameBack) => {
+                tracing::info!(application = %image, "split-tunnel: the application came back into the tunnel");
+            }
+            None => {
+                tracing::debug!(
+                    application = %image,
+                    event = kind.as_u32(),
+                    "split-tunnel: the state of the application did not change"
+                );
             }
         }
     }
 }
 
-/// The name inside an event.
-fn event_name(payload: &[u8]) -> String {
-    if payload.len() < 16 {
-        return String::new();
+/// Whether the answer of the driver means "the queue is empty".
+///
+/// The driver of ours answers `STATUS_NOT_FOUND` when there is no event to
+/// take.  Windows gives that as the code 1168 (`ERROR_NOT_FOUND`), and on
+/// some builds as the code 2 (`ERROR_FILE_NOT_FOUND`).  Both mean the same
+/// thing here: there is nothing in the queue.
+fn is_empty_queue(error: &DriverError) -> bool {
+    match error {
+        DriverError::Command { code, .. } => *code == 1168 || *code == 2,
+        _ => false,
     }
-    let length = u16::from_ne_bytes(payload[12..14].try_into().unwrap()) as usize;
-    let start = 16;
-    let end = (start + length).min(payload.len());
-    if end <= start {
-        return String::new();
-    }
-    let units: Vec<u16> = payload[start..end]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
 }
 
-/// The processes of the machine, with their NT device paths.
-fn running_processes() -> Vec<(u32, u32, Vec<u16>)> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
-        return Vec::new();
-    }
-    let mut entry: PROCESSENTRY32W = unsafe { mem::zeroed() };
-    entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
-    let mut out = Vec::new();
-    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
-    while ok != 0 {
-        let path = device_path_of(entry.th32ProcessID);
-        if let Some(path) = path {
-            out.push((entry.th32ProcessID, entry.th32ParentProcessID, path));
-        }
-        ok = unsafe { Process32NextW(snapshot, &mut entry) };
-    }
-    unsafe { CloseHandle(snapshot) };
-    out
+/// The book of the processes, locked.
+fn lock_map(map: &std::sync::Mutex<HashMap<u64, String>>) -> std::sync::MutexGuard<'_, HashMap<u64, String>> {
+    map.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The NT device path of a process: `\Device\HarddiskVolumeN\...`.
-fn device_path_of(pid: u32) -> Option<Vec<u16>> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+/// The processes of the machine, with the path of their images.
+fn running_images() -> Vec<(u64, PathBuf)> {
+    process::running()
+        .into_iter()
+        .filter_map(|entry| entry.image.map(|image| (entry.id, image)))
+        .collect()
+}
+
+/// The path of the image of a process, the way the system writes it.
+///
+/// The crate of ours reads the whole table of the machine at once; a single
+/// process is asked here, because the driver says that one process has been
+/// born and the answer of the system is wanted before anything else is done
+/// with it.
+fn image_path_of(process_id: u64) -> Option<String> {
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            process_id as u32,
+        )
+    };
     if handle.is_null() {
         return None;
     }
     let mut buffer = [0u16; 1024];
-    let length = unsafe { K32GetProcessImageFileNameW(handle, buffer.as_mut_ptr(), buffer.len() as u32) };
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
     unsafe { CloseHandle(handle) };
-    if length == 0 {
+    if ok == 0 {
         return None;
     }
-    let end = buffer[..length as usize]
-        .iter()
-        .position(|c| *c == 0)
-        .unwrap_or(length as usize);
-    Some(buffer[..end].to_vec())
-}
-
-/// The device paths of EVERY running process that carries the wanted name.
-///
-/// Two different images may carry the same file name -- "node.exe" of
-/// `C:\Program Files\nodejs` and one of the cache of a tool -- and both of
-/// them have to leave the tunnel.  The first match is not enough: the
-/// driver is given the images, and the one that was left out keeps going
-/// through the tunnel.
-///
-/// A full path the person wrote ("E:\MU\main.exe") is honoured exactly:
-/// the drive alone says which volume it is on, and the file does not have
-/// to be running for that -- the driver excludes an image when it starts.
-fn resolve_applications(wanted: &str, running: &[(u32, u32, Vec<u16>)]) -> Vec<String> {
-    let wanted = wanted.trim();
-    if wanted.is_empty() {
-        return Vec::new();
-    }
-    // A full path the person wrote ("E:\MU\main.exe") is translated into the
-    // device path of its own accord -- the drive alone says which volume it
-    // is on.
-    if let Some(path) = device_path_from_dos(wanted) {
-        return vec![path];
-    }
-
-    let wanted_file = file_name_of(wanted).to_ascii_lowercase();
-    // A path without a drive ("Windows\System32\notepad.exe") is compared
-    // with the tail of the device path ("\Device\HarddiskVolumeN\Windows
-    // \System32\notepad.exe"): the drive is dropped, the rest must match.
-    let wanted_tail = wanted.replace('/', "\\").to_ascii_lowercase();
-    let has_tail = wanted_tail.contains('\\');
-
-    let mut out: Vec<String> = Vec::new();
-    for (_, _, path) in running {
-        let text = String::from_utf16_lossy(path);
-        let lower = text.to_ascii_lowercase();
-        let file = lower.rsplit('\\').next().unwrap_or(&lower).to_string();
-        let hit = if has_tail {
-            lower.ends_with(&wanted_tail)
-        } else {
-            file == wanted_file
-        };
-        if hit && !out.iter().any(|seen| seen.eq_ignore_ascii_case(&text)) {
-            out.push(text);
-        }
-    }
-    out
+    Some(String::from_utf16_lossy(&buffer[..size as usize]))
 }
 
 /// The images of the applications the person named, and the names that could
 /// not be found at all.
 ///
-/// EVERY running process that carries the name is taken -- see
-/// [`resolve_applications`].  A bare name that is not running right now is
+/// EVERY running process that carries the name is taken -- two different
+/// images may carry the same file name, and the one that is left out keeps
+/// going through the tunnel.  A bare name that is not running right now is
 /// looked for on the disk: the driver takes the images it is given and
 /// excludes them when they show up, so a path that is known at the moment
 /// the driver is engaged is enough.
 ///
 /// `from_disk` is given the file name of the wanted application and answers
-/// the device path of it, or nothing when the name is nowhere to be found.
-fn collect_exclusions<F>(
+/// the path of it, or nothing when the name is nowhere to be found.
+fn resolve_applications<F>(
     applications: &[String],
-    running: &[(u32, u32, Vec<u16>)],
+    running: &[(u64, PathBuf)],
     mut from_disk: F,
-) -> (Vec<Vec<u16>>, Vec<String>)
+) -> (Vec<PathBuf>, Vec<String>)
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Option<PathBuf>,
 {
-    let mut excluded: Vec<Vec<u16>> = Vec::new();
+    let mut excluded: Vec<PathBuf> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
-    // The bare names that are not running: they are looked for on the disk.
-    let mut wanted_on_disk: Vec<(String, String)> = Vec::new();
 
     for wanted in applications {
         let wanted = wanted.trim();
         if wanted.is_empty() {
             continue;
         }
-        let paths = resolve_applications(wanted, running);
-        if paths.is_empty() {
-            // A path the person wrote is not looked for on the disk: the
-            // disk holds a dozen images with the same file name, and none
-            // of them is the one that was named.
-            let explicit = wanted.contains('\\') || wanted.contains('/') || wanted.contains(':');
-            if explicit {
-                missing.push(wanted.to_owned());
-            } else {
-                wanted_on_disk.push((wanted.to_owned(), file_name_of(wanted).to_owned()));
+        if image::is_bare_name(wanted) {
+            // A bare name: EVERY image with that file name is taken.
+            match image::resolve(wanted, running, false) {
+                image::Resolution::Found(path) => {
+                    let file = image::file_name_of(&path);
+                    for (_, candidate) in running {
+                        if image::file_name_of(candidate).eq_ignore_ascii_case(&file) {
+                            push_path(&mut excluded, candidate.clone());
+                        }
+                    }
+                }
+                image::Resolution::NotFound(_) => {
+                    // Not running: looked for on the disk.
+                    match from_disk(wanted) {
+                        Some(path) => push_path(&mut excluded, path),
+                        None => missing.push(wanted.to_owned()),
+                    }
+                }
+                image::Resolution::Exact(path) => push_path(&mut excluded, path),
             }
             continue;
         }
-        for path in paths {
-            push_unique(&mut excluded, wide(&path));
-        }
-    }
-
-    for (wanted, file) in wanted_on_disk {
-        match from_disk(&file) {
-            Some(path) => push_unique(&mut excluded, wide(&path)),
-            None => missing.push(wanted),
+        // A path the person wrote.  It is honoured as it is: the drive alone
+        // says which volume it is on, and the file does not have to be
+        // running for that.
+        match image::resolve(wanted, running, false) {
+            image::Resolution::Exact(path) => {
+                if has_volume(&path) {
+                    push_path(&mut excluded, path);
+                } else {
+                    // A path without the letter of the volume is of no use to
+                    // the driver: the identity of an application always
+                    // carries the volume.
+                    missing.push(wanted.to_owned());
+                }
+            }
+            image::Resolution::Found(path) => push_path(&mut excluded, path),
+            image::Resolution::NotFound(_) => missing.push(wanted.to_owned()),
         }
     }
 
     (excluded, missing)
+}
+
+/// Whether the path carries the letter of the volume.
+///
+/// `C:\Windows\node.exe` does, `Windows\node.exe` does not.  The driver
+/// compares the path of an image in the spelling of the system, and that
+/// spelling always carries the volume.
+fn has_volume(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    (bytes.len() >= 2 && bytes[1] == b':') || text.starts_with("\\\\")
+}
+
+/// Add a path to the list, unless it is already there.
+fn push_path(list: &mut Vec<PathBuf>, path: PathBuf) {
+    let text = path.to_string_lossy();
+    if list
+        .iter()
+        .any(|seen| seen.to_string_lossy().eq_ignore_ascii_case(&text))
+    {
+        return;
+    }
+    list.push(path);
 }
 
 /// The names the person asked about: the log carries them, the rest of the
@@ -1475,62 +850,94 @@ fn file_name_of(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
-/// Add an image to the list, unless it is already there.
-fn push_unique(list: &mut Vec<Vec<u16>>, path: Vec<u16>) {
-    if list.iter().any(|seen| wide_eq_ignore_case(seen, &path)) {
-        return;
-    }
-    list.push(path);
-}
-
-/// Compare two wide strings, ignoring the case of the letters.
-fn wide_eq_ignore_case(a: &[u16], b: &[u16]) -> bool {
-    String::from_utf16_lossy(a).eq_ignore_ascii_case(&String::from_utf16_lossy(b))
-}
-
-/// How long the search for an application on the disk may take.
-const DISK_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
-
-/// The path of the application the person named, the way the system writes it.
+/// The number of the interface that carries the address of the internet.
 ///
-/// The kernel driver takes the device path of the image, and the switch that
-/// keeps the tunnel honest takes the path the system writes. Both come from
-/// the same place: the running processes, and then the disk -- an application
-/// that is not running now must be excluded all the same, or it goes into the
-/// tunnel the moment it starts.
+/// The driver of ours rewrites the sockets of the excluded applications onto
+/// this interface, so that they leave the tunnel.  The user mode knows the
+/// interface; the driver only has to be told.  Zero means that the interface
+/// is not known.
+fn internet_interface_for(address: Ipv4Addr) -> u32 {
+    let wanted = u32::from_be_bytes(address.octets());
+    let mut size: u32 = 0;
+    // The first call asks how much the table of the adapters needs.
+    unsafe {
+        GetAdaptersAddresses(
+            AF_INET as u32,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut size,
+        );
+    }
+    if size == 0 {
+        return 0;
+    }
+    let mut buffer = vec![0u8; size as usize];
+    let code = unsafe {
+        GetAdaptersAddresses(
+            AF_INET as u32,
+            0,
+            std::ptr::null(),
+            buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+            &mut size,
+        )
+    };
+    if code != 0 {
+        return 0;
+    }
+    let mut adapter = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+    while !adapter.is_null() {
+        let mut unicast = unsafe { (*adapter).FirstUnicastAddress };
+        while !unicast.is_null() {
+            let sockaddr = unsafe { (*unicast).Address.lpSockaddr as *const SOCKADDR_IN };
+            if !sockaddr.is_null() {
+                let raw = unsafe { (*sockaddr).sin_addr.S_un.S_addr };
+                if u32::from_be(raw) == wanted {
+                    return unsafe { (*adapter).Anonymous1.Anonymous.IfIndex };
+                }
+            }
+            unicast = unsafe { (*unicast).Next };
+        }
+        adapter = unsafe { (*adapter).Next };
+    }
+    0
+}
+
+/// The path of the application the person named, the way the system writes
+/// it.
+///
+/// The driver of ours takes the path of the image in the spelling of the
+/// system, and the switch that keeps the tunnel honest takes the same path.
+/// Both come from the same place: the running processes, and then the disk --
+/// an application that is not running now must be excluded all the same, or
+/// it goes into the tunnel the moment it starts.
 pub fn application_paths(applications: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    let running = running_process_dos_paths();
+    let running = running_images();
+    let mut paths: Vec<PathBuf> = Vec::new();
     for wanted in applications {
         let wanted = wanted.trim();
         if wanted.is_empty() {
             continue;
         }
         // A full path the person wrote.
-        if wanted.contains('\\') || wanted.contains('/') || wanted.contains(':') {
-            if std::path::Path::new(wanted).is_file() {
-                out.push(wanted.to_owned());
+        if !image::is_bare_name(wanted) {
+            let path = PathBuf::from(wanted);
+            if path.is_file() {
+                push_path(&mut paths, path);
             }
             continue;
         }
-        let wanted_file = wanted.to_ascii_lowercase();
         // EVERY image with that file name is taken: two of them may carry
         // the same name ("node.exe" of Program Files and one of the cache
         // of a tool), and the one that is left out keeps going through the
         // tunnel.
-        for path in running.iter().filter(|path| {
-            path.rsplit('\\')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                == wanted_file
-        }) {
-            if !out.iter().any(|seen| seen.eq_ignore_ascii_case(path)) {
-                out.push(path.clone());
+        for (_, candidate) in &running {
+            if image::file_name_of(candidate).eq_ignore_ascii_case(wanted) {
+                push_path(&mut paths, candidate.clone());
             }
         }
     }
-    out
+    image::image_paths(&paths)
 }
 
 /// The applications that are not running now, looked for on the disk.
@@ -1539,206 +946,20 @@ pub fn application_paths(applications: &[String]) -> Vec<String> {
 /// the device comes up: a device that is slow to start is a device that is
 /// killed before it carries.  The caller runs it in the background.
 pub fn application_paths_on_disk(applications: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
     for wanted in applications {
         let wanted = wanted.trim();
         if wanted.is_empty() {
             continue;
         }
-        if wanted.contains('\\') || wanted.contains('/') || wanted.contains(':') {
+        if !image::is_bare_name(wanted) {
             continue;
         }
-        if let Some(path) = find_application_on_disk(&wanted.to_ascii_lowercase()) {
-            out.push(path);
+        if let Some(path) = image::find_on_disk(wanted) {
+            push_path(&mut paths, path);
         }
     }
-    out
-}
-
-/// The paths of the running processes, as the system writes them.
-fn running_process_dos_paths() -> Vec<String> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
-        return Vec::new();
-    }
-    let mut entry: PROCESSENTRY32W = unsafe { mem::zeroed() };
-    entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
-    let mut out = Vec::new();
-    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
-    while ok != 0 {
-        if let Some(path) = process_dos_path(entry.th32ProcessID) {
-            out.push(path);
-        }
-        ok = unsafe { Process32NextW(snapshot, &mut entry) };
-    }
-    unsafe { CloseHandle(snapshot) };
-    out
-}
-
-/// The path of a process, the way the system writes it.
-fn process_dos_path(pid: u32) -> Option<String> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return None;
-    }
-    let mut buffer = [0u16; 1024];
-    let mut size = buffer.len() as u32;
-    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
-    unsafe { CloseHandle(handle) };
-    if ok == 0 {
-        return None;
-    }
-    Some(String::from_utf16_lossy(&buffer[..size as usize]))
-}
-
-/// The folders an application usually lives in, and how deep the search goes
-/// in each of them.
-fn application_roots() -> Vec<(std::path::PathBuf, usize)> {
-    let mut roots = Vec::new();
-    for key in [
-        "ProgramFiles",
-        "ProgramFiles(x86)",
-        "ProgramData",
-        "LOCALAPPDATA",
-        "APPDATA",
-    ] {
-        if let Some(dir) = std::env::var_os(key) {
-            let dir = std::path::PathBuf::from(dir);
-            if dir.is_dir() {
-                roots.push((dir, 6));
-            }
-        }
-    }
-    // The tools of Windows itself live here (notepad.exe, and the like).
-    if let Some(windows) = std::env::var_os("SystemRoot") {
-        let system = std::path::PathBuf::from(windows).join("System32");
-        if system.is_dir() {
-            roots.push((system, 2));
-        }
-    }
-    // The applications of the store live here, one folder per package.  The
-    // folder of the package carries the version, so the path of the image
-    // changes with every update -- the name of the image is what the person
-    // writes, and the path is looked up again each time the device starts.
-    if let Some(program_files) = std::env::var_os("ProgramFiles") {
-        let store = std::path::PathBuf::from(program_files).join("WindowsApps");
-        if store.is_dir() {
-            roots.push((store, 2));
-        }
-    }
-    roots
-}
-
-/// The folders the search does not walk into: they are big and they hold no
-/// application the person would name.
-fn skipped_folder(name: &str) -> bool {
-    matches!(
-        name,
-        "windows"
-            | "$recycle.bin"
-            | "system volume information"
-            | "node_modules"
-            | "cache"
-            | "caches"
-            | "temp"
-            | "tmp"
-            | "installer"
-            | "winsxs"
-    )
-}
-
-/// Find the application on the disk by its file name.
-fn find_application_on_disk(wanted_file: &str) -> Option<String> {
-    let wanted = wanted_file.to_ascii_lowercase();
-    let deadline = std::time::Instant::now() + DISK_SEARCH_BUDGET;
-    for (root, depth) in application_roots() {
-        if let Some(hit) = search_for_file(&root, &wanted, 0, depth, deadline) {
-            return Some(hit);
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-    }
-    None
-}
-
-/// Walk a folder looking for the file.
-fn search_for_file(
-    dir: &std::path::Path,
-    wanted: &str,
-    depth: usize,
-    max_depth: usize,
-    deadline: std::time::Instant,
-) -> Option<String> {
-    if depth > max_depth || std::time::Instant::now() >= deadline {
-        return None;
-    }
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            if skipped_folder(&name) {
-                continue;
-            }
-            if let Some(hit) = search_for_file(&path, wanted, depth + 1, max_depth, deadline) {
-                return Some(hit);
-            }
-        } else if name == wanted {
-            return Some(path.to_string_lossy().to_string());
-        }
-    }
-    None
-}
-
-/// The device path of a DOS path ("E:\MU\main.exe").
-///
-/// The drive is asked what volume it is, and the rest of the path is kept:
-/// "\Device\HarddiskVolume3\MU\main.exe". The file itself does not have to
-/// exist -- the driver excludes an image when it starts, not when it is
-/// already running.
-fn device_path_from_dos(wanted: &str) -> Option<String> {
-    let text = wanted.trim();
-    let mut chars = text.chars();
-    let drive = chars.next()?;
-    if !drive.is_ascii_alphabetic() {
-        return None;
-    }
-    if chars.next()? != ':' {
-        return None;
-    }
-    let rest = &text[2..];
-    if !rest.contains('\\') && !rest.contains('/') {
-        return None;
-    }
-    let name: Vec<u16> = format!("{}:", drive.to_ascii_uppercase()).encode_utf16().collect();
-    let mut buffer = vec![0u16; 1024];
-    let length = unsafe {
-        QueryDosDeviceW(name.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
-    };
-    if length == 0 {
-        return None;
-    }
-    let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-    let device = String::from_utf16_lossy(&buffer[..end]);
-    if device.is_empty() {
-        return None;
-    }
-    let rest = rest.replace('/', "\\");
-    Some(format!("{device}{rest}"))
-}
-
-/// A wide string without a terminator: the driver reads the length itself.
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().collect()
-}
-
-/// A wide string with a terminator: the firewall wants a C string.
-fn wide_z(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
+    image::image_paths(&paths)
 }
 
 /// The address of this machine on the physical interface.
@@ -1770,71 +991,18 @@ pub fn local_address_for(gateway: IpAddr) -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_configuration_is_packed_the_way_the_driver_reads_it() {
-        let a = wide(r"\Device\HarddiskVolume2\Program Files\nodejs\node.exe");
-        let b = wide(r"\Device\HarddiskVolume2\Windows\System32\svchost.exe");
-        let packed = pack_configuration(&[a.clone(), b.clone()]);
-
-        let header = ListHeader {
-            num_entries: u64::from_ne_bytes(packed[0..8].try_into().unwrap()),
-            total_length: u64::from_ne_bytes(packed[8..16].try_into().unwrap()),
-        };
-        assert_eq!(header.num_entries, 2);
-        assert_eq!(header.total_length as usize, packed.len());
-
-        let entry_size = mem::size_of::<ConfigurationEntry>();
-        let mut at = mem::size_of::<ListHeader>();
-        for path in [&a, &b] {
-            let entry = ConfigurationEntry {
-                image_name_offset: u64::from_ne_bytes(packed[at..at + 8].try_into().unwrap()),
-                image_name_length: u16::from_ne_bytes(packed[at + 8..at + 10].try_into().unwrap()),
-                _pad: [0; 6],
-            };
-            assert_eq!(entry.image_name_length as usize, path.len() * 2);
-            let start = mem::size_of::<ListHeader>() + 2 * entry_size + entry.image_name_offset as usize;
-            let end = start + entry.image_name_length as usize;
-            let units: Vec<u16> = packed[start..end]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            assert_eq!(units, *path);
-            at += entry_size;
-        }
-    }
-
-    #[test]
-    fn the_process_list_is_packed_the_way_the_driver_reads_it() {
-        let processes = vec![
-            (100u32, 4u32, wide(r"\Device\HarddiskVolume2\a.exe")),
-            (200u32, 100u32, wide(r"\Device\HarddiskVolume2\b.exe")),
-        ];
-        let packed = pack_processes(&processes);
-        let header = ListHeader {
-            num_entries: u64::from_ne_bytes(packed[0..8].try_into().unwrap()),
-            total_length: u64::from_ne_bytes(packed[8..16].try_into().unwrap()),
-        };
-        assert_eq!(header.num_entries, 2);
-        assert_eq!(header.total_length as usize, packed.len());
-        assert_eq!(mem::size_of::<ProcessEntry>(), 32);
-    }
-
-    #[test]
-    fn an_empty_list_is_not_a_configuration() {
-        assert!(pack_configuration(&[]).len() >= mem::size_of::<ListHeader>());
+    /// The path of an image, the way the system writes it.
+    fn image_path(text: &str) -> PathBuf {
+        PathBuf::from(text)
     }
 
     #[test]
     fn the_application_is_found_by_its_name() {
-        let running = vec![(
-            10u32,
-            1u32,
-            wide(r"\Device\HarddiskVolume2\Program Files\nodejs\node.exe"),
-        )];
-        let found = resolve_applications("node.exe", &running);
-        assert_eq!(found.len(), 1);
-        assert!(found[0].ends_with("node.exe"));
-        assert!(resolve_applications("nothing.exe", &running).is_empty());
+        let running = vec![(10u64, image_path(r"C:\Program Files\nodejs\node.exe"))];
+        let (excluded, missing) = resolve_applications(&["node.exe".to_owned()], &running, |_| None);
+        assert!(missing.is_empty());
+        assert_eq!(excluded.len(), 1);
+        assert!(excluded[0].ends_with("node.exe"));
     }
 
     /// Two different images may carry the same file name -- and both of
@@ -1844,41 +1012,32 @@ mod tests {
     fn every_image_with_the_wanted_file_name_is_taken() {
         let running = vec![
             (
-                10u32,
-                1u32,
-                wide(r"\Device\HarddiskVolume2\Program Files\nodejs\node.exe"),
+                10u64,
+                image_path(r"C:\Program Files\nodejs\node.exe"),
             ),
+            (20u64, image_path(r"D:\codex\node.exe")),
             (
-                20u32,
-                1u32,
-                wide(r"\Device\HarddiskVolume4\codex\node.exe"),
-            ),
-            (
-                30u32,
-                1u32,
-                wide(r"\Device\HarddiskVolume2\Windows\System32\svchost.exe"),
+                30u64,
+                image_path(r"C:\Windows\System32\svchost.exe"),
             ),
         ];
-        let found = resolve_applications("node.exe", &running);
-        assert_eq!(found.len(), 2, "both images of node.exe are taken");
-        assert!(found[0].contains("Program Files"));
-        assert!(found[1].contains("codex"));
+        let (excluded, missing) = resolve_applications(&["node.exe".to_owned()], &running, |_| None);
+        assert!(missing.is_empty());
+        assert_eq!(excluded.len(), 2, "both images of node.exe are taken");
+        assert!(excluded[0].to_string_lossy().contains("Program Files"));
+        assert!(excluded[1].to_string_lossy().contains("codex"));
     }
 
-    /// The name of an application that is not running yet is looked for on
-    /// the disk: the driver excludes the images it is given when they show
-    /// up, so the path has to be known when the driver is engaged.
+    /// A name that is on the disk but not running is taken from the disk:
+    /// the driver excludes the images it is given when they show up, so the
+    /// path has to be known when the driver is engaged.
     #[test]
     fn a_name_that_is_on_the_disk_but_not_running_is_taken_from_the_disk() {
-        let running = vec![(
-            10u32,
-            1u32,
-            wide(r"\Device\HarddiskVolume2\Program Files\nodejs\node.exe"),
-        )];
+        let running = vec![(10u64, image_path(r"C:\Program Files\nodejs\node.exe"))];
         let applications = vec!["node.exe".to_owned(), "yandexbrowser.exe".to_owned()];
-        let (excluded, missing) = collect_exclusions(&applications, &running, |file| {
+        let (excluded, missing) = resolve_applications(&applications, &running, |file| {
             if file.eq_ignore_ascii_case("yandexbrowser.exe") {
-                Some(r"\Device\HarddiskVolume2\Yandex\YandexBrowser.exe".to_owned())
+                Some(image_path(r"C:\Yandex\YandexBrowser.exe"))
             } else {
                 None
             }
@@ -1887,7 +1046,7 @@ mod tests {
         assert_eq!(excluded.len(), 2, "the running image and the one on the disk");
         let texts: Vec<String> = excluded
             .iter()
-            .map(|path| String::from_utf16_lossy(path))
+            .map(|path| path.to_string_lossy().to_string())
             .collect();
         assert!(texts.iter().any(|text| text.contains("nodejs")));
         assert!(texts.iter().any(|text| text.contains("YandexBrowser.exe")));
@@ -1897,15 +1056,23 @@ mod tests {
     /// does not keep the rest of the list from leaving the tunnel.
     #[test]
     fn a_name_that_is_nowhere_is_reported() {
-        let running = vec![(
-            10u32,
-            1u32,
-            wide(r"\Device\HarddiskVolume2\Program Files\nodejs\node.exe"),
-        )];
+        let running = vec![(10u64, image_path(r"C:\Program Files\nodejs\node.exe"))];
         let applications = vec!["node.exe".to_owned(), "nowhere.exe".to_owned()];
-        let (excluded, missing) = collect_exclusions(&applications, &running, |_| None);
+        let (excluded, missing) = resolve_applications(&applications, &running, |_| None);
         assert_eq!(excluded.len(), 1);
         assert_eq!(missing, vec!["nowhere.exe".to_owned()]);
+    }
+
+    /// A full path the person wrote is honoured as it is: the file does not
+    /// have to be running.
+    #[test]
+    fn a_full_path_is_honoured_as_it_is() {
+        let running: Vec<(u64, PathBuf)> = Vec::new();
+        let (excluded, missing) =
+            resolve_applications(&[r"E:\MU\main.exe".to_owned()], &running, |_| None);
+        assert!(missing.is_empty());
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0], image_path(r"E:\MU\main.exe"));
     }
 
     /// The log carries the names that were ASKED for -- not the ones that
@@ -1921,7 +1088,7 @@ mod tests {
     }
 
     /// The image of the application the log kept talking about.
-    const NODE: &str = r"\device\harddiskvolume3\program files\nodejs\node.exe";
+    const NODE: &str = r"c:\program files\nodejs\node.exe";
 
     /// An application leaves the tunnel once, no matter how many processes
     /// of it are running.
@@ -1980,7 +1147,7 @@ mod tests {
     #[test]
     fn an_application_that_was_not_asked_about_moves_nothing() {
         let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
-        let other = r"\device\harddiskvolume3\windows\system32\notepad.exe";
+        let other = r"c:\windows\system32\notepad.exe";
         assert_eq!(state.started(other, 7), None);
         assert_eq!(state.stopped(other, 7), None);
         assert!(state.outside().is_empty());
@@ -1997,5 +1164,52 @@ mod tests {
         state.set_watched(vec!["notepad.exe".to_owned()]);
         assert!(state.outside().is_empty());
         assert_eq!(state.stopped(NODE, 42), None);
+    }
+
+    /// The event of the driver that a process was born moves the book: the
+    /// application leaves the tunnel.
+    #[test]
+    fn the_event_of_a_process_that_was_born_moves_the_book() {
+        let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
+        assert_eq!(
+            apply_event(&mut state, EventKind::ProcessStarted, NODE, 42),
+            Some(Transition::Left)
+        );
+        // A second process of the same image does not move it again.
+        assert_eq!(
+            apply_event(&mut state, EventKind::ProcessStarted, NODE, 43),
+            None
+        );
+    }
+
+    /// The event of the driver that a process is gone moves the book: the
+    /// application comes back when its last process is gone.
+    #[test]
+    fn the_event_of_a_process_that_is_gone_moves_the_book() {
+        let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
+        apply_event(&mut state, EventKind::ProcessStarted, NODE, 42);
+        apply_event(&mut state, EventKind::ProcessStarted, NODE, 43);
+        // One of the two is gone: the application is still out.
+        assert_eq!(
+            apply_event(&mut state, EventKind::ProcessExited, NODE, 43),
+            None
+        );
+        // The last one is gone: now it comes back.
+        assert_eq!(
+            apply_event(&mut state, EventKind::ProcessExited, NODE, 42),
+            Some(Transition::CameBack)
+        );
+    }
+
+    /// The event of the driver that the list has changed moves nothing: the
+    /// list itself is not an application.
+    #[test]
+    fn the_event_of_a_changed_list_moves_nothing() {
+        let mut state = ExcludedState::new(vec!["node.exe".to_owned()]);
+        assert_eq!(
+            apply_event(&mut state, EventKind::ConfigurationChanged, NODE, 42),
+            None
+        );
+        assert!(state.outside().is_empty());
     }
 }

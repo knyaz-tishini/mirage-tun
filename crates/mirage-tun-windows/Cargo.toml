@@ -33,6 +33,9 @@ windows-sys = { version = "0.59", features = [
 socket2 = { version = "0.5", features = ["all"] }
 mirage-wfp = { path = "crates/mirage-wfp" }
 mirage-tun-core = { path = "../mirage-tun-core" }
+# The split tunnel of ours: the protocol, the driver and the agent that
+# drives it.  Our own crate, in our own repository.
+mirage-split-tunnel = { path = "../../../mirage-split-tunnel/crates/mirage-split-tunnel" }
 mirage-core = { path = "../../../mirage-oss/crates/mirage-core" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
